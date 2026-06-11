@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 7 · Training, Sampling &amp; Debugging</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 7</span> · Training, Sampling &amp; Debugging</h1>
+<p class="subtitle">The model exists; now it learns. You'll write Adam from its update equations, assemble the jitted train step, build the data pipeline and the sampling loop, and train a character-level model that <em>memorizes Alice in Wonderland</em> — with the exact expected output embedded below, machine-verified. Then: the debugging checklist that turns "it doesn't work" into a 10-minute bisection.</p>
+
+<h2 id="adam">7.1 Adam from scratch</h2>
+<p>SGD scales every parameter's step by the same \(\eta\). Adam adapts per parameter, using two exponential moving averages maintained for every single weight: the mean of gradients \(m\) (momentum — smooths noise) and the mean of squared gradients \(v\) (scale — measures how big this coordinate's gradients typically are):</p>
+$$ m_t = \beta_1 m_{t-1} + (1-\beta_1) g_t, \qquad v_t = \beta_2 v_{t-1} + (1-\beta_2) g_t^2, $$
+$$ \hat m_t = \frac{m_t}{1-\beta_1^t}, \qquad \hat v_t = \frac{v_t}{1-\beta_2^t}, \qquad \theta_t = \theta_{t-1} - \eta\, \frac{\hat m_t}{\sqrt{\hat v_t} + \varepsilon}. $$
+<p>The division by \(\sqrt{\hat v_t}\) makes the step size roughly \(\eta\) <em>in units of typical gradient size</em>, per coordinate — embeddings of rare tokens (small, sporadic gradients) get proportionally large steps; busy weights get tame ones.</p>
+<div class="box keypoint"><div class="box-title">Why bias correction exists</div>
+<p>\(m\) and \(v\) start at zero. After one step, \(m_1 = (1-\beta_1) g_1 = 0.1\,g_1\) — the average is biased toward 0 simply because the history is empty, and with \(\beta_2 = 0.999\), \(v\) is 1000× too small, making \(1/\sqrt{v}\) catastrophically large. Dividing by \(1 - \beta^t\) exactly cancels the deficit: at \(t=1\), \(\hat m_1 = g_1\) and \(\hat v_1 = g_1^2\) — so the very first step is \(\eta\, g_1 / (|g_1| + \varepsilon) = \eta\,\mathrm{sign}(g_1)\). The correction fades as \(\beta^t \to 0\). (The companion tests assert this first-step property numerically.)</p>
+</div>
+<p>In JAX, Adam is the §4.3 pattern with two state trees:</p>
+<pre><code>def adam_init(params):
+    zeros = lambda p: jnp.zeros_like(p)
+    return {"m": jax.tree.map(zeros, params), "v": jax.tree.map(zeros, params)}
+
+def adam_update(params, grads, state, step, lr, b1=0.9, b2=0.999, eps=1e-8):
+    m = jax.tree.map(lambda m, g: b1 * m + (1 - b1) * g, state["m"], grads)
+    v = jax.tree.map(lambda v, g: b2 * v + (1 - b2) * g * g, state["v"], grads)
+    mhat_scale = 1.0 / (1 - b1 ** step)      # scalars — applied inside the map
+    vhat_scale = 1.0 / (1 - b2 ** step)
+    params = jax.tree.map(
+        lambda p, m, v: p - lr * (m * mhat_scale) / (jnp.sqrt(v * vhat_scale) + eps),
+        params, m, v)
+    return params, {"m": m, "v": v}
+</code></pre>
+
+<div class="quiz" data-concept="ch7.html#adam" data-concept-label="§7.1 Adam">
+  <div class="q-text"><p>From memory: write Adam's four update equations (m, v, bias corrections, parameter step), then <code>adam_init</code> and <code>adam_update</code> as tree.maps. Prove the first-step property: with any gradient \(g_1\), what is \(\theta_1 - \theta_0\) (ignore \(\varepsilon\))? Why would skipping bias correction be especially bad for \(v\)?</p></div>
+  <div class="hint">At t=1: \(m_1 = (1{-}\beta_1)g_1\) and \(1 - \beta_1^1 = 1{-}\beta_1\) — the correction divides out exactly.</div>
+  <div class="answer"><p>Equations and code as in §7.1. First step: \(\hat m_1 = g_1\), \(\hat v_1 = g_1^2\) ⇒ step \(= -\eta\, g_1/\sqrt{g_1^2} = -\eta\,\mathrm{sign}(g_1)\): every parameter moves by exactly the learning rate, in the gradient's direction. Without correction, \(v_1 = 0.001\,g_1^2\), so \(\sqrt{v_1} \approx 0.03|g_1|\) and the step is ~32× too large — early training becomes a sequence of explosions precisely when the model is most fragile. (Check 7 of <code>test_jax_core.py</code> asserts the sign-of-g property.)</p></div>
+</div>
+
+<h2 id="train-step">7.2 The jitted train step</h2>
+<p>Chapter 4's canonical pattern, instantiated. Everything that changes is an argument; the whole thing is one jit unit:</p>
+<pre><code>@jax.jit
+def train_step(params, opt_state, step, batch):
+    loss, grads = jax.value_and_grad(loss_fn)(params, batch)
+    params, opt_state = adam_update(params, grads, opt_state, step, lr=3e-4)
+    return params, opt_state, loss
+</code></pre>
+<p>Audit it with Chapter 3 eyes. <code>step</code> must be an argument — bias correction needs it, and a closed-over Python counter would freeze at its trace-time value (§3.3). It can be a plain int: JAX promotes scalar arguments to traced values, so passing 1, 2, 3, … does <em>not</em> recompile (shape and dtype are what count, and they don't change). <code>lr</code> here is a baked-in constant — fine because it never changes; to anneal it, pass it as one more argument. <code>batch</code> has fixed shape \((B, T+1)\) every step, so compilation happens exactly once.</p>
+
+<div class="quiz" data-concept="ch7.html#train-step" data-concept-label="§7.2 train_step">
+  <div class="q-text"><p>Write the jitted <code>train_step</code> from memory. Then three audits: why must <code>step</code> be an argument rather than a global counter; why doesn't passing a different int every call cause recompilation; what two changes are needed to support a learning-rate schedule?</p></div>
+  <div class="hint">§3.3 for the counter; §3.1 for what determines a cache hit (shape/dtype, not value).</div>
+  <div class="answer"><p>Code as in §7.2. A global counter is closure-captured at trace time: the compiled program would apply step-1 bias correction forever (silently — early steps 32× too big never calm down). No recompile because jit keys its cache on shape+dtype: every int is a scalar int32 tracer, values flow in at runtime. Schedule: compute <code>lr = schedule(step)</code> <em>inside</em> the jitted function from the traced step (or pass lr as an argument) — both keep lr live; reading a global that you update from the loop would freeze it.</p></div>
+</div>
+
+<h2 id="data">7.3 Data: random windows from one long array</h2>
+<p>Character-level tokenization is two dictionaries — no BPE needed at this scale. The whole corpus becomes one int array; a batch is B random windows of length T+1 (the +1 feeds the shift in <code>loss_fn</code>):</p>
+<pre><code>chars = sorted(set(CORPUS))                  # the vocabulary: 46 distinct chars
+stoi = {c: i for i, c in enumerate(chars)}
+data = jnp.array([stoi[c] for c in CORPUS])  # (2095,) ints
+
+def get_batch(key, data, batch_size, T):
+    starts = jax.random.randint(key, (batch_size,), 0, data.shape[0] - T - 1)
+    idx = starts[:, None] + jnp.arange(T + 1)[None, :]    # (B, T+1) indices
+    return data[idx]                                       # gather: (B, T+1)
+</code></pre>
+<p>The indexing trick deserves a pause: <code>starts[:, None] + arange(T+1)[None, :]</code> broadcasts a column of B start positions against a row of T+1 offsets, producing a (B, T+1) index matrix — every row a contiguous window — and one gather fetches the whole batch. No Python loop, no ragged shapes, jit-stable. The driving loop supplies a fresh key per step (§1.4): <code>key, bkey = jax.random.split(key)</code>.</p>
+
+<div class="quiz" data-concept="ch7.html#data" data-concept-label="§7.3 Data pipeline">
+  <div class="q-text"><p>Write <code>get_batch(key, data, batch_size, T)</code> from memory, explaining the broadcast that builds the index matrix. Why T+1 and not T? And connect to §4.4: what goes wrong if the loop reuses one key for every <code>get_batch</code> call?</p></div>
+  <div class="hint">Column (B,1) + row (1,T+1) → matrix (B,T+1). The +1: loss_fn slices inputs [:, :-1] and targets [:, 1:].</div>
+  <div class="answer"><p>Code as in §7.3. The broadcast: starts as a (B,1) column plus offsets as a (1,T+1) row gives the (B,T+1) matrix of absolute indices; <code>data[idx]</code> gathers it in one op. T+1 because each training window must contain both the T inputs and the T shifted targets. Reusing one key ⇒ <code>randint</code> returns identical starts every step ⇒ every step trains on the same batch: loss looks beautiful, the model has learned 32 windows. (Same key, same function, same numbers — §1.4's discipline exists for exactly this.)</p></div>
+</div>
+
+<h2 id="sampling">7.4 Sampling: the model writes</h2>
+<p>Generation is the forward pass in a loop: feed the context, take the <em>last position's</em> logits, sample one token, append, repeat:</p>
+<pre><code>def sample(params, key, prompt_ids, n_new, T, temperature=0.8):
+    ids = list(prompt_ids)
+    for _ in range(n_new):
+        ctx = jnp.array(ids[-T:])[None, :]          # last ≤T tokens, batch of 1
+        logits = forward(params, ctx)[0, -1]        # (V,) — final position only
+        key, sub = jax.random.split(key)
+        ids.append(int(jax.random.categorical(sub, logits / temperature)))
+    return ids
+</code></pre>
+<p>Three things to understand. <strong>Context truncation</strong> (<code>ids[-T:]</code>): the position table has \(T_{max}\) rows; feed more and you'd index past it — the model has a finite window. <strong>Temperature</strong>: dividing logits by \(\tau\) before the softmax sharpens (\(\tau &lt; 1\)) or flattens (\(\tau &gt; 1\)) the distribution; \(\tau \to 0\) is argmax (deterministic, loops easily), \(\tau = 1\) samples the model's true distribution. <strong><code>jax.random.categorical</code></strong> samples from logits directly (no need to softmax first — it does log-space sampling internally), and the key discipline applies: one fresh subkey per generated token.</p>
+<p class="muted">This loop re-encodes the whole context every token — \(O(T^2)\) per token. Fine here; real inference caches each layer's K and V ("KV cache") so each new token costs one position's compute. Same math, an engineering chapter of its own.</p>
+
+<div class="quiz" data-concept="ch7.html#sampling" data-concept-label="§7.4 Sampling">
+  <div class="q-text"><p>Write the sampling loop from memory. Why index <code>[0, -1]</code> into the logits; what exactly does temperature do to the softmax (give the \(\tau \to 0\) and \(\tau = 1\) limits); and why must the key be split inside the loop?</p></div>
+  <div class="hint">logits has shape (1, t, V) — which prediction do you want? Temperature: softmax(z/τ).</div>
+  <div class="answer"><p>Code as in §7.4. <code>[0, -1]</code>: batch entry 0, final position — the distribution over the <em>next</em> token after the full context (other positions predict mid-context tokens we already have). Temperature: \(\mathrm{softmax}(z/\tau)\); \(\tau \to 0\) puts all mass on the argmax (greedy, deterministic, prone to repetition loops); \(\tau = 1\) is the unmodified learned distribution; \(\tau\) between trades diversity against fidelity. Splitting inside the loop gives each draw an independent subkey — reusing one key would make every step's "random" draw identical, locking the generator into a cycle.</p></div>
+</div>
+
+<h2 id="run">7.5 The verified run</h2>
+<p>Everything assembled is <code>code/transformer.py</code> (~200 lines, half comments). Setup and run:</p>
+<pre><code>python3 -m venv .venv &amp;&amp; .venv/bin/pip install jax
+.venv/bin/python code/test_jax_core.py     # the unit checks, ~20 s
+.venv/bin/python code/transformer.py       # the training run, ~4 min CPU
+</code></pre>
+<p>The tests machine-check chapters 2, 5, 6, 7 (every label names its section):</p>
+<pre><code>  PASS  layer_norm gives per-token mean 0, var 1 (ch5 §norm)
+  PASS  attention == per-head manual-loop reference (ch5 §attention, ch6 §attn-code)
+  PASS  causality: changing tokens >= t leaves logits < t unchanged (ch5 §mask)
+  PASS  cross-entropy of logits [2,0,0], target 0 = 0.2395 nats (ch5 §loss)
+  PASS  untrained loss ~= ln(vocab) = 2.398 (ch5 §loss, ch7 §debug)
+  PASS  jax.grad matches central finite differences on loss_fn (ch2 §grad)
+  PASS  first Adam step moves by exactly lr * sign(g) (ch7 §adam)
+
+ALL 7 CHECKS PASS
+</code></pre>
+<p>And the training run — with the default seed 0 on CPU, your losses should match these to the digit (the timings and the sampled text past the quoted lines will vary):</p>
+<pre><code>corpus: 2095 chars, vocab = 46
+params: 632,192  (expect first loss near ln 46 = 3.83)
+step     1  loss 3.857  (2s)
+step   200  loss 2.231  (24s)
+step   400  loss 0.728  (46s)
+step   600  loss 0.229  (69s)
+step   800  loss 0.151  (92s)
+step  1000  loss 0.126  (114s)
+step  1200  loss 0.114  (137s)
+step  1400  loss 0.104  (160s)
+step  1600  loss 0.101  (183s)
+step  1800  loss 0.096  (205s)
+step  2000  loss 0.093  (228s)
+
+FINAL: average loss over last 100 steps = 0.093
+
+sample:
+Alice after it, never once considering how
+in the world she was to get out again. The rabbit-hole went straight on
+like a tunnel for some way, and then dipped suddenly down, so suddenly
+…
+
+PASS: model fits the corpus (loss 0.093 < 1.0; untrained baseline ln 46 = 3.83).
+</code></pre>
+<p>Read the curve like an engineer: step 1 sits at 3.86 ≈ ln 46 (init is honest, no leakage); by step 400 it's far below 1.4-bits-per-char territory; it asymptotes near 0.09 — the model has effectively memorized the 2 KB corpus, which is exactly what 632 K parameters <em>should</em> do to 2 K characters. The sample quotes the text verbatim for three lines, then degrades where sampling temperature kicks it off the memorized rail. Overfitting — uselessness as a product, perfection as a verification: every part of the pipeline demonstrably works. Scaling to real text is only more data, more layers, and patience.</p>
+
+<div class="quiz" data-concept="ch7.html#run" data-concept-label="§7.5 Reading the run">
+  <div class="q-text"><p>Interpret the run like a reviewer: (a) what does <code>loss 3.857</code> at step 1 certify, and what would 6.2 or 2.1 have meant? (b) Why is final loss 0.093 <em>expected</em> rather than impressive — and why is that fine for our purpose? (c) Why does the sample start as a perfect quotation and then degrade?</p></div>
+  <div class="hint">(a) is the ln V ritual from §5.6. (b) compare parameter count to corpus size. (c) what does τ=0.8 sampling do on a distribution that's near-one-hot on the memorized continuation?</div>
+  <div class="answer"><p>(a) 3.857 ≈ ln 46 = 3.83 certifies sane init scales <em>and</em> no target leakage (mask works). ≫ln V ⇒ init too large (overconfident wrong softmax); ≪ln V at step 0 ⇒ the model sees its targets — mask bug. (b) 632 K parameters vs 2,095 training characters: capacity dwarfs data, so near-zero training loss is memorization, guaranteed by construction. Fine because the goal is <em>verifying the pipeline</em> — every gradient, mask, and update demonstrably works; generalization needs more data, not different code. (c) On memorized text the next-char distribution is nearly one-hot, so sampling follows the rail; each \(\tau=0.8\) draw still has small probability of an off-rail character, and one such slip puts the context outside anything memorized — errors compound autoregressively from there.</p></div>
+</div>
+
+<h2 id="debug">7.6 The debugging checklist</h2>
+<p>Things go wrong silently in JAX — that's the price of compilation. The bisection order that finds most bugs in minutes:</p>
+<ol>
+<li><strong>First loss ≈ ln V?</strong> (3.83 for us.) Too high → init scales. Too low → causal mask / target leakage.</li>
+<li><strong>Causality test.</strong> Corrupt tokens ≥ t; logits &lt; t must not move (test 3). Catches mask-after-softmax, wrong <code>tril</code> orientation, position-mixing bugs.</li>
+<li><strong>Overfit one batch.</strong> Train on a single fixed batch for 300 steps; loss should approach 0. If it can't memorize 32 windows, the model/optimizer wiring is broken — no point training on more data.</li>
+<li><strong>Gradient check.</strong> <code>jax.grad</code> vs central finite differences on a few coordinates (test 6). Catches <code>stop_gradient</code> misplacement and hand-rolled-math errors.</li>
+<li><strong>Loss plateaus at a suspicious constant?</strong> Compute what the constant <em>means</em>: stuck exactly at ln V ⇒ logits carry no information (dead forward pass, lr 1000× off, or Adam state not threaded — §4.4's audit list). A plateau at "loss of predicting spaces and e's" ⇒ model learned unigrams only; usually attention is broken while the MLP limps along.</li>
+<li><strong>JAX-specific suspects, in frequency order:</strong> reused PRNG key (identical batches/inits — §1.4); closure-captured state frozen at trace time (§3.3); forgetting to rebind (<code>x.at[…].set</code> result discarded — §1.2); accidental recompilation every step (changing shapes — §3.5); printing tracers and concluding values are broken (§3.1).</li>
+</ol>
+
+<div class="quiz" data-concept="ch7.html#debug" data-concept-label="§7.6 Debugging">
+  <div class="q-text"><p>Final recall of the course. From memory: (a) reproduce the 6-step debugging checklist in bisection order. (b) For each symptom, name the most likely JAX bug: loss falls beautifully but samples are gibberish from epoch 1 on <em>fresh</em> data; loss frozen at exactly 3.83 for 2000 steps; "updating" a config attribute on your model object does nothing; training loss 0.4 at step 0.</p></div>
+  <div class="hint">(b) in order: what data is it really seeing? is any signal reaching the logits? §3.3. ln V says what?</div>
+  <div class="answer"><p>(a) ① first-loss vs ln V → ② causality/corruption test → ③ single-batch overfit → ④ grad vs finite differences → ⑤ interpret the plateau constant → ⑥ sweep the JAX-specific list (key reuse, closure capture, unbound <code>.at</code>, recompilation, tracer prints). (b) Gibberish-despite-falling-loss: reused batch key — it memorized one batch (loss is real, data isn't fresh). Frozen at 3.83: no gradient signal reaching logits — optimizer state not threaded back, or lr effectively zero, or a <code>stop_gradient</code>/detached path severing the loss from params. Config attribute ignored: closure capture — the jitted function baked the old value in at trace time. Loss 0.4 at step 0: the model sees its targets — causal mask absent/inverted or inputs not shifted. </p></div>
+</div>
+
+<p style="margin-top:2rem"><strong>Where to next.</strong> You can now define and train a transformer in JAX with nothing but <code>jax.numpy</code>. Three worthy follow-ups: swap learned positions for RoPE and standard attention for GQA (the single-page advanced lesson in this repo, <code>transformer-jax.html</code>, builds exactly those, plus Mixture-of-Experts); rewrite <code>forward</code>'s layer loop as <code>lax.scan</code> over stacked params and feel compile times drop; and read the Flax NNX source for <code>MultiHeadAttention</code> — you will recognize every line, which is the point of having built it raw.</p>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 5 · TRPO: Trust Region Policy Optimization</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 5</span> · TRPO: Trust Region Policy Optimization</h1>
+<p class="subtitle">Chapter 4 left us with a local model \(L\) and a question: how far can we trust it? TRPO (Schulman et al., 2015) answers with a theorem — improvement is guaranteed if the step is small in KL — and an algorithm: maximize \(L\) inside a hard KL ball, solved with natural gradients, conjugate gradient, and a line search. PPO exists because this machinery works but is heavy; you must understand what it does to appreciate what PPO replaces it with.</p>
+
+<h2 id="bound">5.1 The monotonic improvement theorem</h2>
+<p>How wrong can the surrogate be? TRPO's theoretical core bounds the error by the policy divergence:</p>
+<div class="box keypoint"><div class="box-title">TRPO lower bound</div>
+$$ \eta(\pi') \;\ge\; \eta(\pi) + L_\pi(\pi') \;-\; C\, D_{\mathrm{KL}}^{\max}(\pi, \pi'), \qquad C = \frac{4\, \epsilon\, \gamma}{(1-\gamma)^2}, $$
+<p>where \(\epsilon = \max_{s,a}|A^\pi(s,a)|\) and \(D_{\mathrm{KL}}^{\max}\) is the KL maximized over states. The surrogate, debited by a KL penalty, <em>under-promises</em>: the true objective is at least the penalized surrogate.</p>
+</div>
+<p>Why this guarantees monotonic improvement: define \(M(\pi') = \eta(\pi) + L_\pi(\pi') - C\,D^{\max}_{\mathrm{KL}}(\pi,\pi')\). Then (i) \(\eta(\pi') \ge M(\pi')\) for all \(\pi'\), and (ii) \(M(\pi) = \eta(\pi)\) (at \(\pi'=\pi\), both \(L\) and KL are zero — §4.4). So if you choose \(\pi'\) maximizing \(M\), then</p>
+$$ \eta(\pi') \ge M(\pi') \ge M(\pi) = \eta(\pi). $$
+<p>Each iteration can only help. This is <strong>minorize–maximize</strong> (MM): \(M\) is a global lower bound (minorant) touching \(\eta\) at the current point — the same template as EM. The intuition behind the bound itself: the only lie in \(L\) is the frozen state distribution; if the policies are close in KL at every state, their trajectory distributions are close, so the visitation distributions \(d^{\pi}\) and \(d^{\pi'}\) cannot differ much, and the lie is bounded — with the horizon factor \(1/(1-\gamma)^2\) pricing how long the distribution shift has to compound.</p>
+
+<div class="quiz" data-concept="ch5.html#bound" data-concept-label="§5.1 Improvement theorem">
+  <div class="q-text"><p>State the TRPO lower bound from memory (structure matters more than the constant). Then give the three-line MM argument showing that maximizing the penalized surrogate guarantees \(\eta\) does not decrease, identifying where each of the two properties of \(M\) is used.</p></div>
+  <div class="hint">Property (i): minorant. Property (ii): tangency at the current policy — uses \(L_\pi(\pi)=0\) and \(D_{\mathrm{KL}}(\pi,\pi)=0\).</div>
+  <div class="answer"><p>\(\eta(\pi') \ge \eta(\pi) + L_\pi(\pi') - C D^{\max}_{\mathrm{KL}}(\pi,\pi')\) with \(C = 4\epsilon\gamma/(1-\gamma)^2\), \(\epsilon = \max|A^\pi|\). Let \(M(\pi') = \eta(\pi) + L_\pi(\pi') - C D^{\max}_{\mathrm{KL}}\). For the maximizer \(\pi^+\): \(\eta(\pi^+) \ge M(\pi^+)\) [bound, property (i)] \(\ge M(\pi)\) [\(\pi^+\) maximizes \(M\)] \(= \eta(\pi)\) [tangency, property (ii): both penalty terms vanish at \(\pi'=\pi\)]. Hence monotonic improvement.</p></div>
+</div>
+
+<h2 id="constraint">5.2 From penalty to constraint</h2>
+<p>Using the theoretical penalty directly is hopeless: \(C\) involves \(\max_{s,a}|A^\pi|\) and \(1/(1-\gamma)^2\) — with \(\gamma = 0.99\) that's a factor of \(4\times10^4\,\epsilon\), prescribing microscopically conservative steps. TRPO makes two pragmatic substitutions: trade the penalty for a <strong>hard constraint</strong> with a tunable radius \(\delta\), and replace the unwieldy \(\max_s\) KL with the <strong>average</strong> KL over visited states:</p>
+<div class="box definition"><div class="box-title">The TRPO optimization problem</div>
+$$ \max_\theta\; \mathbb{E}_{s\sim d^{\pi_\text{old}},\, a\sim\pi_\text{old}}\Big[ \frac{\pi_\theta(a|s)}{\pi_{\theta_\text{old}}(a|s)} \hat A(s,a) \Big] \quad \text{s.t.}\quad \bar D_{\mathrm{KL}}(\theta_\text{old}, \theta) := \mathbb{E}_{s\sim d^{\pi_\text{old}}}\big[ D_{\mathrm{KL}}(\pi_{\theta_\text{old}}(\cdot|s) \,\|\, \pi_\theta(\cdot|s)) \big] \le \delta. $$
+<p>Typical \(\delta \approx 0.01\). The constraint form is preferred over a fixed penalty coefficient because no single coefficient works across problems or even across iterations of one problem — a hard radius is far easier to set than a price. (Remember this sentence: it is also why PPO's adaptive-KL variant exists, §6.5.)</p>
+</div>
+
+<h2 id="natural">5.3 Solving it: linearize the objective, quadratize the constraint</h2>
+<p>For a small step \(\Delta = \theta - \theta_\text{old}\), expand both pieces around \(\theta_\text{old}\): the objective to first order (its value and gradient \(g = \nabla_\theta L|_{\theta_\text{old}}\) — which by §4.4 is the policy gradient), the constraint to second order (its value and gradient vanish at \(\Delta=0\), §4.5, leaving the Fisher quadratic):</p>
+$$ \max_\Delta\; g^\top \Delta \quad\text{s.t.}\quad \tfrac{1}{2}\Delta^\top F \Delta \le \delta. $$
+<p>Lagrangian \(g^\top\Delta - \frac{\mu}{2}\Delta^\top F\Delta\); stationarity gives \(g = \mu F \Delta\), so the direction is \(\Delta \propto F^{-1} g\) — the <strong>natural gradient</strong>. The constraint is active at the optimum (the objective is linear — push to the boundary), which pins the length: setting \(\Delta = \beta F^{-1}g\) in \(\frac12 \Delta^\top F\Delta = \delta\) yields \(\frac{\beta^2}{2} g^\top F^{-1} g = \delta\), hence</p>
+<div class="box keypoint"><div class="box-title">The TRPO step</div>
+$$ \Delta^{*} \;=\; \sqrt{\frac{2\delta}{\,g^\top F^{-1} g\,}}\; F^{-1} g. $$
+<p>\(F^{-1}\) re-expresses the gradient in behavior space: directions in which the policy distribution is hyper-sensitive (large Fisher eigenvalue) get shrunk, insensitive directions get amplified. The resulting step of behavioral size \(\sqrt{2\delta}\) is the same <em>policy change</em> regardless of how the network is parametrized — the §4.1 problem, solved exactly to second order.</p>
+</div>
+
+<div class="quiz" data-concept="ch5.html#natural" data-concept-label="§5.3 The natural gradient step">
+  <div class="q-text"><p>Derive the TRPO step from memory: write the local problem (linear objective, quadratic constraint — justify from §4.4/§4.5 why those orders), solve the Lagrangian for the direction, argue the constraint is tight, and derive the step length. Why does \(F^{-1}g\) fix the parametrization-sensitivity problem of §4.1?</p></div>
+  <div class="hint">Stationarity: \(g = \mu F\Delta\). Then substitute \(\Delta = \beta F^{-1}g\) into \(\frac12\Delta^\top F\Delta = \delta\).</div>
+  <div class="answer"><p>\(L\)'s zeroth/first-order data at \(\theta_\text{old}\) are 0 and \(g\) (the policy gradient); KL's zeroth/first orders vanish, so its leading term is \(\frac12\Delta^\top F\Delta\). Problem: \(\max g^\top\Delta\) s.t. \(\frac12\Delta^\top F\Delta\le\delta\). Lagrangian stationarity: \(g = \mu F\Delta \Rightarrow \Delta \propto F^{-1}g\). A linear objective increases along the ray, so the optimum sits on the boundary; \(\frac{\beta^2}{2}g^\top F^{-1}g = \delta \Rightarrow \beta = \sqrt{2\delta/(g^\top F^{-1}g)}\). \(F\) measures how strongly each parameter direction moves the <em>distribution</em>; preconditioning by \(F^{-1}\) equalizes this, making the step a fixed-size move in behavior space, invariant to reparametrization.</p></div>
+</div>
+
+<h2 id="cg">5.4 Conjugate gradient: \(F^{-1}g\) without ever forming \(F\)</h2>
+<p>For a network with \(n\) parameters (easily \(10^5\)–\(10^7\)), \(F\) is \(n\times n\): storing it is impossible, inverting it absurd. TRPO's engineering insight: you never need \(F\) — only the ability to compute <strong>Fisher–vector products</strong> \(v \mapsto Fv\). Two facts combine:</p>
+<ul>
+<li><strong>Conjugate gradient</strong> solves \(Fx = g\) for symmetric positive-definite \(F\) using only matvecs — and ~10 iterations give an \(x \approx F^{-1}g\) good enough for a trust-region step (we don't need an exact solve; the line search mops up).</li>
+<li><strong>\(Fv\) via double backprop:</strong> \(F\) is the Hessian of the average KL at \(\theta_\text{old}\) (§4.5). So compute the scalar \(\bar D_{\mathrm{KL}}\), backprop to get \(\nabla\bar D_{\mathrm{KL}}\), dot with the fixed vector \(v\), and backprop the scalar \(\nabla\bar D_{\mathrm{KL}}^\top v\) again: the result is \(\nabla^2\bar D_{\mathrm{KL}}\, v = Fv\). Cost: a small constant times one gradient evaluation. (In practice a damped product \((F + \beta I)v\), \(\beta\sim 0.1\), keeps CG stable.)</li>
+</ul>
+
+<div class="quiz" data-concept="ch5.html#cg" data-concept-label="§5.4 CG and Fisher-vector products">
+  <div class="q-text"><p>TRPO needs \(F^{-1}g\). Explain (a) why forming or inverting \(F\) is off the table for neural policies, (b) what property of conjugate gradient makes it the right solver here and roughly how many iterations TRPO uses, and (c) the double-backprop recipe for \(Fv\) — every step, in order.</p></div>
+  <div class="hint">(c) starts from a <em>scalar</em>: the average KL between the frozen old policy and the current one, evaluated at \(\theta_\text{old}\).</div>
+  <div class="answer"><p>(a) \(F\) is \(n\times n\) with \(n\) up to millions of parameters — \(O(n^2)\) memory to store, \(O(n^3)\) to invert; both impossible. (b) CG solves SPD systems using only products \(v\mapsto Fv\), never the matrix, and converges fast in the large eigen-directions — ~10 iterations suffice for an approximate trust-region direction. (c) Compute scalar \(k = \bar D_{\mathrm{KL}}(\theta_\text{old}\|\theta)\) at \(\theta = \theta_\text{old}\); autograd → \(u = \nabla_\theta k\) (a vector, kept in the graph); form scalar \(u^\top v\) with \(v\) detached; autograd again → \(\nabla_\theta(u^\top v) = \nabla^2 k\, v = Fv\), since the KL Hessian at the expansion point <em>is</em> the Fisher matrix.</p></div>
+</div>
+
+<h2 id="linesearch">5.5 The line search: trust, but verify</h2>
+<p>The step \(\Delta^*\) was derived from <em>approximations</em> — linearized objective, quadratic KL. The true KL at \(\theta_\text{old} + \Delta^*\) may exceed \(\delta\), and the true surrogate may even decrease. TRPO therefore backtracks: try \(\theta_\text{old} + \alpha^j \Delta^*\) for \(\alpha \approx 0.8\), \(j = 0, 1, 2, \dots\), accepting the first candidate that satisfies <strong>both</strong> checks, now computed exactly (no Taylor expansion):</p>
+<ol>
+<li>the actual average KL constraint: \(\bar D_{\mathrm{KL}}(\theta_\text{old}, \theta) \le \delta\);</li>
+<li>actual surrogate improvement: \(\hat L(\theta) \gt \hat L(\theta_\text{old})\) (with a sufficient-decrease flavor in practice).</li>
+</ol>
+<p>If ten halvings all fail, take no step. This final verification — checking the <em>real</em> quantities, not the model — is what makes TRPO so reliable in practice: a bad quadratic model costs you a smaller step, never a destroyed policy.</p>
+
+<h2 id="algorithm">5.6 TRPO assembled, and what it costs</h2>
+<div class="fig"><pre>
+TRPO iteration
+  1. run π_old for N steps; compute GAE advantages Â          (Ch 3)
+  2. g  ← ∇_θ  (1/N) Σ r_t(θ) Â_t   at θ_old                  (Ch 4)
+  3. x  ≈ F⁻¹ g   by ~10 CG iterations, each one Fv product   (§5.4)
+  4. Δ* ← sqrt(2δ / xᵀg) · x                                  (§5.3; note xᵀg = gᵀF⁻¹g)
+  5. backtracking line search on θ_old + αʲ Δ*:
+        accept first j with  KL ≤ δ  AND  surrogate improved   (§5.5)
+  6. fit value function; repeat
+</pre><div class="caption">One iteration. Compare with PPO's (Ch 6): steps 2–5 collapse into "Adam on a clipped loss".</div></div>
+<p>The bill for the guarantee:</p>
+<ul>
+<li><strong>Complexity</strong> — CG loop, double backprop, KL evaluations, line search: several hundred lines of delicate code versus a dozen for the eventual PPO loss.</li>
+<li><strong>Compute</strong> — each update costs ~10 Fisher-vector products plus line-search evaluations, several times a plain gradient step.</li>
+<li><strong>Rigidity</strong> — the clean \(F^{-1}g\) story strains with architectures whose policy and value share parameters (the constrained problem no longer factors cleanly), with very large networks (CG cost), and it can't exploit minibatch optimizers: each batch yields <em>one</em> carefully verified step, where PPO will take dozens of cheap ones.</li>
+</ul>
+<p>Hold the question "what did the constraint actually buy?" in mind: a <em>limit on how far the new policy's action distribution drifts from the data-collecting policy's</em>. Chapter 6 buys approximately the same thing with a <code>clamp</code>.</p>
+
+<div class="quiz" data-concept="ch5.html#linesearch" data-concept-label="§5.5–5.6 Line search & costs">
+  <div class="q-text"><p>(a) The natural-gradient step already encodes the KL radius \(\delta\) — so why does TRPO still need a line search, and what exactly does it check (both conditions, computed how)? (b) List three concrete reasons TRPO is considered heavy, each tied to a specific piece of the §5.6 pseudocode.</p></div>
+  <div class="hint">(a) Which quantities in the derivation were Taylor approximations, and at what step size do they stop being accurate?</div>
+  <div class="answer"><p>(a) \(\Delta^*\) is optimal for the <em>linearized</em> objective and <em>quadratic</em> KL; at finite step size the true KL can overshoot \(\delta\) and the true surrogate can fall. The backtracking search evaluates, exactly and per candidate \(\theta_\text{old}+\alpha^j\Delta^*\): (1) actual average KL \(\le \delta\), (2) actual sampled surrogate improved; first passer wins, no step if none. (b) Step 3: ~10 CG iterations each requiring a double-backprop \(Fv\) product — compute and implementation burden; step 5: extra full-batch KL/surrogate evaluations per candidate; steps 2–5 as a whole produce a single parameter update per rollout and resist shared actor-critic parameters and minibatching, unlike first-order optimizers.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch5.html#algorithm" data-concept-label="§5.6 TRPO assembled">
+  <div class="q-text"><p>Write the full TRPO iteration as pseudocode from memory — all six steps in order, with the formula in step 4 exact. Sanity check: where do \(g\) and \(x\) come from, and why is \(x^\top g\) the right denominator?</p></div>
+  <div class="hint">Step 4's coefficient came from making the quadratic constraint tight in §5.3 — with \(x \approx F^{-1}g\) substituting for the exact solve.</div>
+  <div class="answer"><p>(1) rollout under \(\pi_\text{old}\), GAE; (2) \(g = \nabla_\theta \hat L\) at \(\theta_\text{old}\); (3) \(x \approx F^{-1}g\) via CG on \(Fx=g\) with double-backprop \(Fv\) products; (4) \(\Delta^* = \sqrt{2\delta/(x^\top g)}\,x\) — since \(x \approx F^{-1}g\), \(x^\top g \approx g^\top F^{-1} g = \Delta^\top F \Delta / \beta^2\), exactly the quadratic form the constraint needs; (5) backtrack \(\alpha^j\Delta^*\), accept on [true KL \(\le\delta\) ∧ surrogate ↑], else no step; (6) regress \(V_\phi\) on returns; loop.</p></div>
+</div>
+
+<div class="box recall-pause"><div class="box-title">Before moving on</div>
+<p>Close the page. Reproduce: the lower bound and the 3-line MM argument; the constrained problem; the \(\Delta^* = \sqrt{2\delta/g^\top F^{-1}g}\,F^{-1}g\) derivation; the \(Fv\) double-backprop recipe; the two line-search conditions. Then formulate, in your own words, the one-sentence summary of what the entire apparatus enforces — you'll need that sentence to see why PPO's clip is a legitimate substitute.</p>
+</div>
+
+</main>
+</body>
+</html>

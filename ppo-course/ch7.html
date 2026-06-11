@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 7 · Building PPO from Scratch</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 7</span> · Building PPO from Scratch</h1>
+<p class="subtitle">PPO's core is twenty lines, but the published results depend on a constellation of implementation details that papers mention in passing or not at all. This chapter gives you the full algorithm, the details that decide success, a staged build ladder with a verification step at every rung, and the reference code — machine-checked on this machine, expected output included.</p>
+
+<h2 id="algorithm">7.1 The complete algorithm</h2>
+<div class="fig"><pre>
+PPO (actor-critic, fixed-window rollouts)
+hyperparams: N envs, T steps, K epochs, M minibatches, ε, γ, λ, c1, c2, lr
+
+initialize policy/value net θ; θ_old ← θ
+loop until budget exhausted:
+  # ---- Phase 1: collect (Ch 1-3) ----
+  run π_θold in N parallel envs for T steps each, storing
+      (s_t, a_t, log π_θold(a_t|s_t), r_t, done_t, V_θold(s_t))      # NT transitions
+  bootstrap value V(s_T) for each env's last state
+  compute GAE advantages Â_t (backward recursion, §3.6)
+  value targets  R̂_t ← Â_t + V_θold(s_t)
+
+  # ---- Phase 2: optimize (Ch 4-6) ----
+  for epoch = 1..K:
+      shuffle the NT transitions; split into M minibatches
+      for each minibatch:
+          r_t(θ)   ← exp(log π_θ(a_t|s_t) − log π_θold(a_t|s_t))
+          normalize Â over the minibatch                              # §7.2
+          L_clip   ← mean min(r Â, clip(r, 1−ε, 1+ε) Â)
+          L_value  ← mean (V_θ(s_t) − R̂_t)²       (optionally clipped, §7.2)
+          L        ← −L_clip + c1·L_value − c2·entropy
+          Adam step on ∇L; clip grad-norm to 0.5
+      (optional) break epoch loop if approx-KL &gt; target              # §6.5
+  θ_old ← θ
+</pre><div class="caption">Everything earlier in the course locates itself here: Ch 2-3 build Phase 1's last three lines, Ch 4-6 build Phase 2's loss.</div></div>
+
+<div class="quiz" data-concept="ch7.html#algorithm" data-concept-label="§7.1 The algorithm">
+  <div class="q-text"><p>Write the full two-phase PPO algorithm from memory, at the level of the pseudocode above: what is stored per transition during collection, the three lines that close Phase 1, and the exact order of operations inside a minibatch step.</p></div>
+  <div class="hint">Per transition you must store everything Phase 2 needs that would be wrong to recompute under the new θ. What five things?</div>
+  <div class="answer"><p>Store \((s_t, a_t, \log\pi_{\theta_\text{old}}(a_t|s_t), r_t, \text{done}_t, V_{\theta_\text{old}}(s_t))\) — the old log-prob and old value <em>must</em> be snapshotted at collection. Close Phase 1: bootstrap \(V(s_T)\), GAE backward pass, targets \(\hat R = \hat A + V_\text{old}\). Minibatch step: forward pass for new log-probs/values/entropy → ratio via exp(new−old) → normalize \(\hat A\) → clipped policy loss (min!) → value loss → combined loss with signs \(-,+,-\) → backprop → grad-norm clip → Adam step. Epochs over shuffled minibatches, optional KL early-stop, then refresh θ_old.</p></div>
+</div>
+
+<h2 id="details">7.2 The details that decide success</h2>
+<p>Empirical studies (notably "The 37 Implementation Details of PPO" and Engstrom et al.'s "Implementation Matters") found these contribute as much to reported performance as the clipped objective itself. Learn them as a checklist:</p>
+
+<h3>Data &amp; advantages</h3>
+<ul>
+<li><strong>Fixed-window rollouts.</strong> Collect exactly \(N \times T\) transitions regardless of episode boundaries; episodes spanning windows are stitched by the bootstrap. Decouples batch size from episode length.</li>
+<li><strong>Termination vs truncation.</strong> A <em>terminated</em> episode ended in the MDP: bootstrap value 0. A <em>truncated</em> one hit a time limit in a still-alive state: bootstrapping 0 there teaches the critic that the state is worthless — a systematic bias. Exact fix: add \(\gamma V(s_{\text{final}})\) to the last reward of truncated episodes (the GAE recursion cuts there anyway, so this is the only entry point). Watch your vector-env autoreset semantics: with gymnasium's <code>NEXT_STEP</code> mode a naive loop silently records one garbage transition per episode (this exact bug cost the reference implementation ~40% of its final score during development — see §7.5).</li>
+<li><strong>Advantage normalization.</strong> Per minibatch: \(\hat A \leftarrow (\hat A - \mathrm{mean})/(\mathrm{std} + 10^{-8})\). The mean-shift is "free" by the baseline argument (§3.1); the std division stabilizes the effective step size across the run. Normalize <em>after</em> GAE, never the returns used as value targets.</li>
+</ul>
+
+<h3>Loss &amp; optimizer</h3>
+<ul>
+<li><strong>Value clipping.</strong> \(L^V = \max\big((V_\theta - \hat R)^2, (\mathrm{clip}(V_\theta - V_\text{old}, -\epsilon, \epsilon) + V_\text{old} - \hat R)^2\big)\): the critic, too, is held near its data-collection self. Adopted by most implementations for parity with the originals, though ablations find it neutral-to-slightly-harmful — know it, doubt it.</li>
+<li><strong>Gradient-norm clipping</strong> at 0.5; <strong>Adam with \(\varepsilon = 10^{-5}\)</strong> (not the default \(10^{-8}\)); <strong>learning-rate annealing</strong> linearly to zero — a slowly tightening trust region by other means.</li>
+<li><strong>Orthogonal initialization</strong>; policy head scaled tiny (std 0.01) so the initial policy is near-uniform and \(\log\pi\) gradients are well-behaved; value head std 1.0.</li>
+</ul>
+
+<h3>Diagnostics (what to log)</h3>
+<ul>
+<li><strong>Episodic return</strong> — the only number that is the actual objective (§2.6's warning: never the loss).</li>
+<li><strong>Approximate KL</strong>: \(\hat k_3 = \mathbb{E}[(r - 1) - \log r]\) — a low-variance, always-nonnegative estimator of \(D_{\mathrm{KL}}(\pi_\text{old}\|\pi_\theta)\) (better than the naive \(\mathbb{E}[-\log r]\), which can go negative on samples). Healthy: \(10^{-3}\)–\(10^{-2}\); used for early stopping.</li>
+<li><strong>Clip fraction</strong> — share of samples with \(|r - 1| \gt \epsilon\). Healthy: roughly 0.05–0.3 late in training; ~0 means timid updates (or tiny lr), &gt;0.5 means the policy is tearing away from the data.</li>
+<li><strong>Explained variance</strong> of the critic: \(1 - \mathrm{Var}(\hat R - V)/\mathrm{Var}(\hat R)\). Near 1: critic informative; ≤ 0: critic worse than predicting the mean (it will be noisy early — and, late in training on a solved env with near-constant returns, the denominator collapses and the metric becomes erratic; read it with the return curve, see §7.4).</li>
+<li><strong>Entropy</strong> — should decay smoothly; a cliff-dive to zero is premature collapse (raise \(c_2\), check advantage scaling).</li>
+</ul>
+
+<div class="quiz" data-concept="ch7.html#details" data-concept-label="§7.2 Termination vs truncation">
+  <div class="q-text"><p>Your CartPole agent's value function systematically underestimates good states near the 500-step time limit, capping performance. Explain the termination/truncation distinction, the exact one-line fix and why it interacts correctly with the GAE recursion, and what \(V\) is being taught in the buggy version.</p></div>
+  <div class="hint">At a time limit, is the state worth 0? What does the done-mask do to \(\delta_{T_{ep}}\) there?</div>
+  <div class="answer"><p>Termination = the MDP ended (pole fell): future value genuinely 0. Truncation = external time limit in a live state: the state retains its value, but the done-mask zeroes the bootstrap in \(\delta = r + \gamma V(s')(1-d) - V(s)\), teaching \(V\) that pre-limit states are near-worthless, and the error propagates backward through bootstrapping. Fix: for truncated-not-terminated episodes, \(r_{\text{last}} \mathrel{+}= \gamma V(s_{\text{final}})\). It's exact because the recursion cuts at the boundary regardless — the folded-in value is precisely the bootstrap term the mask removed.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch7.html#details" data-concept-label="§7.2 Diagnostics">
+  <div class="q-text"><p>From memory: name the five diagnostics every PPO run should log, give the healthy range or shape for each, and the k3 approximate-KL formula with the reason it beats \(\mathbb{E}[-\log r]\).</p></div>
+  <div class="hint">k3 uses the ratio and its log together; what property does \((r-1) - \log r\) have for all \(r \gt 0\)?</div>
+  <div class="answer"><p>(1) episodic return — rising, the real objective; (2) approx-KL \(\hat k_3 = \mathbb{E}[(r-1)-\log r]\), ~\(10^{-3}\)–\(10^{-2}\) — pointwise nonnegative (convexity: \(\log r \le r-1\)) and lower-variance than \(\mathbb{E}[-\log r]\), whose samples can be negative; (3) clip fraction ~0.05–0.3 (0 = timid, &gt;0.5 = tearing away); (4) explained variance → 1 as the critic learns (noisy early; unstable when return variance collapses); (5) entropy — smooth decay, no cliff.</p></div>
+</div>
+
+<h2 id="ladder">7.3 The build ladder — write it yourself</h2>
+<p>Build in five rungs, <em>verifying each before the next</em>. The reference <code>code/ppo.py</code> (~230 lines) is your answer key, not your starting point. Environment: <code>CartPole-v1</code>; architecture: separate 64-tanh-64 actor and critic heads (§7.2 init).</p>
+<ol>
+<li><strong>Rollout collector.</strong> N=4 envs × T=128 steps; store the six per-transition fields (§7.1 recall). <em>Verify:</em> shapes \((T, N, \cdot)\); with a random policy, episodic returns ≈ 20-30; stored log-probs match recomputing them from the stored states and actions.</li>
+<li><strong>GAE.</strong> The §3.6 loop, vectorized over envs, with the truncation bootstrap. <em>Verify:</em> port <code>test_ppo_core.py</code>'s brute-force comparison to your function (or run the file against it) — all three GAE checks must pass to 1e-10.</li>
+<li><strong>Loss.</strong> Ratio from stored vs new log-probs; clipped policy loss; value loss; entropy; combined with §6.7's signs. <em>Verify:</em> on the very first minibatch of fresh data (before any optimizer step), ratios are exactly 1.0, the policy loss equals \(-\mathrm{mean}(\hat A_{\text{norm}})\approx 0\), and approx-KL is 0. PASS 4-5 of the test file checks your clip behavior.</li>
+<li><strong>Update loop.</strong> K=4 epochs, M=4 minibatches, Adam(2.5e-4, eps=1e-5), grad clip 0.5, lr anneal. <em>Verify:</em> after one update, approx-KL ∈ \([10^{-4}, 10^{-1}]\) — outside that, hunt before training.</li>
+<li><strong>Train.</strong> 400k steps, seed 1. <em>Verify:</em> the §7.4 expected output — returns through ~150 by 15k steps, ~480+ by 350k, final PASS.</li>
+</ol>
+
+<div class="quiz" data-concept="ch7.html#ladder" data-concept-label="§7.3 Rung 2 — write GAE">
+  <div class="q-text"><p><strong>Coding recall (paper or editor, no peeking):</strong> write the complete vectorized GAE function — signature <code>gae(rewards, values, dones, next_value, next_done, gamma, lam) -&gt; advantages</code>, arrays shaped \((T, N)\) — including both boundary rules. Then state its two verification properties (the endpoint identities).</p></div>
+  <div class="hint">One backward loop; at \(t = T-1\) the "next" quantities come from the function arguments; mask <em>both</em> the bootstrap inside δ and the recursion term.</div>
+  <div class="answer"><pre>def gae(rewards, values, dones, next_value, next_done, gamma, lam):
+    T = rewards.shape[0]
+    adv  = np.zeros_like(rewards)
+    last = np.zeros_like(next_value)
+    for t in reversed(range(T)):
+        nonterm = 1.0 - (dones[t+1] if t &lt; T-1 else next_done)
+        v_next  = values[t+1] if t &lt; T-1 else next_value
+        delta   = rewards[t] + gamma * v_next * nonterm - values[t]
+        last    = delta + gamma * lam * nonterm * last
+        adv[t]  = last
+    return adv</pre><p>Verify: with λ=0 it returns exactly the TD errors; with λ=1 (no terminals) exactly discounted-returns-minus-values. Both are PASS 2-3 in <code>test_ppo_core.py</code>.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch7.html#ladder" data-concept-label="§7.3 Rung 3 — write the loss">
+  <div class="q-text"><p><strong>Coding recall:</strong> write the PPO minibatch loss in PyTorch — from <code>new_logp, old_logp, adv, new_v, old_v, returns, entropy</code> to the scalar <code>loss</code> — including ratio, advantage normalization, clipped policy loss, (clipped) value loss, and coefficients. Mark the two places a sign error classically hides.</p></div>
+  <div class="hint">Write the policy term as a loss directly: <code>max(-adv*ratio, -adv*clip(ratio))</code> is equivalent to negating the min — fewer sign hazards.</div>
+  <div class="answer"><pre>logratio = new_logp - old_logp
+ratio    = logratio.exp()
+adv      = (adv - adv.mean()) / (adv.std() + 1e-8)
+pg_loss  = torch.max(-adv * ratio,
+                     -adv * ratio.clamp(1-eps, 1+eps)).mean()
+v_clip   = old_v + (new_v - old_v).clamp(-eps, eps)
+v_loss   = 0.5 * torch.max((new_v - returns)**2,
+                           (v_clip  - returns)**2).mean()
+loss     = pg_loss + 0.5 * v_loss - 0.01 * entropy.mean()</pre><p>Sign traps: (1) the policy term — maximizing min(·) = minimizing max(−·); negate <em>inside</em> the max, both branches; (2) entropy enters the loss with a minus (we maximize it). Also: <code>old_logp</code>, <code>adv</code>, <code>returns</code>, <code>old_v</code> must all be detached/stored — only <code>new_*</code> and <code>entropy</code> carry gradients.</p></div>
+</div>
+
+<h2 id="reference">7.4 The reference run — machine-verified</h2>
+<p>Both companion files were executed on this machine. The checks:</p>
+<div class="fig"><pre>$ python code/test_ppo_core.py
+PASS 1: GAE backward recursion == brute-force sum of (γλ)^l δ
+PASS 2: λ=1 gives A_t = (discounted return) − V(s_t)  (pure Monte Carlo)
+PASS 3: λ=0 gives A_t = δ_t = r_t + γV(s_{t+1}) − V(s_t)  (one-step TD)
+PASS 4: clipped surrogate matches the hand-computed ch6 example
+PASS 5: grad is zero when clip protects (A&gt;0, r&gt;1+ε); alive when the unclipped branch is worse (A&lt;0, r&gt;1+ε)
+PASS 6: E[∇ log π] = 0 (EGLP lemma) verified exactly for a categorical
+ALL 6 CHECKS PASS</pre><div class="caption">Output reproduced verbatim from this machine.</div></div>
+<p>And the training run (CPU, ~70 s; seed 1, default hyperparameters — excerpted):</p>
+<div class="fig"><pre>$ python code/ppo.py
+update   10/781  step    5120  avg_return(last20)    42.5  approx_kl 0.0004  clip_frac 0.000  expl_var 0.01  sps 5869
+update   20/781  step   10240  avg_return(last20)    84.2  approx_kl 0.0006  clip_frac 0.000  expl_var 0.15  sps 5983
+update   30/781  step   15360  avg_return(last20)   197.4  approx_kl 0.0005  clip_frac 0.000  expl_var 0.24  sps 6014
+update   60/781  step   30720  avg_return(last20)   222.0  approx_kl 0.0000  clip_frac 0.000  expl_var 0.17  sps 6052
+update  100/781  step   51200  avg_return(last20)   250.2  approx_kl 0.0000  clip_frac 0.000  expl_var 0.23  sps 6077
+update  200/781  step  102400  avg_return(last20)   303.2  approx_kl 0.0001  clip_frac 0.000  expl_var 0.84  sps 6101
+update  300/781  step  153600  avg_return(last20)   385.3  approx_kl 0.0001  clip_frac 0.000  expl_var 0.03  sps 6125
+update  400/781  step  204800  avg_return(last20)   490.1  approx_kl 0.0009  clip_frac 0.000  expl_var 0.21  sps 6130
+update  600/781  step  307200  avg_return(last20)   469.6  approx_kl 0.0001  clip_frac 0.000  expl_var 0.02  sps 6098
+update  690/781  step  353280  avg_return(last20)   500.0  approx_kl 0.0000  clip_frac 0.000  expl_var 0.41  sps 6077
+update  781/781  step  399872  avg_return(last20)   500.0  approx_kl 0.0000  clip_frac 0.000  expl_var 0.46  sps 6080
+FINAL: average return over last 20 episodes = 500.0
+PASS: CartPole-v1 effectively solved (&gt;= 400 / 500).</pre><div class="caption">Excerpted verbatim from this machine. Note the diagnostics in motion: returns climb from random (~30) to the 500 cap; explained variance grinds upward through mid-training, then turns erratic once returns saturate (the §7.2 caveat: Var(R̂) collapses on a solved env — read it alongside the return curve, which is what actually matters). On a task this easy, with lr-annealed small steps, approx-KL and clip-fraction stay near zero; on harder benchmarks (Atari, MuJoCo) expect approx-KL ~1e-3–1e-2 and clip fractions of 0.1–0.3.</div></div>
+
+<h2 id="debug">7.5 Debugging checklist (collected from the course's own bugs)</h2>
+<table>
+<tr><th>Symptom</th><th>Prime suspects</th></tr>
+<tr><td>Return flat at random-policy level</td><td>sign error in a loss term (§6.7); advantages not detached so critic gradients fight the policy (§2.6); ratio computed old/new instead of new/old</td></tr>
+<tr><td>Learns, then collapses suddenly</td><td>no grad clipping; lr too high; missing min in the clip objective (§6.4); entropy collapse — check the entropy curve</td></tr>
+<tr><td>Plateaus well below solved</td><td>truncation treated as termination (§7.2); vector-env autoreset garbage transitions — verify which autoreset mode your gymnasium uses (§7.2); γ too low for the horizon (§3.5)</td></tr>
+<tr><td>approx-KL ≈ 0 <em>and</em> no learning</td><td>old log-probs recomputed under current θ instead of stored (ratio ≡ 1 forever — the loss reduces to vanilla PG and the epochs do nothing)</td></tr>
+<tr><td>approx-KL exploding, clip fraction &gt; 0.5</td><td>advantages not normalized; lr too high; too many epochs — add KL early stopping (§6.5)</td></tr>
+<tr><td>Explained variance stuck ≤ 0 late in training</td><td>value targets computed with wrong bootstrap (done-mask off by one step — §3.6); value lr/coefficient too small</td></tr>
+<tr><td>GAE advantages look reasonable but tests fail at episode ends</td><td>nonterminal mask applied to δ but not the recursion term, or vice versa (§3.6 recall)</td></tr>
+</table>
+
+<div class="quiz" data-concept="ch7.html#debug" data-concept-label="§7.5 Debugging">
+  <div class="q-text"><p>Diagnose from memory: (a) approx-KL prints exactly 0 every epoch and nothing improves; (b) training plateaus at ~60% of max score with healthy-looking losses; (c) returns rise for 100k steps then collapse to random in a few updates. One primary hypothesis and one concrete check each.</p></div>
+  <div class="hint">(a) what makes a ratio identically 1? (b) think §7.2 data bugs that <em>don't</em> show in any loss; (c) what failure modes are sudden rather than gradual?</div>
+  <div class="answer"><p>(a) Old log-probs are being recomputed with the current network instead of read from the rollout buffer, so \(r \equiv 1\); check by printing stored vs recomputed log-probs after one optimizer step — they must differ. (b) Data-pipeline bias invisible to the loss: truncation-as-termination or autoreset garbage transitions; check by inspecting transitions at episode boundaries in the buffer (is the post-terminal obs a reset state? did the last reward get its \(\gamma V\) bootstrap?). (c) Trust-region failure: missing min / no grad clip / entropy collapse; check the logged entropy and clip fraction in the updates just before the cliff — entropy cliff-diving or clip fraction spiking names the culprit.</p></div>
+</div>
+
+<h2 id="beyond">7.6 Where to go next</h2>
+<ul>
+<li><strong>Continuous control:</strong> swap the categorical head for the §1.2 diagonal Gaussian (learned state-independent log-std, actions squashed or clipped to bounds) and run MuJoCo/Box2D — the rest of the file is unchanged. That generality is much of why PPO became the default.</li>
+<li><strong>Scale:</strong> more envs (vectorization is the cheap speedup), observation/reward normalization (the remaining "37 details"), recurrent policies for partial observability.</li>
+<li><strong>RLHF:</strong> PPO with a per-token KL penalty against a frozen reference model (§6.6's idea) was the original alignment recipe for LLMs — the ratio, the clip, GAE: everything transfers.</li>
+<li><strong>Primary sources</strong>, now fully readable: Schulman et al. 2015 (TRPO), Schulman et al. 2015b (GAE), Schulman et al. 2017 (PPO); Engstrom et al. 2020 and Huang et al.'s "37 Details" for the empirical fine print.</li>
+</ul>
+
+<div class="box recall-pause"><div class="box-title">Capstone</div>
+<p>The final recall is the course's thesis: <em>write PPO from a blank file</em>, using only the build ladder's rung descriptions, and make it print the PASS line. When your implementation diverges from the expected output, Chapter 7.5 is your differential diagnosis — and every entry in it links back to a derivation you can now reproduce. That loop — predict, fail, re-derive, fix — is the actual course.</p>
+</div>
+
+</main>
+</body>
+</html>

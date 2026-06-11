@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 5 · The Transformer on Paper</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 5</span> · The Transformer on Paper</h1>
+<p class="subtitle">JAX is parked for one chapter. Before implementing anything you need the architecture cold: every tensor, every shape, every design decision <em>and its reason</em>. We build a decoder-only language model — the GPT family shape — because next-token prediction needs no labels and one architecture carries you from toy to frontier.</p>
+
+<h2 id="config">5.0 The model we will build</h2>
+<p>One fixed configuration for the rest of the course; all shape drills use it. A character-level language model:</p>
+<table>
+<tr><th>symbol</th><th>meaning</th><th>ours</th></tr>
+<tr><td>\(V\)</td><td>vocabulary size (distinct characters)</td><td>46</td></tr>
+<tr><td>\(D\)</td><td>d_model, width of the residual stream</td><td>128</td></tr>
+<tr><td>\(L\)</td><td>number of transformer blocks</td><td>3</td></tr>
+<tr><td>\(H\)</td><td>attention heads</td><td>4</td></tr>
+<tr><td>\(d_h\)</td><td>head dimension, \(D/H\)</td><td>32</td></tr>
+<tr><td>\(F\)</td><td>hidden width of the MLP (d_ff)</td><td>512</td></tr>
+<tr><td>\(B, T\)</td><td>batch size, sequence length</td><td>32, 64</td></tr>
+</table>
+<p>The whole pipeline, tokens to loss:</p>
+<pre><code>tokens (B, T) ints
+  ├─ token embedding + position embedding ──► x: (B, T, D)   the residual stream
+  │    repeat × L:
+  │      x = x + Attention( LayerNorm(x) )      ← tokens talk to each other
+  │      x = x + MLP( LayerNorm(x) )            ← each token thinks alone
+  ├─ final LayerNorm
+  ├─ unembed (embedding matrix transposed) ──► logits: (B, T, V)
+  └─ cross-entropy against tokens shifted left by one ──► scalar loss
+</code></pre>
+<p>Two structural facts to internalize now. The <strong>residual stream</strong> \(x\) is the spine: blocks <em>read</em> from it and <em>add</em> their contribution back, so information (and gradients) can flow from layer 0 to the loss untouched — this additive highway is why deep transformers train. And attention is the <em>only</em> place where positions exchange information; everything else acts on each position independently.</p>
+
+<h2 id="embedding">5.1 Embeddings: from ids to vectors</h2>
+<p>A token id is a meaningless integer; the model needs vectors. The <strong>embedding table</strong> \(E \in \mathbb{R}^{V \times D}\) is a learned matrix; "embedding token 17" is just reading row 17. For a batch of ids this is pure indexing: <code>E[tokens]</code> maps (B, T) ints to (B, T, D) floats.</p>
+<p>Attention, as you'll prove in a moment, treats its input as a <em>set</em> — it has no idea token 3 comes before token 4. So we add a second learned table, the <strong>position embedding</strong> \(P \in \mathbb{R}^{T_{max} \times D}\), giving every position its own vector:</p>
+$$ x_{b,t} = E_{\text{tokens}[b,t]} + P_t. $$
+<p>Same word at a different position ⇒ different starting vector. Learned absolute positions are the simplest scheme that works (the original GPT choice); sinusoidal tables and rotary embeddings (RoPE) are drop-in alternatives you can explore later — the architecture around them is unchanged.</p>
+
+<div class="quiz" data-concept="ch5.html#embedding" data-concept-label="§5.1 Embeddings">
+  <div class="q-text"><p>Shape drill, from memory: give the shapes of the token-embedding table, the position-embedding table, and the result of embedding a batch. With our config, how many parameters do the two tables hold (numbers, not formulas)? And why does the embedding operation need no matmul — what is it computationally?</p></div>
+  <div class="hint">\(V \times D\) and \(T_{max} \times D\) (take \(T_{max} = 256\) for the count). Embedding = selecting rows.</div>
+  <div class="answer"><p>\(E: (V, D) = (46, 128)\) → 5,888 params; \(P: (T_{max}, D) = (256, 128)\) → 32,768 params. Embedded batch: \((B, T, D) = (32, 64, 128)\), computed as <code>E[tokens] + P[:T]</code> — a gather (row lookup) plus a broadcast add; no multiplication, because one-hot × matrix <em>is</em> row selection, and we skip the one-hot.</p></div>
+</div>
+
+<h2 id="attention">5.2 Attention from first principles</h2>
+<p>Each position holds a vector; positions need to exchange information ("what noun does this pronoun refer to?"). Attention is a <em>differentiable dictionary lookup</em>. From every token's vector we project three things:</p>
+<ul>
+<li>a <strong>query</strong> \(q_t = x_t W_Q\) — "what am I looking for?"</li>
+<li>a <strong>key</strong> \(k_t = x_t W_K\) — "what can I be found by?"</li>
+<li>a <strong>value</strong> \(v_t = x_t W_V\) — "what do I hand over if you look at me?"</li>
+</ul>
+<p>Token \(i\) scores every token \(j\) by the dot product \(q_i \cdot k_j\), softmaxes the scores into weights, and takes the weighted average of the values:</p>
+$$ \mathrm{Attn}(x)_i = \sum_j \underbrace{\mathrm{softmax}_j\!\Big( \frac{q_i \cdot k_j}{\sqrt{d_h}} \Big)}_{w_{ij}} \, v_j, $$
+<p>followed by an output projection \(W_O\). The output is a <em>convex combination</em> of value vectors: attention can blend and retrieve what tokens offer, never invent content beyond it.</p>
+<div class="box keypoint"><div class="box-title">Why divide by \(\sqrt{d_h}\)?</div>
+<p>A dot product of \(d_h\) independent unit-variance terms has variance \(d_h\) — standard deviation \(\sqrt{d_h}\). With \(d_h = 32\), raw scores would spread over roughly \(\pm 5.7\) instead of \(\pm 1\), and softmax of widely spread inputs saturates: one weight \(\approx 1\), the rest \(\approx 0\), gradients through the softmax \(\approx 0\). Dividing by \(\sqrt{d_h}\) restores unit variance at any head size, keeping the attention distribution soft and trainable. Tiny constant, disproportionate consequences.</p>
+</div>
+
+<div class="quiz" data-concept="ch5.html#attention" data-concept-label="§5.2 Attention">
+  <div class="q-text"><p>From memory: define the roles of \(q\), \(k\), \(v\) in one phrase each; write the attention formula including the scale; and reproduce the variance argument for \(\sqrt{d_h}\) — what saturates without it, and why does saturation kill learning?</p></div>
+  <div class="hint">Roles: looking for / found by / handed over. For the variance: \(\mathrm{Var}(\sum_{i=1}^{d} a_i b_i)\) with independent unit-variance factors = ?</div>
+  <div class="answer"><p>Query: what this token seeks; key: how a token advertises itself for matching; value: the content delivered if matched. \(\mathrm{Attn}_i = \sum_j \mathrm{softmax}_j(q_i k_j^\top / \sqrt{d_h}) v_j\), then \(W_O\). Variance: each product \(a_i b_i\) has variance 1; \(d_h\) independent terms sum to variance \(d_h\), std \(\sqrt{d_h}\). Softmax over inputs spread \(\pm\sqrt{d_h}\) is near-argmax: outputs hit the flat saturated region where \(\partial\, \mathrm{softmax} \approx 0\), so no gradient reaches \(W_Q, W_K\) and the attention pattern freezes where it randomly started. The \(1/\sqrt{d_h}\) rescales scores to unit variance regardless of head size.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch5.html#attention" data-concept-label="§5.2 Attention by hand">
+  <div class="q-text"><p>By hand: a query attends over two visible keys with scaled scores \([0, \ln 3]\); their (one-dimensional) values are \(v_1 = 2\), \(v_2 = 6\). Compute the attention weights and the output. What structural property of attention outputs does this illustrate?</p></div>
+  <div class="hint">\(e^0 = 1\), \(e^{\ln 3} = 3\). Weights = softmax of the scores.</div>
+  <div class="answer"><p>Weights \(= [1, 3]/(1+3) = [0.25, 0.75]\); output \(= 0.25 \cdot 2 + 0.75 \cdot 6 = \mathbf{5}\). Illustration: the output is a convex combination of the values — always inside the interval \([2, 6]\); attention interpolates between what tokens offer, never extrapolates.</p></div>
+</div>
+
+<h2 id="mask">5.3 The causal mask</h2>
+<p>A language model predicts token \(t+1\) from tokens \(\le t\). But raw attention lets every position see every other — including the future, where the answer literally sits. The fix: before the softmax, set every score \(q_i \cdot k_j\) with \(j &gt; i\) to \(-\infty\):</p>
+$$ \tilde s_{ij} = \begin{cases} s_{ij} &amp; j \le i \\ -\infty &amp; j &gt; i \end{cases} \qquad \Rightarrow \qquad e^{-\infty} = 0 \text{ inside the softmax.} $$
+<p>The mask is a lower-triangular boolean matrix (<code>tril</code>). Two details people get wrong:</p>
+<ul>
+<li><strong>Mask before softmax, not after.</strong> Softmax normalizes over everything it sees. Zeroing weights <em>after</em> softmax leaves the visible weights summing to less than 1 (the future stole mass) — outputs silently shrink. Masking with \(-\infty\) <em>before</em> means the softmax renormalizes over visible tokens only: a proper distribution.</li>
+<li><strong>The diagonal stays.</strong> A token may attend to itself; row 0 attends only to itself. (All-\(-\infty\) rows would produce NaNs.)</li>
+</ul>
+<p>The mask is also why training is parallel: with masking, position \(t\)'s output depends only on tokens \(\le t\), so <em>every position is simultaneously a correct training example</em> — one forward pass yields \(T\) next-token predictions, not 1.</p>
+
+<div class="quiz" data-concept="ch5.html#mask" data-concept-label="§5.3 Causal mask">
+  <div class="q-text"><p>Why must masking happen <em>before</em> the softmax — what exactly breaks with after-softmax zeroing? Why is the diagonal kept? And state the property that the companion tests check ("causality test"): if I corrupt tokens at positions \(\ge t\), what must hold for the logits at positions \(&lt; t\)?</p></div>
+  <div class="hint">After softmax, what do the surviving weights sum to? For the test: which inputs can position t−1's output depend on?</div>
+  <div class="answer"><p>Before: \(e^{-\infty} = 0\) ⇒ softmax renormalizes over the visible prefix, weights sum to 1. After: a token that gave (say) 90% of its mass to future positions retains weights summing to 0.1 — its output is scaled down by an arbitrary data-dependent factor, with no error raised. Diagonal kept so each token sees at least itself (row 0 otherwise becomes all \(-\infty\) → NaN). Causality test: logits at positions \(&lt; t\) must be bit-for-bit unchanged when tokens \(\ge t\) are altered, because masked attention is the only cross-position operation and it never looks right of the diagonal.</p></div>
+</div>
+
+<h2 id="multihead">5.4 Multi-head attention</h2>
+<p>One attention pattern per layer is a bottleneck: the softmax weights sum to 1, so attending strongly to one relationship means ignoring others. <strong>Multi-head attention</strong> runs \(H\) independent attentions in parallel, each in a smaller subspace of size \(d_h = D/H\), then concatenates:</p>
+<ol>
+<li>Project once: \(Q = x W_Q\), \(K = x W_K\), \(V = x W_V\), each \((B, T, D)\).</li>
+<li><em>Reshape</em> the last axis into \((H, d_h)\) and treat each of the \(H\) slices as its own attention problem: scores \((B, H, T, T)\), mask, softmax, weighted values \((B, H, T, d_h)\).</li>
+<li>Concatenate heads back to \((B, T, D)\) and apply the output projection \(W_O \in \mathbb{R}^{D \times D}\), which lets heads' contributions mix.</li>
+</ol>
+<p>Note what's <em>not</em> there: no extra parameters versus single-head (same four \(D \times D\) matrices — the heads are a <em>reshape</em>, not new projections), and the per-head scale is \(\sqrt{d_h}\), not \(\sqrt{D}\) — a classic implementation bug. Different heads learn visibly different functions: previous-token heads, syntax heads, induction heads.</p>
+
+<div class="quiz" data-concept="ch5.html#multihead" data-concept-label="§5.4 Multi-head">
+  <div class="q-text"><p>Walk through multi-head attention's tensor shapes for our config — from \(x: (32, 64, 128)\) through Q/K/V, the per-head split, scores, weighted values, concat, and output. Why multiple heads at all (what does the softmax's sum-to-1 have to do with it)? How many parameters does the attention sub-block hold (count the four matrices; ignore biases)?</p></div>
+  <div class="hint">(B,T,D) → reshape (B,T,H,d_h) → transpose (B,H,T,d_h) → scores (B,H,T,T). Heads are free: 4 × D × D.</div>
+  <div class="answer"><p>Q/K/V: each \((32,64,128)\); reshape \((32,64,4,32)\), transpose to \((32,4,64,32)\); scores \(QK^\top/\sqrt{32}\): \((32,4,64,64)\); after mask+softmax, weights·values: \((32,4,64,32)\); transpose back and merge: \((32,64,128)\); \(W_O\): \((32,64,128)\). Motivation: one softmax distributes a single unit of attention — heavily attending to one relation starves others; \(H\) independent softmaxes let the layer track \(H\) relations at once, each in its own 32-dim subspace. Parameters: \(4 \times 128 \times 128 = 65{,}536\) per layer — identical to single-head; the split costs nothing.</p></div>
+</div>
+
+<h2 id="norm">5.5 LayerNorm and the pre-LN residual block</h2>
+<p>Residual addition lets activations grow without bound as contributions accumulate; downstream blocks would face inputs of wildly varying scale. <strong>LayerNorm</strong> re-standardizes each token vector independently — mean 0, variance 1 across the \(D\) features — then applies a learned per-feature scale \(\gamma\) and shift \(\beta\):</p>
+$$ \mathrm{LN}(x) = \frac{x - \mu(x)}{\sqrt{\sigma^2(x) + \varepsilon}} \odot \gamma + \beta, \qquad \mu, \sigma^2 \text{ over the feature axis only.} $$
+<p>Crucially: statistics are per-token, over features — <em>not</em> over the batch (that's BatchNorm, which would leak information across examples and break at small batch / generation time). \(\varepsilon\) guards the division; \(\gamma, \beta\) restore expressiveness (the network can undo the normalization where it helps).</p>
+<p>Placement matters. The modern arrangement is <strong>pre-LN</strong>: normalize the <em>input of each sub-block</em>, inside the residual branch:</p>
+$$ x \leftarrow x + \mathrm{Attn}(\mathrm{LN}_1(x)), \qquad x \leftarrow x + \mathrm{MLP}(\mathrm{LN}_2(x)). $$
+<p>The residual path itself is never normalized — there is an identity route from embedding to loss, so gradients reach early layers unattenuated; pre-LN models train stably without the warmup gymnastics the original post-LN arrangement required. A final LayerNorm cleans up the stream before the unembedding.</p>
+<p>The <strong>MLP sub-block</strong> is the simple half: two matrices with a GELU between, \(\mathrm{MLP}(x) = \mathrm{GELU}(xW_1 + b_1)W_2 + b_2\), expanding \(D \to F = 4D \to D\), applied to every position independently. Attention gathers; the MLP processes.</p>
+
+<div class="quiz" data-concept="ch5.html#norm" data-concept-label="§5.5 LayerNorm / pre-LN">
+  <div class="q-text"><p>By hand: LayerNorm of the token vector \(x = [1, 3]\) with \(\gamma = [1, 1]\), \(\beta = [0, 0]\), \(\varepsilon \approx 0\). Then: over which axis are LN statistics computed and why not the batch axis; and write the two pre-LN residual equations, explaining why the residual path stays unnormalized.</p></div>
+  <div class="hint">\(\mu = 2\), \(\sigma^2 = \frac{(1-2)^2 + (3-2)^2}{2} = 1\).</div>
+  <div class="answer"><p>\(\mu=2, \sigma=1\) ⇒ \(\mathrm{LN}(x) = [-1, 1]\). Statistics are over the feature axis, per token: each token normalizes itself using only its own vector, so behavior is independent of batch composition and identical at train/generation time (BatchNorm fails both). Pre-LN block: \(x \leftarrow x + \mathrm{Attn}(\mathrm{LN}_1(x))\); \(x \leftarrow x + \mathrm{MLP}(\mathrm{LN}_2(x))\). The residual path is untouched so that an identity route runs from embeddings to the loss — gradients flow through pure additions, which is what lets depth scale without vanishing signals.</p></div>
+</div>
+
+<h2 id="loss">5.6 The loss: every position predicts its successor</h2>
+<p>After the final LayerNorm we need logits over the vocabulary. Rather than a new \((D, V)\) matrix, reuse the embedding: \(\text{logits} = x E^\top\) — <strong>weight tying</strong>. It saves \(V \times D\) parameters, and it's principled: embedding and unembedding are near-inverse maps between token space and vector space, and tying consistently helps at small scale.</p>
+<p>Training pairs come from the famous shift: feed <code>tokens[:-1]</code>, predict <code>tokens[1:]</code> — position \(t\)'s logits are graded against the actual next token. Thanks to the causal mask all \(T\) predictions are valid simultaneously, so a \((B, T+1)\) batch yields \(B \cdot T\) supervised examples per step. The loss at each position is cross-entropy, \(-\log p_\theta(\text{correct token})\), averaged:</p>
+$$ \mathcal{L} = -\frac{1}{BT} \sum_{b,t} \log\, \mathrm{softmax}\big(\text{logits}_{b,t}\big)_{\text{targets}_{b,t}}. $$
+<div class="box keypoint"><div class="box-title">The most useful number in deep learning: \(\ln V\)</div>
+<p>Before training, logits are near-random ⇒ the softmax is near-uniform ⇒ each correct token has probability \(\approx 1/V\) ⇒ loss \(\approx \ln V\). For our \(V = 46\): \(\ln 46 \approx 3.83\). Check this on the very first step, every time you build a model. Loss far above \(\ln V\): broken init (scales too big). Loss <em>below</em> it at step 0: information is leaking — almost always a causal-mask bug letting positions see their own targets. One printed number catches the two worst transformer bugs.</p>
+</div>
+
+<div class="quiz" data-concept="ch5.html#loss" data-concept-label="§5.6 Loss / shift / ln V">
+  <div class="q-text"><p>Three parts, from memory. (a) From the sequence <code>[5, 9, 2, 7]</code>, list every (context → target) pair one forward pass trains on. (b) Vocab of 3, logits \([2, 0, 0]\), correct token index 0: compute the cross-entropy in nats (2 dp; \(e^2 \approx 7.39\)). (c) State the \(\ln V\) ritual: the expected first loss for \(V = 46\), and the diagnosis when the observed value is far above vs below it.</p></div>
+  <div class="hint">(a) Shift by one: inputs [5,9,2], targets [9,2,7]. (b) \(p_0 = e^2/(e^2+2)\).</div>
+  <div class="answer"><p>(a) 5→9, [5,9]→2, [5,9,2]→7 — three pairs (\(T\) pairs from \(T{+}1\) tokens). (b) \(p_0 = 7.39/9.39 = 0.787\); loss \(= -\ln 0.787 \approx \mathbf{0.24}\) nats. (c) Expect \(\ln 46 \approx 3.83\) at step 0. Far above ⇒ initialization scales are wrong (e.g. unscaled weights make logits huge and the softmax confidently wrong). Below ⇒ the model can already see the answer: causal mask missing/wrong (or targets leaked into inputs). The companion <code>transformer.py</code> prints exactly this check — its first measured loss is 3.86.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch5.html#config" data-concept-label="§5.0–5.6 Whole-model synthesis">
+  <div class="q-text"><p>Closed book, the chapter capstone: draw the full pipeline from <code>tokens (B,T)</code> to the scalar loss — every stage with its output shape for our config, in order, including where the two LayerNorms sit in a block, where the mask acts, and where weight tying appears. (Paper. This diagram <em>is</em> Chapter 6's implementation checklist.)</p></div>
+  <div class="hint">tokens → embed+pos → [LN → attn → add; LN → MLP → add] × 3 → LN → unembed → shift → cross-entropy.</div>
+  <div class="answer"><p>tokens (32,64) → <code>E[tokens]+P[:64]</code> → x (32,64,128) → 3 × [ x + Attn(LN₁(x)) with scores (32,4,64,64) masked by tril before softmax → x + MLP(LN₂(x)) with hidden (32,64,512) ] → final LN (32,64,128) → logits \(xE^\top\) (32,64,46) [weight tying] → grade position t against token t+1 (inputs <code>[:, :-1]</code>, targets <code>[:, 1:]</code>) → mean cross-entropy, scalar, ≈3.83 at init. If any stage's shape or placement differed in your drawing, re-derive that section before Chapter 6 — the implementation transcribes this diagram line by line.</p></div>
+</div>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 4 · The Step-Size Problem &amp; Surrogate Objectives</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 4</span> · The Step-Size Problem &amp; Surrogate Objectives</h1>
+<p class="subtitle">This is the conceptual heart of the course. Three results — the performance difference lemma, the surrogate objective, and their first-order agreement — explain precisely why naive policy gradients are fragile, and define the quantity that both TRPO and PPO actually optimize. Master this chapter and those two algorithms become near-corollaries.</p>
+
+<h2 id="fragility">4.1 Why one bad step can end a run</h2>
+<p>In supervised learning, an oversized step costs you one bad update; the next minibatch comes from the same distribution and pulls you back. In RL the data <em>comes from the policy</em> (§1.4). The failure mode is a ratchet:</p>
+<div class="box warning"><div class="box-title">The policy-collapse ratchet</div>
+<p>Oversized step &rarr; policy becomes much worse &rarr; the worse policy visits bad, uninformative states &rarr; gradients estimated from those states say nothing about how to return to good behavior &rarr; further updates wander. The step destroyed not just the parameters but the <em>future data</em>. Recovery is slow or never.</p>
+</div>
+<p>Worse, the right step size is not knowable in parameter space. The map from parameters to behavior is wildly non-uniform: for a Gaussian policy, shifting \(\mu\) by 0.1 is a negligible behavioral change when \(\sigma = 10\) and a revolution when \(\sigma = 0.01\) — identical parameter distances, orders-of-magnitude different distribution distances. A fixed learning rate that is safe in one region of \(\theta\)-space is reckless in another. Conclusion: <strong>step sizes must be measured in distribution space</strong> (KL divergence), not parameter space. That idea, made rigorous, is TRPO; made cheap, it is PPO.</p>
+
+<div class="quiz" data-concept="ch4.html#fragility" data-concept-label="§4.1 Fragility">
+  <div class="q-text"><p>Explain (a) why an oversized step is far more damaging in on-policy RL than in supervised learning, and (b) why no fixed parameter-space learning rate can be right, with the Gaussian-policy example and the conclusion it forces.</p></div>
+  <div class="hint">(a) What generates the next batch of training data in each setting? (b) Compare \(\Delta\mu = 0.1\) at \(\sigma=10\) vs \(\sigma=0.01\).</div>
+  <div class="answer"><p>(a) Supervised data is i.i.d. from a fixed distribution, so a bad step is corrected by subsequent unaffected batches. In RL the post-step policy generates the next data; a collapsed policy collects states that carry no signal about recovering, so the damage compounds. (b) The same parameter displacement can be behaviorally tiny (\(\sigma=10\): distributions overlap almost completely) or enormous (\(\sigma=0.01\): essentially disjoint). Since the parameter→behavior map's sensitivity varies across \(\theta\)-space, safety must be defined by a distribution distance (KL) — a trust region in policy space, not parameter space.</p></div>
+</div>
+
+<h2 id="pdl">4.2 The performance difference lemma</h2>
+<p>How much better is a new policy \(\pi'\) than the current \(\pi\)? There is an exact, beautiful answer (Kakade &amp; Langford, 2002). Define the discounted state-visitation measure \(d^{\pi'}\!(s) = \sum_{t}\gamma^t \Pr(s_t = s \mid \pi')\) and write \(\eta(\pi) = \mathbb{E}_{\tau\sim\pi}[\sum_t \gamma^t r_t]\) for expected return.</p>
+<div class="box keypoint"><div class="box-title">Performance difference lemma</div>
+$$ \eta(\pi') - \eta(\pi) \;=\; \mathbb{E}_{\tau \sim \pi'}\Big[ \sum_{t=0}^\infty \gamma^t A^{\pi}(s_t, a_t) \Big] \;=\; \mathbb{E}_{s \sim d^{\pi'}}\,\mathbb{E}_{a\sim\pi'(\cdot|s)}\big[ A^\pi(s,a) \big]. $$
+<p>In words: the improvement of \(\pi'\) over \(\pi\) equals the advantage <em>of the old policy</em>, accumulated <em>along the new policy's trajectories</em>. Run \(\pi'\); every time it picks an action that \(\pi\) considers above-average, that's pure profit; below-average, pure loss; total profit = total improvement, exactly.</p>
+</div>
+<p><strong>Proof.</strong> The key trick: write \(A^\pi(s_t,a_t) = \mathbb{E}_{s_{t+1}}[r_t + \gamma V^\pi(s_{t+1}) - V^\pi(s_t)]\) (the identity from §1.5) and evaluate the sum along a trajectory of \(\pi'\):</p>
+$$ \mathbb{E}_{\tau\sim\pi'}\Big[\sum_t \gamma^t A^\pi(s_t,a_t)\Big] = \mathbb{E}_{\tau\sim\pi'}\Big[\sum_t \gamma^t\big( r_t + \gamma V^\pi(s_{t+1}) - V^\pi(s_t) \big)\Big]. $$
+<p>The value terms telescope: \(\sum_t \gamma^t(\gamma V^\pi(s_{t+1}) - V^\pi(s_t)) = -V^\pi(s_0)\) (each \(+\gamma^{t+1}V^\pi(s_{t+1})\) cancels the next term's \(-\gamma^{t+1}V^\pi(s_{t+1})\); the tail vanishes by discounting). So the right side equals</p>
+$$ \mathbb{E}_{\tau\sim\pi'}\Big[\sum_t \gamma^t r_t\Big] - \mathbb{E}_{s_0\sim\rho_0}\big[V^\pi(s_0)\big] = \eta(\pi') - \eta(\pi), $$
+<p>using the fact that both policies share the same initial-state distribution. \(\blacksquare\)</p>
+<p>Note the structural rhyme with §3.4: GAE's telescoping collapsed sums of TD errors; here the <em>same cancellation</em> collapses a sum of advantages. One algebraic move, two pillars of the theory.</p>
+
+<div class="quiz" data-concept="ch4.html#pdl" data-concept-label="§4.2 Performance difference lemma">
+  <div class="q-text"><p><strong>Prove the performance difference lemma from memory.</strong> State it precisely first (whose advantage? whose trajectories?), then give the telescoping proof, flagging where the shared initial-state distribution is used.</p></div>
+  <div class="hint">Replace \(A^\pi\) by its TD form \(r + \gamma V^\pi(s') - V^\pi(s)\), valid in expectation, then telescope the value terms along the trajectory.</div>
+  <div class="hint">\(\sum_t \gamma^t(\gamma V(s_{t+1}) - V(s_t))\): write out \(t=0,1,2\) and watch the cancellation; only \(-V(s_0)\) survives.</div>
+  <div class="answer"><p>\(\eta(\pi') - \eta(\pi) = \mathbb{E}_{\tau\sim\pi'}[\sum_t \gamma^t A^\pi(s_t,a_t)]\): <em>old</em> policy's advantage on the <em>new</em> policy's trajectories. Proof: \(A^\pi(s_t,a_t) = \mathbb{E}[r_t + \gamma V^\pi(s_{t+1}) - V^\pi(s_t)]\); summing with weights \(\gamma^t\) along \(\tau\sim\pi'\), the value terms telescope to \(-V^\pi(s_0)\), leaving \(\mathbb{E}_{\pi'}[\sum\gamma^t r_t] - \mathbb{E}_{s_0}[V^\pi(s_0)]\). The first term is \(\eta(\pi')\); the second is \(\eta(\pi)\) <em>because \(s_0 \sim \rho_0\) for both policies</em> — the initial distribution belongs to the environment. ∎</p></div>
+</div>
+
+<h2 id="surrogate">4.3 The surrogate: optimize the new policy on the old policy's data</h2>
+<p>The lemma suggests an algorithm: pick \(\pi'\) to maximize \(\mathbb{E}_{s\sim d^{\pi'}}\mathbb{E}_{a\sim\pi'}[A^\pi(s,a)]\). One obstacle makes this non-trivial — and it is <em>the</em> obstacle of policy optimization: the state distribution \(d^{\pi'}\) belongs to the policy we haven't chosen yet. We cannot sample from it without running \(\pi'\), and we can't run every candidate \(\pi'\).</p>
+<p>The pragmatic move: <strong>pretend the state distribution doesn't change</strong>. Replace \(d^{\pi'}\) by \(d^{\pi}\) — but correct the <em>action</em> distribution exactly, using importance sampling:</p>
+$$ \mathbb{E}_{a\sim\pi'(\cdot|s)}\big[A^\pi(s,a)\big] = \mathbb{E}_{a\sim\pi(\cdot|s)}\Big[ \frac{\pi'(a|s)}{\pi(a|s)}\, A^\pi(s,a) \Big], $$
+<p>valid whenever \(\pi(a|s) \gt 0\) wherever \(\pi'(a|s) \gt 0\) (multiply and divide inside the expectation — that's the whole proof). This yields the object TRPO and PPO both optimize:</p>
+<div class="box definition"><div class="box-title">The surrogate objective</div>
+$$ L_\pi(\pi') \;=\; \mathbb{E}_{s\sim d^\pi}\, \mathbb{E}_{a\sim\pi(\cdot|s)}\Big[ \frac{\pi'(a|s)}{\pi(a|s)}\, A^\pi(s,a) \Big]. $$
+<p>Every ingredient is estimable from data collected under the <em>current</em> policy \(\pi\): states from \(d^\pi\), actions from \(\pi\), advantages \(\hat A_t\) from GAE, and the ratio is a forward pass through both policy heads. With samples: \(\hat L(\theta) = \frac{1}{N}\sum_t \frac{\pi_\theta(a_t|s_t)}{\pi_{\theta_{\text{old}}}(a_t|s_t)}\hat A_t = \frac{1}{N}\sum_t r_t(\theta)\hat A_t\).</p>
+</div>
+<p>The substitution \(d^{\pi'} \to d^\pi\) — only the state distribution is approximated; actions are handled exactly — is where all the error lives. Everything in TRPO and PPO is about controlling that error.</p>
+
+<div class="quiz" data-concept="ch4.html#surrogate" data-concept-label="§4.3 The surrogate">
+  <div class="q-text"><p>Construct the surrogate from memory: start from the performance difference lemma, identify which factor is intractable and why, make the approximation, and apply importance sampling to the part that can be handled exactly. State the support condition IS requires, and what the ratio \(r_t(\theta)\) is concretely in code.</p></div>
+  <div class="hint">Two distributions in the lemma belong to \(\pi'\): states and actions. One of them can be exactly corrected from \(\pi\)'s samples, one cannot. Which, and why?</div>
+  <div class="answer"><p>Lemma: \(\Delta\eta = \mathbb{E}_{s\sim d^{\pi'}}\mathbb{E}_{a\sim\pi'}[A^\pi]\). Sampling \(d^{\pi'}\) requires deploying \(\pi'\) — intractable during optimization over candidate \(\pi'\). Approximate \(d^{\pi'}\!\approx d^\pi\); the action expectation is corrected exactly: \(\mathbb{E}_{a\sim\pi'}[A^\pi] = \mathbb{E}_{a\sim\pi}[\tfrac{\pi'}{\pi}A^\pi]\), requiring \(\pi \gt 0\) wherever \(\pi' \gt 0\). Result: \(L_\pi(\pi') = \mathbb{E}_{d^\pi,\pi}[\tfrac{\pi'(a|s)}{\pi(a|s)}A^\pi]\). In code, \(r_t(\theta) = \exp(\log\pi_\theta(a_t|s_t) - \log\pi_{\theta_\text{old}}(a_t|s_t))\) — new log-prob minus stored rollout log-prob, exponentiated.</p></div>
+</div>
+
+<h2 id="matching">4.4 The license to use \(L\): first-order agreement</h2>
+<p>Why is maximizing \(L\) a sensible proxy for maximizing \(\eta\)? Because at the current policy the two functions touch tangentially. Parametrize \(\pi_\theta\) and write \(L_{\theta_{\text{old}}}(\theta) := L_{\pi_{\theta_\text{old}}}(\pi_\theta)\):</p>
+<div class="box keypoint"><div class="box-title">Value and gradient match at \(\theta_{\text{old}}\)</div>
+$$ L_{\theta_\text{old}}(\theta_\text{old}) = 0 = \eta(\theta_\text{old}) - \eta(\theta_\text{old}), \qquad \nabla_\theta L_{\theta_\text{old}}(\theta)\big|_{\theta_\text{old}} = \nabla_\theta\, \eta(\theta)\big|_{\theta_\text{old}}. $$
+<p><em>Value:</em> at \(\theta = \theta_\text{old}\) the ratio is 1, and \(\mathbb{E}_{a\sim\pi}[A^\pi] = 0\) (§1.5). <em>Gradient:</em> \(\nabla_\theta \frac{\pi_\theta(a|s)}{\pi_{\theta_\text{old}}(a|s)}\big|_{\theta_\text{old}} = \frac{\nabla_\theta \pi_\theta(a|s)|_{\theta_\text{old}}}{\pi_{\theta_\text{old}}(a|s)} = \nabla_\theta\log\pi_\theta(a|s)\big|_{\theta_\text{old}}\), so \(\nabla L|_{\theta_\text{old}} = \mathbb{E}[\nabla\log\pi_\theta\, A^\pi]\) — precisely the advantage-form policy gradient of §3.2.</p>
+</div>
+<p>So: an infinitesimal ascent step on \(L\) is <em>identical</em> to a policy-gradient step on \(\eta\). The surrogate is not an alternative objective; it is a local model of the true one — accurate to first order at the expansion point, increasingly wrong as \(\pi_\theta\) departs from \(\pi_{\theta_\text{old}}\) and the frozen state distribution \(d^{\pi_\text{old}}\) stops describing where \(\pi_\theta\) actually goes. Like any local model, it has a <strong>trust radius</strong>. How far can you push before the model lies? Measured in what units? That is Chapter 5's question, and "KL divergence" is its answer.</p>
+
+<div class="quiz" data-concept="ch4.html#matching" data-concept-label="§4.4 First-order agreement">
+  <div class="q-text"><p>Prove both matching properties at \(\theta_\text{old}\): (a) \(L_{\theta_\text{old}}(\theta_\text{old}) = 0\); (b) \(\nabla_\theta L|_{\theta_\text{old}} = \nabla_\theta\eta|_{\theta_\text{old}}\). Then state, in one careful sentence, the precise sense in which the surrogate can be trusted and the sense in which it cannot.</p></div>
+  <div class="hint">(a) needs \(\mathbb{E}_{a\sim\pi}[A^\pi(s,a)]=0\) from §1.5. (b) needs \(\nabla\pi/\pi = \nabla\log\pi\) and recognizing the §3.2 gradient.</div>
+  <div class="answer"><p>(a) At \(\theta_\text{old}\), ratio \(\equiv 1\), so \(L = \mathbb{E}_{s}\mathbb{E}_{a\sim\pi}[A^\pi] = \mathbb{E}_s[0] = 0\). (b) Only the ratio depends on \(\theta\): its gradient at \(\theta_\text{old}\) is \(\nabla\pi_\theta/\pi_{\theta_\text{old}} = \nabla\log\pi_\theta\), giving \(\nabla L = \mathbb{E}_{d^\pi,\pi}[\nabla\log\pi_\theta\, A^\pi]\), the advantage-form policy gradient of \(\eta\). Trust: \(L\) predicts the effect of <em>infinitesimal</em> policy changes exactly (same gradient); it cannot be trusted for finite steps, because it evaluates the new policy under the old policy's state distribution, an error growing with the distance between policies.</p></div>
+</div>
+
+<h2 id="kl">4.5 Measuring policy change: KL divergence</h2>
+<p>The natural distance-like measure between the old and new action distributions at a state:</p>
+$$ D_{\mathrm{KL}}\big(\pi_{\text{old}}(\cdot|s)\,\big\|\,\pi_\theta(\cdot|s)\big) = \mathbb{E}_{a\sim\pi_\text{old}(\cdot|s)}\Big[ \log\frac{\pi_\text{old}(a|s)}{\pi_\theta(a|s)} \Big] \ge 0, $$
+<p>zero iff the distributions coincide (almost everywhere). Properties that matter here: it is asymmetric (TRPO uses old-first); it is <em>parametrization-invariant</em> — it sees only the distributions, so it is exactly the behavioral measure §4.1 demanded, immune to the \(\sigma=10\) vs \(\sigma=0.01\) trap; and for small parameter displacements it is locally quadratic, \(D_{\mathrm{KL}}(\pi_{\theta_\text{old}} \| \pi_{\theta_\text{old}+\Delta}) \approx \tfrac{1}{2}\Delta^\top F\, \Delta\), where \(F = \mathbb{E}\big[\nabla\log\pi\,\nabla\log\pi^\top\big]\) is the <strong>Fisher information matrix</strong>. (First-order term vanishes — KL has a minimum, value 0, at \(\Delta = 0\).) This quadratic form is the bridge to TRPO's natural gradient.</p>
+
+<div class="quiz" data-concept="ch4.html#kl" data-concept-label="§4.5 KL divergence">
+  <div class="q-text"><p>(a) Define \(D_{\mathrm{KL}}(\pi_\text{old}\|\pi_\theta)\) for action distributions at a state. (b) Why is parametrization invariance the property that makes KL the right trust-region currency (connect to §4.1)? (c) What is the second-order expansion of KL in \(\Delta\theta\), why is there no first-order term, and what is the matrix called?</p></div>
+  <div class="hint">(c) \(g(\Delta) = D_{\mathrm{KL}}(\pi_{\theta_\text{old}}\|\pi_{\theta_\text{old}+\Delta})\) is minimized at \(\Delta = 0\) with value 0. What does that say about \(\nabla g(0)\)?</div>
+  <div class="answer"><p>(a) \(\mathbb{E}_{a\sim\pi_\text{old}}[\log(\pi_\text{old}(a|s)/\pi_\theta(a|s))]\). (b) It depends only on the distributions, not on \(\theta\)'s coordinates — the same behavioral change yields the same KL whether the network is over- or under-sensitive there, fixing exactly the non-uniformity that makes parameter-space step sizes meaningless. (c) \(D_{\mathrm{KL}} \approx \frac{1}{2}\Delta^\top F \Delta\) with \(F = \mathbb{E}[\nabla\log\pi\,\nabla\log\pi^\top]\), the Fisher information matrix; the linear term vanishes because KL attains its minimum (0) at \(\Delta=0\), so its gradient there is zero.</p></div>
+</div>
+
+<div class="box recall-pause"><div class="box-title">Before moving on</div>
+<p>The chapter in one breath, from memory: <em>improvement equals old-advantage along new trajectories (prove it); the new state distribution is unsamplable, so freeze states and importance-sample actions (write \(L\)); the surrogate matches \(\eta\) to first order at \(\theta_\text{old}\) (prove both halves); its trust radius must be measured in KL (say why)</em>. If you can deliver that monologue with the three proofs, TRPO will read like an implementation detail.</p>
+</div>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 2 · grad: Differentiation as a Function Transform</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 2</span> · <code>grad</code>: Differentiation as a Function Transform</h1>
+<p class="subtitle">In PyTorch, differentiation is something that happens <em>to</em> tensors: a tape records your forward pass, <code>backward()</code> replays it, gradients precipitate into <code>.grad</code> fields. In JAX, differentiation is something that happens to <em>functions</em>: <code>jax.grad</code> eats a function and returns its derivative — another ordinary function you can call, compose, jit, or differentiate again.</p>
+
+<h2 id="grad-transform">2.1 grad eats a function, returns a function</h2>
+<pre><code>def f(x):
+    return x**3 + 2*x
+
+df = jax.grad(f)        # df is a new Python function computing f'
+df(2.0)                 # 3·4 + 2 = 14.0
+jax.grad(jax.grad(f))(2.0)   # f'' = 6x  ⇒  12.0 — it composes
+</code></pre>
+<p>Three rules govern <code>jax.grad</code>:</p>
+<ol>
+<li><strong>The function must return a scalar.</strong> A gradient \(\nabla f\) is defined for \(f: \mathbb{R}^n \to \mathbb{R}\). Losses are scalars, so this is no restriction for training. (For vector-valued outputs you'd use <code>jax.jacobian</code>; we won't need it.)</li>
+<li><strong>By default it differentiates with respect to the <em>first</em> argument.</strong> <code>jax.grad(loss_fn)(params, batch)</code> returns \(\partial \text{loss}/\partial \text{params}\) and treats <code>batch</code> as a constant. Want a different argument, or several? <code>argnums=1</code> or <code>argnums=(0, 1)</code>.</li>
+<li><strong>The argument can be any nested structure of arrays</strong> — a dict of dicts of matrices is fine. The gradient comes back with <em>exactly the same structure</em>: one gradient array per parameter array, in the same place. (This is the "pytree" idea; Chapter 4 is devoted to it.)</li>
+</ol>
+<p>Notice what's absent compared to PyTorch: there is no <code>requires_grad</code> flag (what gets differentiated is chosen by <em>argument position</em>, not by tensor attributes), no graph being silently recorded as you compute (you ask for a derivative explicitly, of a specific function), and no <code>.grad</code> fields (gradients are plain return values).</p>
+
+<div class="quiz" data-concept="ch2.html#grad-transform" data-concept-label="§2.1 grad basics">
+  <div class="q-text"><p>From memory: what does <code>jax.grad</code> take and return? State its three rules (output type, which argument, what argument structures are allowed). Then compute by hand what <code>jax.grad(lambda x: x**2 * 3.0)(4.0)</code> returns, and write the call that differentiates <code>loss(params, x, y)</code> with respect to <em>both</em> <code>params</code> and <code>x</code>.</p></div>
+  <div class="hint">grad : function → function. The rules answer: scalar output, argnums (default?), pytrees allowed.</div>
+  <div class="answer"><p><code>jax.grad</code> takes a scalar-valued function and returns a new function computing its gradient. Rules: (1) the differentiated function must return a scalar; (2) differentiation is w.r.t. the first argument unless <code>argnums</code> says otherwise; (3) arguments may be arbitrary nested containers of arrays, and the gradient mirrors that structure exactly. Hand computation: \(\frac{d}{dx} 3x^2 = 6x\), so <code>24.0</code>. Both arguments: <code>jax.grad(loss, argnums=(0, 1))(params, x, y)</code> — <code>params</code> is index 0 and <code>x</code> index 1 — returning the tuple <code>(dparams, dx)</code>.</p></div>
+</div>
+
+<h2 id="torch-mapping">2.2 The backward() decoder ring</h2>
+<p>Every PyTorch training-step incantation has a JAX counterpart — usually <em>nothing</em>, because the problem it solves doesn't exist:</p>
+<table>
+<tr><th>PyTorch</th><th>JAX</th><th>why</th></tr>
+<tr><td><code>loss = loss_fn(model(x), y)</code><br><code>loss.backward()</code></td><td><code>grads = jax.grad(loss_fn)(params, x, y)</code></td><td>differentiate the function, get gradients as a value</td></tr>
+<tr><td><code>optimizer.zero_grad()</code></td><td>— (nothing)</td><td>gradients are fresh return values, not accumulators; there is no buffer to clear, and stale-gradient bugs are impossible</td></tr>
+<tr><td><code>p.grad</code> for each parameter</td><td>the returned <code>grads</code> pytree</td><td>same structure as <code>params</code>: <code>grads["w1"]</code> matches <code>params["w1"]</code></td></tr>
+<tr><td><code>with torch.no_grad():</code></td><td>— (nothing)</td><td>nothing is recorded unless you call <code>grad</code>; inference is just calling the function</td></tr>
+<tr><td><code>x.detach()</code></td><td><code>jax.lax.stop_gradient(x)</code></td><td>block the gradient path through one value (§2.4)</td></tr>
+<tr><td><code>create_graph=True</code> (higher-order)</td><td><code>jax.grad(jax.grad(f))</code></td><td>transformations compose; no special flags</td></tr>
+</table>
+<p>Gradient <em>accumulation</em> across microbatches — the one legitimate use of PyTorch's accumulating <code>.grad</code> — is done explicitly in JAX: compute each microbatch's <code>grads</code> and average the pytrees yourself (you'll be able to write that one-liner after Chapter 4).</p>
+
+<div class="quiz" data-concept="ch2.html#torch-mapping" data-concept-label="§2.2 PyTorch → JAX mapping">
+  <div class="q-text"><p>For each, give the JAX equivalent and a one-sentence justification: (a) <code>loss.backward()</code>; (b) <code>optimizer.zero_grad()</code>; (c) reading <code>p.grad</code>; (d) <code>with torch.no_grad():</code> around evaluation. Why can a stale-gradient bug (forgetting <code>zero_grad</code>) not occur in JAX even in principle?</p></div>
+  <div class="hint">Two of the four map to "nothing, the concept doesn't exist". Which state would have to exist for zero_grad / no_grad to be needed?</div>
+  <div class="answer"><p>(a) <code>grads = jax.grad(loss_fn)(params, batch)</code> — differentiation is an explicit function call. (b) Nothing: gradients aren't accumulated into persistent buffers, so there's nothing to zero. (c) Index the returned pytree: <code>grads["layer1"]["w"]</code>. (d) Nothing: JAX records no graph during ordinary evaluation; calling <code>forward(params, x)</code> is already "no grad". Stale gradients are impossible because each <code>jax.grad</code> call returns a brand-new value computed from scratch — there is no mutable <code>.grad</code> field anywhere to hold yesterday's gradient.</p></div>
+</div>
+
+<h2 id="value-and-grad">2.3 value_and_grad and has_aux: the training-step workhorses</h2>
+<p>In training you want the loss <em>and</em> the gradient. Calling <code>f</code> and <code>grad(f)</code> separately would run the forward pass twice. The fused version is what every real JAX training step uses:</p>
+<pre><code>loss, grads = jax.value_and_grad(loss_fn)(params, batch)
+</code></pre>
+<p>Often the loss function also produces side information — accuracy, logits, a breakdown of loss terms. But <code>grad</code> demands a scalar output. The escape hatch is <code>has_aux=True</code>: your function returns a pair <code>(scalar_loss, anything_else)</code>, and only the scalar is differentiated:</p>
+<pre><code>def loss_fn(params, batch):
+    logits = forward(params, batch["x"])
+    loss = cross_entropy(logits, batch["y"])
+    acc = (logits.argmax(-1) == batch["y"]).mean()
+    return loss, {"acc": acc, "logits": logits}     # (scalar, aux)
+
+(loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, batch)
+</code></pre>
+<p>Note the nesting on the left: the value slot holds the full <code>(loss, aux)</code> pair, the second slot holds <code>grads</code>. Getting this unpacking wrong is a rite of passage; commit it to memory now.</p>
+
+<div class="quiz" data-concept="ch2.html#value-and-grad" data-concept-label="§2.3 value_and_grad / has_aux">
+  <div class="q-text"><p>Write from memory: a <code>loss_fn(params, x, y)</code> that returns the mean-squared error <em>and</em> the raw predictions as auxiliary output, and the single line that evaluates loss, predictions, and gradients in one pass. What exactly does the call return, with what nesting? Why does <code>has_aux</code> need to exist at all?</p></div>
+  <div class="hint">Return <code>(scalar, aux)</code> from the function; the transformed call returns <code>((scalar, aux), grads)</code>.</div>
+  <div class="answer"><pre><code>def loss_fn(params, x, y):
+    pred = forward(params, x)
+    return jnp.mean((pred - y)**2), pred
+
+(loss, pred), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, x, y)</code></pre><p>It returns a pair whose first element is the function's full return value <code>(loss, pred)</code> and whose second is the gradient of the <em>scalar only</em>, shaped like <code>params</code>. <code>has_aux</code> exists because <code>grad</code> requires a scalar to differentiate; the flag lets a function smuggle out extra (undifferentiated) results without violating that rule.</p></div>
+</div>
+
+<h2 id="stop-gradient">2.4 stop_gradient: cutting one wire</h2>
+<p>Sometimes a value should be used in the forward computation but treated as a constant by differentiation — PyTorch's <code>.detach()</code>. JAX spells it <code>jax.lax.stop_gradient</code>:</p>
+<pre><code># TD-style bootstrap target: learn V to match r + γ·V(s'), but do NOT
+# differentiate through the target's own V — it's playing "ground truth"
+target = reward + gamma * jax.lax.stop_gradient(value_fn(params, s_next))
+loss = jnp.mean((value_fn(params, s) - target)**2)
+</code></pre>
+<p>Without <code>stop_gradient</code> here, <code>grad</code> would also push <code>value_fn(params, s_next)</code> <em>toward</em> the residual — the optimizer chases its own moving prediction (a known instability in bootstrapped value learning) instead of regressing prediction onto target. The same tool builds straight-through estimators and freezes submodules. Identity in the forward pass; zero in the backward pass.</p>
+
+<div class="quiz" data-concept="ch2.html#stop-gradient" data-concept-label="§2.4 stop_gradient">
+  <div class="q-text"><p>What does <code>jax.lax.stop_gradient</code> do in the forward and backward directions, and what is its PyTorch twin? Write the TD(0) value-loss snippet from memory with the stop in the right place, and explain concretely what changes in the computed gradient if you omit it.</p></div>
+  <div class="hint">Forward: identity. Backward: …? In the TD loss there are two appearances of <code>params</code> — gradient should flow through exactly one.</div>
+  <div class="answer"><p>Forward: identity (value passes through unchanged). Backward: gradient is exactly zero through it — differentiation treats it as a constant. Twin: <code>.detach()</code>.</p><pre><code>target = r + gamma * jax.lax.stop_gradient(V(params, s_next))
+loss = jnp.mean((V(params, s) - target)**2)</code></pre><p>With the stop, \(\nabla\text{loss}\) contains only the term pulling \(V(s)\) toward the target. Without it, an extra term \(-\gamma \cdot \nabla V(s')\) appears, pushing the <em>target</em> toward the prediction too — the regression becomes a pursuit of a moving point it itself controls, which biases learning and is a classic source of divergence.</p></div>
+</div>
+
+<h2 id="how-it-works">2.5 What grad actually does (one level down)</h2>
+<p>You don't need autodiff internals to use JAX, but one mental model prevents superstition. <code>jax.grad(f)(x)</code>: (1) <em>traces</em> <code>f</code> at the abstract shape of <code>x</code>, recording each primitive operation into a small intermediate program (a <em>jaxpr</em>); (2) transforms that program into one computing the derivative (reverse-mode: forward pass storing residuals, then a backward sweep — same math as PyTorch's tape, built ahead of time from the traced program rather than recorded during execution); (3) runs it. PyTorch's tape is rebuilt by every forward pass at runtime; JAX's derivative program is constructed from the trace and — under <code>jit</code> — compiled once and reused. The practical consequences:</p>
+<ul>
+<li>Python control flow (<code>if</code>/<code>for</code> on concrete values) is resolved <em>during tracing</em> — the derivative program sees only the branch actually taken (more in Chapter 3).</li>
+<li>Memory behaves like PyTorch: reverse mode stores activations for the backward sweep.</li>
+<li>Because "derivative of a program" is itself a program, transformations stack arbitrarily: <code>jit(grad(f))</code>, <code>grad(grad(f))</code>, <code>vmap(grad(f))</code> all just work.</li>
+</ul>
+
+<div class="quiz" data-concept="ch2.html#how-it-works" data-concept-label="§2.5 grad mechanics">
+  <div class="q-text"><p>Closed book: walk through what happens, step by step, when you call <code>jax.grad(f)(x)</code>. Where does PyTorch build its equivalent of the recorded program, and where does JAX? Name two practical consequences of the difference.</p></div>
+  <div class="hint">Three steps: trace → transform → run. PyTorch records during the forward pass at runtime; JAX records during ______.</div>
+  <div class="answer"><p>Steps: (1) trace <code>f</code> with abstract inputs, recording primitives into a jaxpr; (2) transform the jaxpr into a derivative program (reverse-mode: forward with residuals + backward sweep); (3) execute it at <code>x</code>. PyTorch constructs its graph dynamically during every forward execution; JAX constructs it once from a trace, ahead of execution. Consequences: under <code>jit</code> the whole loss-and-gradient computation compiles to one reusable XLA program (no per-step graph-building overhead); Python control flow is frozen at trace time (a branch on data needs special handling — Chapter 3); and transformations compose freely since the output of one transform is a valid input to another (<code>vmap(grad(f))</code>, <code>grad(grad(f))</code>).</p></div>
+</div>
+
+</main>
+</body>
+</html>

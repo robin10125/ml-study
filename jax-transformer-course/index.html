@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Transformer in JAX, from zero</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1>A Transformer in JAX, <span class="chapno">from zero</span></h1>
+<p class="subtitle">A rigorous, recall-driven course for people who know PyTorch or TensorFlow and zero JAX. By the end you will think natively in pure functions, pytrees, and PRNG keys — and you will define and train a working transformer language model in JAX, from an empty file, without reference.</p>
+
+<h2>How this course works</h2>
+<p>Reading about JAX produces the comfortable illusion that you could write it. The illusion evaporates in an empty editor. This course is built around <strong>active recall</strong>: every section is followed by recall boxes asking you to reproduce — not recognize — the material. The rules:</p>
+<ul>
+<li><strong>Attempt before revealing.</strong> Write your answer (code on a keyboard, ideally with a Python session open — <code>pip install jax</code> is the entire setup). Each recall has progressive <em>hints</em>, a <em>solution</em>, and a <em>📖 Review</em> link jumping to the exact section that teaches the concept, for when the attempt fails.</li>
+<li><strong>Check the box only for honest, unaided successes.</strong> Progress is stored locally per chapter and aggregated below.</li>
+<li><strong>Space it.</strong> Revisit failed recalls the next day, then after three days. The sidebar counts are your map of what's still soft.</li>
+<li><strong>Run everything.</strong> Unlike a math course, every claim here is checkable in a REPL in seconds. A recall you verified by running beats ten you eyeballed.</li>
+</ul>
+
+<h2>Your progress</h2>
+<div id="dashboard"></div>
+
+<h2>The route</h2>
+<p><strong>Part I — JAX itself</strong> (no transformer in sight; PyTorch/TF contrasts throughout):</p>
+<p><strong>Ch 1 — Thinking in JAX.</strong> The design inversion: state as explicit data, not object internals. Immutable arrays and <code>.at[]</code>, the purity contract and how impure code <em>silently lies</em>, PRNG keys and the splitting discipline.</p>
+<p><strong>Ch 2 — grad.</strong> Differentiation as a function transformation. <code>value_and_grad</code>, <code>has_aux</code>, <code>argnums</code>, <code>stop_gradient</code>, what replaces <code>backward()</code>/<code>zero_grad()</code> (and why nothing has to), and what <code>grad</code> actually builds.</p>
+<p><strong>Ch 3 — jit &amp; vmap.</strong> Tracing: the one mechanism behind every JAX surprise. Shape-keyed compilation, control flow on traced values, the closure-capture trap, and <code>vmap</code> — write per-example code, batch it mechanically, get per-example gradients free.</p>
+<p><strong>Ch 4 — Pytrees.</strong> Parameters without modules: nested dicts, <code>tree.map</code>, init functions with fan-in scaling, optimizers as three lines, the canonical jitted train step, <code>lax.scan</code> — capped by a complete MLP pipeline you write closed-book.</p>
+<p><strong>Part II — the transformer</strong>:</p>
+<p><strong>Ch 5 — The Transformer on Paper.</strong> Embeddings, attention from first principles (with the \(\sqrt{d_h}\) variance argument), the causal mask and why it goes <em>before</em> softmax, multi-head as a free reshape, pre-LN residual blocks, weight tying, and the \(\ln V\) ritual.</p>
+<p><strong>Ch 6 — The Transformer in JAX.</strong> Chapter 5's diagram as ~80 lines: <code>layer_norm</code>, <code>attention</code>, <code>mlp</code>, <code>block</code>, <code>forward</code>, <code>loss_fn</code>, <code>init_params</code> — every one a closed-book recall, every one machine-verified in the companion code.</p>
+<p><strong>Ch 7 — Training, Sampling &amp; Debugging.</strong> Adam from its equations (with the bias-correction proof), the jitted train step, the data pipeline, temperature sampling, the verified training run that memorizes Alice in Wonderland, and a debugging checklist keyed to the chapters.</p>
+
+<h2>Companion code</h2>
+<p>In <code>code/</code>, both machine-verified on this machine:</p>
+<ul>
+<li><code>transformer.py</code> — the reference single-file model (~200 lines, pure <code>jax.numpy</code>; no Flax, no Optax). The default run trains a 632 K-parameter character-level LM that fits its corpus (final loss 0.093 vs untrained baseline \(\ln 46 = 3.83\)) and prints a PASS line; expected output is embedded in Chapter 7.</li>
+<li><code>test_jax_core.py</code> — seven deterministic checks tying the code to the chapters: LayerNorm statistics, attention vs a per-head manual loop, the causality test, a hand-computed cross-entropy, the \(\ln V\) init loss, <code>jax.grad</code> vs finite differences, and Adam's first-step property. Expect <code>ALL 7 CHECKS PASS</code>.</li>
+</ul>
+<p>Setup: <code>python3 -m venv .venv &amp;&amp; .venv/bin/pip install jax</code>, then <code>.venv/bin/python code/test_jax_core.py</code>.</p>
+
+<h2>Prerequisites</h2>
+<p>Working PyTorch or TensorFlow experience (you've trained models and know what a loss, an optimizer, and an embedding are), NumPy fluency, and comfort with basic probability and gradients. No JAX whatsoever — Chapter 1 assumes none. If you want the architecture extensions afterward (RoPE, grouped-query attention, Mixture-of-Experts), the single-page advanced lesson <code>../transformer-jax.html</code> picks up where Chapter 7 ends.</p>
+
+</main>
+</body>
+</html>

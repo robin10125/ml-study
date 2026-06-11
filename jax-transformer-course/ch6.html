@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 6 · The Transformer in JAX</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 6</span> · The Transformer in JAX</h1>
+<p class="subtitle">Chapter 5's diagram becomes ~80 lines of <code>jax.numpy</code>. Six functions: <code>layer_norm</code>, <code>attention</code>, <code>mlp</code>, <code>block</code>, <code>forward</code>, <code>loss_fn</code> — plus <code>init_params</code>. Every one is a recall below, and the same code lives verified in <code>code/transformer.py</code>. The convention throughout: B = batch, T = sequence, D = d_model = 128, H = 4 heads, head dim 32.</p>
+
+<h2 id="norm-code">6.1 layer_norm</h2>
+<p>The smallest piece first. Statistics over the <em>last</em> axis with <code>keepdims=True</code> so the division broadcasts back over \((B, T, D)\):</p>
+<pre><code>def layer_norm(x, gamma, beta, eps=1e-5):
+    mean = jnp.mean(x, axis=-1, keepdims=True)        # (B, T, 1)
+    var = jnp.var(x, axis=-1, keepdims=True)          # (B, T, 1)
+    return (x - mean) * jax.lax.rsqrt(var + eps) * gamma + beta
+</code></pre>
+<p>Self-check list: <code>axis=-1</code> (per token, over features — never over batch or time); <code>keepdims</code> (or manual <code>[..., None]</code>) for the broadcast; \(\varepsilon\) <em>inside</em> the square root; \(\gamma, \beta\) of shape \((D,)\) broadcasting over the leading axes. <code>jax.lax.rsqrt</code> is a fused reciprocal square root — <code>/ jnp.sqrt(…)</code> is equally correct.</p>
+
+<div class="quiz" data-concept="ch6.html#norm-code" data-concept-label="§6.1 layer_norm">
+  <div class="q-text"><p>Write <code>layer_norm(x, gamma, beta, eps=1e-5)</code> from memory for <code>x: (B, T, D)</code>. Then state what each of these mistakes does at runtime: (a) <code>axis=0</code>; (b) omitting <code>keepdims=True</code>; (c) adding <code>eps</code> <em>outside</em> the sqrt.</p></div>
+  <div class="hint">Two reductions (mean, var), one normalize, one affine. The reductions must keep their axis so (B,T,1) broadcasts against (B,T,D).</div>
+  <div class="answer"><p>Code as in §6.1. (a) <code>axis=0</code> normalizes each feature across the <em>batch</em> — BatchNorm-ish, statistically wrong here, leaks across examples, and silently produces a working-looking model that trains worse. (b) Without keepdims the stats have shape (B,T) and broadcasting against (B,T,D) raises a shape error — the loud, kind failure. (c) <code>rsqrt(var)+eps</code>-style placement no longer guards the division: an all-constant token has var = 0 ⇒ <code>rsqrt(0)=inf</code> ⇒ NaNs that poison everything downstream.</p></div>
+</div>
+
+<h2 id="attn-code">6.2 attention: the centerpiece</h2>
+<p>Transcribing §5.2–5.4. The dance is: project → split heads → move the head axis forward → scores → mask → softmax → weighted sum → merge heads → output projection.</p>
+<pre><code>N_HEADS = 4   # static config — NOT inside params (see §6.5)
+
+def attention(p, x):
+    B, T, D = x.shape
+    H = N_HEADS
+    hd = D // H
+
+    q = (x @ p["wq"]).reshape(B, T, H, hd).transpose(0, 2, 1, 3)  # (B,H,T,hd)
+    k = (x @ p["wk"]).reshape(B, T, H, hd).transpose(0, 2, 1, 3)
+    v = (x @ p["wv"]).reshape(B, T, H, hd).transpose(0, 2, 1, 3)
+
+    scores = q @ k.transpose(0, 1, 3, 2) / jnp.sqrt(hd)           # (B,H,T,T)
+    mask = jnp.tril(jnp.ones((T, T), dtype=bool))
+    scores = jnp.where(mask, scores, -jnp.inf)                    # before softmax!
+    weights = jax.nn.softmax(scores, axis=-1)
+
+    out = (weights @ v).transpose(0, 2, 1, 3).reshape(B, T, D)    # merge heads
+    return out @ p["wo"]
+</code></pre>
+<p>Why the transposes? <code>@</code> on 4-D arrays batches over the leading axes and matmuls the last two. With heads at axis 1, <code>q @ k^T</code> means "for every (batch, head): a \((T, d_h) \times (d_h, T)\) matmul" — exactly the per-head score matrices, no <code>vmap</code> needed (though <code>vmap</code> over a single-head function is a fine alternative). Note the JAX specifics: the boolean <code>tril</code> mask is applied with <code>jnp.where</code> — the both-branches select from §3.2 — and \(-\infty\) is legal and exact (<code>e^{-inf}</code> = 0).</p>
+
+<div class="quiz" data-concept="ch6.html#attn-code" data-concept-label="§6.2 attention code">
+  <div class="q-text"><p>The centerpiece recall of the course: write <code>attention(p, x)</code> from memory — params <code>wq, wk, wv, wo</code>, all \((D, D)\); causal; multi-head. Annotate every line with its output shape. Then explain why <code>q @ k.transpose(0,1,3,2)</code> computes all B·H score matrices at once.</p></div>
+  <div class="hint">Order: project → reshape (B,T,H,hd) → transpose (B,H,T,hd) → scores /√hd → tril + where(−inf) → softmax → @v → transpose back → reshape (B,T,D) → @wo.</div>
+  <div class="hint">Matmul on n-D arrays: batch over all leading axes, contract the last axis of the left with the second-to-last of the right.</div>
+  <div class="answer"><p>Code and shapes as in §6.2. Grade yourself against: reshape uses H and hd=D//H; transpose brings H before T (0,2,1,3); scale is \(\sqrt{d_h} = \sqrt{32}\), <em>not</em> \(\sqrt{D}\); mask built with <code>jnp.tril(ones((T,T),bool))</code> and applied with <code>where(mask, scores, -inf)</code> <em>before</em> softmax; softmax over the <em>last</em> axis (keys); final transpose+reshape merges heads <em>before</em> <code>wo</code>. The batched matmul works because <code>@</code> treats (B,H) as batch dimensions and contracts (T,hd)×(hd,T) → (T,T) per batch-head pair — B·H small matmuls expressed as one op.</p></div>
+</div>
+
+<h2 id="mlp-block-code">6.3 mlp and block</h2>
+<pre><code>def mlp(p, x):
+    return jax.nn.gelu(x @ p["w1"] + p["b1"]) @ p["w2"] + p["b2"]
+
+def block(p, x):
+    x = x + attention(p["attn"], layer_norm(x, p["ln1_g"], p["ln1_b"]))
+    x = x + mlp(p["mlp"], layer_norm(x, p["ln2_g"], p["ln2_b"]))
+    return x
+</code></pre>
+<p><code>block</code> is the pre-LN diagram verbatim: normalize <em>inside</em> the branch, add to the untouched stream. The two LayerNorms have separate learned \(\gamma/\beta\) (they normalize different statistics). Note how naturally the pure-function style composes: <code>block</code> takes its slice of the params tree and the stream, returns the new stream — no registration, no module tree, just function calls mirroring the dataflow.</p>
+
+<div class="quiz" data-concept="ch6.html#mlp-block-code" data-concept-label="§6.3 mlp + block">
+  <div class="q-text"><p>Write <code>mlp(p, x)</code> (D→512→D, GELU) and <code>block(p, x)</code> (pre-LN, two residual adds) from memory, with the params layout they expect. Two audits: where exactly do the residual adds happen relative to the norms, and what would <code>x = attention(p["attn"], layer_norm(...))</code> — without the <code>x +</code> — do to trainability at depth?</p></div>
+  <div class="hint">Pre-LN: LN sits at the entrance of each branch; the stream is only ever added to.</div>
+  <div class="answer"><p>Code as in §6.3; params: <code>{"ln1_g","ln1_b","ln2_g","ln2_b","attn":{wq,wk,wv,wo},"mlp":{w1,b1,w2,b2}}</code>. The adds wrap each normalized branch: <code>x + Attn(LN(x))</code> then <code>x + MLP(LN(x))</code> — LN never applies to the through-path. Dropping <code>x +</code> removes the identity highway: gradients must then pass <em>through</em> every attention/MLP nonlinearity multiplicatively, shrinking layer by layer — the vanishing-signal regime that made deep pre-resnet networks untrainable. With the adds, the loss has a linear path to every layer's input.</p></div>
+</div>
+
+<h2 id="forward-code">6.4 forward: assembling the model</h2>
+<pre><code>def forward(params, tokens):
+    B, T = tokens.shape
+    x = params["embed"][tokens] + params["pos"][:T]    # (B, T, D)
+    for p in params["blocks"]:                          # unrolls under jit (§3.1)
+        x = block(p, x)
+    x = layer_norm(x, params["lnf_g"], params["lnf_b"])
+    return x @ params["embed"].T                        # weight tying: (B, T, V)
+</code></pre>
+<p>Details worth noticing: <code>params["embed"][tokens]</code> is fancy-indexing a \((V, D)\) table with a \((B, T)\) int array — a pure gather, fully differentiable with respect to the table. <code>params["pos"][:T]</code> slices the position table to the actual sequence length and broadcasts over the batch. The Python <code>for</code> over blocks is fine: the list has fixed length, so under <code>jit</code> it unrolls into 3 copies of the block computation (a <code>lax.scan</code> over stacked layer params is the at-scale alternative — §4.5). Weight tying is literally <code>.T</code>.</p>
+
+<div class="quiz" data-concept="ch6.html#forward-code" data-concept-label="§6.4 forward">
+  <div class="q-text"><p>Write <code>forward(params, tokens)</code> from memory. Then three whys: why is <code>E[tokens]</code> differentiable w.r.t. <code>E</code> even though it's indexing; why is the Python loop over blocks legal under jit (and when would you switch to scan); why does <code>x @ params["embed"].T</code> implement the unembedding, dimensionally?</p></div>
+  <div class="hint">Gather's gradient is scatter-add. Loop bound: traced or static? Shapes: (B,T,D) @ (D,V).</div>
+  <div class="answer"><p>Code as in §6.4. ① A gather is a linear map (one-hot matmul without materializing the one-hot); its gradient scatter-adds each position's incoming gradient into the rows that were read — rows of <code>E</code> used often get more gradient. ② The loop bound (3 blocks) is plain Python, known at trace time — the loop unrolls into the jaxpr (§3.1); switch to <code>lax.scan</code> over stacked params when depth makes compile time/code size hurt. ③ <code>x: (B,T,128) @ E.T: (128,46) → (B,T,46)</code>: each token's vector is dotted against every token's embedding row — similarity in embedding space becomes the logit, which is the tying intuition.</p></div>
+</div>
+
+<h2 id="init-code">6.5 init_params: keys, scales, and what stays out of the tree</h2>
+<pre><code>def init_params(key, vocab, d_model=128, n_layers=3, d_ff=512, max_T=256):
+    def dense(key, n_in, n_out):
+        return jax.random.normal(key, (n_in, n_out)) / jnp.sqrt(n_in)
+
+    key, ek, pk = jax.random.split(key, 3)
+    blocks = []
+    for _ in range(n_layers):
+        key, kq, kk, kv, ko, k1, k2 = jax.random.split(key, 7)   # fresh keys, every layer
+        blocks.append({
+            "ln1_g": jnp.ones(d_model), "ln1_b": jnp.zeros(d_model),
+            "ln2_g": jnp.ones(d_model), "ln2_b": jnp.zeros(d_model),
+            "attn": {"wq": dense(kq, d_model, d_model),
+                     "wk": dense(kk, d_model, d_model),
+                     "wv": dense(kv, d_model, d_model),
+                     "wo": dense(ko, d_model, d_model)},
+            "mlp": {"w1": dense(k1, d_model, d_ff), "b1": jnp.zeros(d_ff),
+                    "w2": dense(k2, d_ff, d_model), "b2": jnp.zeros(d_model)},
+        })
+    return {"embed": jax.random.normal(ek, (vocab, d_model)) * 0.02,
+            "pos": jax.random.normal(pk, (max_T, d_model)) * 0.02,
+            "blocks": blocks,
+            "lnf_g": jnp.ones(d_model), "lnf_b": jnp.zeros(d_model)}
+</code></pre>
+<p>All of Part I shows up here: split-per-use key discipline (seven fresh keys per layer — §1.4), fan-in \(1/\sqrt{n_{in}}\) scaling (§4.2), LN gains at ones / biases and shifts at zeros, small (0.02) embeddings. And one subtlety that bites everyone once:</p>
+<div class="box warning"><div class="box-title">Config does not belong in the params pytree</div>
+<p><code>n_heads</code> is an integer. If you store it in <code>params</code>, every <code>tree.map</code> walks over it: <code>jax.grad</code> tries to differentiate it, Adam tries to update it, <code>zeros_like</code> zeroes it. Leaves of <code>params</code> must be exactly the things you train — arrays, nothing else. Static configuration lives outside: a module constant, a closure, or a <code>static_argnums</code> argument (§3.2). That's why <code>transformer.py</code> has <code>N_HEADS = 4</code> at module level.</p>
+</div>
+
+<div class="quiz" data-concept="ch6.html#init-code" data-concept-label="§6.5 init_params">
+  <div class="q-text"><p>Without looking: write the <code>dense</code> helper and the init for <em>one</em> block (both LNs, four attention matrices, the two-layer MLP), with correct key handling. Then explain precisely what goes wrong if <code>n_heads: 4</code> is stored as a params leaf, and name the three legal homes for static config.</p></div>
+  <div class="hint">Seven splits per block: q, k, v, o, w1, w2 — plus the carried parent. LN params need no keys (deterministic ones/zeros).</div>
+  <div class="answer"><p>Code as in §6.5: <code>dense = normal(key,(n_in,n_out))/sqrt(n_in)</code>; LNs at ones/zeros (no randomness); each weight gets its own fresh subkey, parent key carried forward. With <code>n_heads</code> as a leaf: <code>jax.grad</code> attempts to differentiate an int (error, or a useless zero-gradient float), <code>adam_init</code>'s <code>zeros_like</code> turns it into an array 0, and the first update "trains" your head count — at best a crash, at worst silent corruption of config. Legal homes: a module-level constant (our choice), a closed-over variable (capturing true constants is fine, §3.3), or a <code>static_argnums</code> argument when it must vary between calls.</p></div>
+</div>
+
+<h2 id="loss-code">6.6 cross_entropy and loss_fn</h2>
+<pre><code>def cross_entropy(logits, targets):
+    logp = jax.nn.log_softmax(logits, axis=-1)                      # (..., V)
+    picked = jnp.take_along_axis(logp, targets[..., None], axis=-1)[..., 0]
+    return -picked.mean()
+
+def loss_fn(params, tokens):          # tokens: (B, T+1)
+    inputs, targets = tokens[:, :-1], tokens[:, 1:]                  # the shift
+    logits = forward(params, inputs)                                 # (B, T, V)
+    return cross_entropy(logits, targets)
+</code></pre>
+<p>Two implementation points. <strong>Numerics:</strong> always <code>log_softmax</code>, never <code>log(softmax(…))</code> — the fused version subtracts the max before exponentiating, immune to overflow, and never takes <code>log(0)</code>. <strong>Gathering:</strong> we need <code>logp[b, t, targets[b, t]]</code> for every (b, t); <code>take_along_axis</code> does exactly that batched indexing — <code>targets[..., None]</code> lifts targets to \((B, T, 1)\) so it can index the last axis, and <code>[..., 0]</code> drops the singleton. (One-hot multiply-and-sum is the same math, at the cost of materializing \((B, T, V)\).)</p>
+
+<div class="quiz" data-concept="ch6.html#loss-code" data-concept-label="§6.6 loss code">
+  <div class="q-text"><p>Write <code>cross_entropy(logits, targets)</code> and <code>loss_fn(params, tokens)</code> from memory, with the shift. Why is <code>log_softmax</code> numerically safer than <code>log(softmax(x))</code> — show the failure input — and what do the shapes look like through the <code>take_along_axis</code> gather?</p></div>
+  <div class="hint">Failure: logits like [1000, 0]. softmax overflows e^1000 → inf/inf; log_softmax computes x − max − log Σ e^(x−max).</div>
+  <div class="answer"><p>Code as in §6.6. With logits [1000, 0]: <code>softmax</code> evaluates \(e^{1000} = \infty\) ⇒ nan; even mild versions underflow small probabilities to 0 ⇒ <code>log(0) = -\infty</code>. <code>log_softmax</code> rewrites as \(x - \max(x) - \log\sum e^{x - \max(x)}\): exponents are \(\le 0\), nothing overflows, the log argument is \(\ge 1\). Shapes: <code>logp (B,T,V)</code>, <code>targets[...,None] (B,T,1)</code> indexes axis −1 → picked <code>(B,T,1)</code> → <code>[...,0]</code> → (B,T) → mean → scalar. The shift: inputs <code>[:, :-1]</code>, targets <code>[:, 1:]</code>, so position t is graded on token t+1.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch6.html#attn-code" data-concept-label="§6.1–6.6 Whole model">
+  <div class="q-text"><p>The chapter capstone, and the test of the course's promise: in an empty editor, write the complete model — <code>layer_norm</code>, <code>attention</code>, <code>mlp</code>, <code>block</code>, <code>forward</code>, <code>cross_entropy</code>, <code>loss_fn</code>, <code>init_params</code> — run <code>loss_fn(init_params(key, 46), tokens)</code> on random tokens, and check it prints ≈ 3.83. Then run the causality test from §5.3. Both must pass before Chapter 7.</p></div>
+  <div class="hint">Don't debug by staring: bisect with the two machine checks (ln V at init; corrupt-the-future). Compare against <code>code/transformer.py</code> only after both pass or you're truly stuck.</div>
+  <div class="answer"><p>Reference: <code>code/transformer.py</code> (functions identical to §§6.1–6.6). Verification, from <code>code/test_jax_core.py</code>, which machine-checks this chapter: attention ≡ per-head manual loop; corrupting tokens ≥ t leaves logits &lt; t unchanged; untrained <code>loss_fn</code> = 2.40 vs ln 11 = 2.398 (its small test vocab); cross-entropy of [2,0,0]@0 = 0.2395. If your from-memory version passes the init-loss and causality checks, you have written a transformer in JAX without reference — the course's stated goal. Chapter 7 makes it learn.</p></div>
+</div>
+
+</main>
+</body>
+</html>

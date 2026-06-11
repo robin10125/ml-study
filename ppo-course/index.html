@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PPO from First Principles</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1>Proximal Policy Optimization, <span class="chapno">from first principles</span></h1>
+<p class="subtitle">A rigorous, recall-driven course. By the end you will have derived the policy gradient theorem, GAE, the performance difference lemma, TRPO's natural-gradient trust region, and PPO's clipped surrogate — and written a PPO that solves CartPole, from scratch, with every line accounted for.</p>
+
+<h2>How this course works</h2>
+<p>Reading about RL produces a comfortable illusion of understanding that evaporates at the keyboard. This course is built around <strong>active recall</strong>: every section is followed by recall boxes asking you to reproduce — not recognize — the material. The rules:</p>
+<ul>
+<li><strong>Attempt before revealing.</strong> Say or write your answer first. Each recall has progressive <em>hints</em> (use them — a hinted recall beats a peeked answer), a <em>solution</em>, and a <em>📖 Review</em> link jumping to the exact section that teaches the concept, for when the attempt fails.</li>
+<li><strong>Check the box only for honest, unaided successes.</strong> Progress is stored locally per chapter and aggregated below.</li>
+<li><strong>Space it.</strong> Revisit failed recalls the next day, then after three days. The sidebar counts are your map of what's still soft.</li>
+<li><strong>Derive on paper.</strong> The proofs here (log-derivative trick, baseline unbiasedness, GAE telescoping, performance difference lemma, natural gradient step) are short — two to six lines each — and every one is asked again later as a recall. Paper, not eyes.</li>
+</ul>
+
+<h2>Your progress</h2>
+<div id="dashboard"></div>
+
+<h2>The route</h2>
+<p><strong>Ch 1 — MDPs, Returns &amp; Value Functions.</strong> The vocabulary: trajectory probabilities, reward-to-go, \(V\)/\(Q\)/\(A\), Bellman equations, why the data distribution moving with the policy changes everything.</p>
+<p><strong>Ch 2 — The Policy Gradient Theorem.</strong> The log-derivative trick, the full derivation (watching the environment dynamics drop out), the EGLP lemma, reward-to-go, REINFORCE and its two fatal weaknesses.</p>
+<p><strong>Ch 3 — Baselines, Advantages &amp; GAE.</strong> Variance reduction with proofs: baselines are free, the value function is the right one, TD errors estimate advantages, and GAE's \(\lambda\)-dial interpolates the whole bias–variance spectrum. The exact buffer loop PPO uses.</p>
+<p><strong>Ch 4 — The Step-Size Problem &amp; Surrogates.</strong> The conceptual core: why one bad step can end a run, the performance difference lemma, the importance-sampled surrogate, first-order agreement, and KL as the right ruler.</p>
+<p><strong>Ch 5 — TRPO.</strong> The monotonic improvement bound, the KL-constrained problem, natural gradient via conjugate gradient and Fisher-vector products, the verifying line search — and the bill for all that rigor.</p>
+<p><strong>Ch 6 — PPO.</strong> The clipped surrogate: the four-case analysis, why the <em>min</em> makes it a pessimistic bound, what clipping does and does not guarantee, the adaptive-KL variant, the full three-term loss, PPO vs TRPO.</p>
+<p><strong>Ch 7 — Building PPO from Scratch.</strong> The complete algorithm, the implementation details that decide success (truncation bootstrapping, advantage normalization, value clipping, approx-KL monitoring…), a staged build ladder with verification at each rung, machine-checked companion code, and a debugging checklist.</p>
+
+<h2>Companion code</h2>
+<p>In <code>code/</code>, both machine-verified on this machine:</p>
+<ul>
+<li><code>ppo.py</code> — the reference single-file PPO (PyTorch + Gymnasium). The default run solves CartPole-v1 (average return 500.0/500) and prints a PASS line; expected output is embedded in Chapter 7.</li>
+<li><code>test_ppo_core.py</code> — six deterministic checks tying the code to the chapters' algebra: GAE recursion ≡ definition, both \(\lambda\) endpoints, a hand-computed clipped-loss example, the clip's zero-gradient regions, and the EGLP lemma. Expect <code>ALL 6 CHECKS PASS</code>.</li>
+</ul>
+<p>Setup: <code>python3 -m venv .venv &amp;&amp; .venv/bin/pip install numpy gymnasium torch</code>, then <code>.venv/bin/python code/test_ppo_core.py</code>.</p>
+
+<h2>Prerequisites</h2>
+<p>Comfort with probability (expectations, conditioning), gradients, and basic deep learning (training a network with Adam). No prior RL is assumed — Chapter 1 builds it — but this is a course for people willing to do algebra on paper.</p>
+
+</main>
+</body>
+</html>
