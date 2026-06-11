@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flash Attention, From Scratch — Course Home</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">&#9889;</span> Flash Attention, From Scratch</h1>
+<p class="subtitle">A rigorous, recall-driven course that takes you from "what is attention?" to writing a FlashAttention-2-style kernel in CUDA and in JAX.</p>
+
+<h2 id="goal">What you will be able to do</h2>
+<p>By the end of this course you will be able to:</p>
+<ul>
+  <li>Explain <em>precisely</em> why standard attention is slow on GPUs (it is not the FLOPs), using memory-hierarchy arguments with real numbers.</li>
+  <li>Derive the online-softmax recurrence and prove it computes exact softmax — the single mathematical trick that makes Flash Attention possible.</li>
+  <li>State the FlashAttention-2 forward and backward algorithms from memory, including the three specific changes FA-2 made over FA-1.</li>
+  <li>Write, compile, and verify a working FlashAttention-2-style forward kernel in CUDA, and a backward kernel, against a reference implementation.</li>
+  <li>Implement Flash Attention in JAX twice: as a blockwise <code>lax.scan</code> with a <code>custom_vjp</code>, and as a Pallas GPU kernel.</li>
+</ul>
+
+<div class="box keypoint"><div class="box-title">The one-sentence summary of this entire course</div>
+Flash Attention computes <em>exactly</em> the same output as standard attention, with <em>more</em> arithmetic, but runs faster because it never writes the \(N \times N\) attention matrix to slow GPU memory — and the only mathematical obstacle to doing that, the softmax normalizer that seems to need all scores at once, is removed by an <em>online softmax</em> that incrementally corrects earlier work as new scores arrive.
+</div>
+
+<h2 id="how">How to study this course (read this — it changes your results)</h2>
+<p>This course is built around <strong>active recall</strong>: you will constantly be asked to produce knowledge before being shown it. Purple <strong>Recall</strong> boxes appear throughout. For each one:</p>
+<ol>
+  <li><strong>Answer out loud or on paper first.</strong> Actually write the equation or code. Reading the solution and thinking "yeah, I knew that" produces an illusion of knowledge that collapses the moment you face an empty <code>.cu</code> file.</li>
+  <li>Stuck? Click <strong>💡 Hint</strong> — hints are progressive, so take them one at a time and re-attempt after each.</li>
+  <li>If a hint isn't enough, the <strong>📖 Review</strong> link jumps to the exact section of the lesson that teaches the needed concept. Re-read it, come back, and try again <em>without</em> looking.</li>
+  <li>Only then click <strong>Show solution</strong>, and grade yourself honestly with the "recalled correctly from memory" checkbox. Your progress is saved in your browser and shown in the sidebar and below.</li>
+  <li>Return to unchecked recalls tomorrow, then in three days. Spaced repetition is not optional decoration; it is how the CUDA chapter becomes writable from memory.</li>
+</ol>
+<p>The coding chapters (5–7) are <em>workbooks</em>: each kernel is built as a sequence of recall exercises, and the full verified program is given at the end. You will get far more out of them if you keep a terminal open and actually compile as you go.</p>
+
+<h2 id="prereq">Prerequisites</h2>
+<ul>
+  <li>Comfortable linear algebra: matrix multiplication, transposes, shapes.</li>
+  <li>You have seen the transformer attention formula before (we re-derive everything, but it shouldn't be your first exposure).</li>
+  <li>Basic C/C++ reading ability for the CUDA chapters; basic Python/NumPy for the JAX chapter.</li>
+  <li><strong>No CUDA or GPU-architecture knowledge is assumed.</strong> Chapter 2 builds it from zero.</li>
+  <li>To run the code: any NVIDIA GPU + <code>nvcc</code> for chapters 5–6; <code>pip install jax</code> for chapter 7 (the Pallas kernel can run in interpreter mode on CPU).</li>
+</ul>
+
+<h2 id="map">Course map</h2>
+<table>
+<tr><th>Chapter</th><th>You learn</th><th>You can then…</th></tr>
+<tr><td><a href="ch1.html">1 · Attention &amp; the Memory Wall</a></td><td>Standard attention, FLOP and byte counting, arithmetic intensity</td><td>Explain why attention is memory-bound, with numbers</td></tr>
+<tr><td><a href="ch2.html">2 · GPU Architecture &amp; CUDA Basics</a></td><td>SMs, warps, the memory hierarchy, shared memory, tiling, warp shuffles</td><td>Write a tiled matmul kernel — the skeleton of every attention kernel</td></tr>
+<tr><td><a href="ch3.html">3 · Safe &amp; Online Softmax</a></td><td>Numerical stability, the online softmax recurrence and its proof, log-sum-exp</td><td>Run the recurrence by hand and derive it from scratch</td></tr>
+<tr><td><a href="ch4.html">4 · The FlashAttention-2 Algorithm</a></td><td>Tiling attention, the FA-2 forward algorithm, IO complexity, FA-1 → FA-2 changes, work partitioning, causal masking</td><td>Write FA-2 forward pseudocode from memory</td></tr>
+<tr><td><a href="ch5.html">5 · FA-2 Forward in CUDA</a></td><td>A complete, compilable, verified forward kernel, built piece by piece</td><td>Program flash attention forward in CUDA</td></tr>
+<tr><td><a href="ch6.html">6 · The Backward Pass</a></td><td>Gradient derivations, recomputation from the log-sum-exp, the FA-2 backward kernel</td><td>Program flash attention backward in CUDA</td></tr>
+<tr><td><a href="ch7.html">7 · Flash Attention in JAX</a></td><td>Blockwise scan implementation, <code>custom_vjp</code>, Pallas kernels</td><td>Implement flash attention in JAX, reference-checked</td></tr>
+</table>
+
+<h2 id="notation">Notation used everywhere</h2>
+<table>
+<tr><th>Symbol</th><th>Meaning</th></tr>
+<tr><td>\(N\)</td><td>sequence length (number of tokens)</td></tr>
+<tr><td>\(d\)</td><td>head dimension (e.g. 64 or 128); per-head, after splitting the model dimension across heads</td></tr>
+<tr><td>\(Q, K, V \in \mathbb{R}^{N \times d}\)</td><td>query, key, value matrices <em>for one head of one sequence</em></td></tr>
+<tr><td>\(S = QK^\top / \sqrt{d} \in \mathbb{R}^{N \times N}\)</td><td>(scaled) score matrix</td></tr>
+<tr><td>\(P = \mathrm{softmax}_{\text{row}}(S)\)</td><td>attention weights; each row sums to 1</td></tr>
+<tr><td>\(O = PV \in \mathbb{R}^{N \times d}\)</td><td>attention output</td></tr>
+<tr><td>\(B_r, B_c\)</td><td>tile sizes: rows (queries) and columns (keys) per block</td></tr>
+<tr><td>\(T_r = \lceil N/B_r \rceil,\; T_c = \lceil N/B_c \rceil\)</td><td>number of query / key tiles</td></tr>
+<tr><td>\(m, \ell\)</td><td>running row max and running softmax denominator (the online-softmax state)</td></tr>
+<tr><td>\(L = m + \log \ell\)</td><td>row log-sum-exp, the only softmax statistic saved for backward</td></tr>
+<tr><td>HBM / SRAM</td><td>large, slow off-chip GPU memory / small, fast on-chip memory (shared memory + registers)</td></tr>
+</table>
+
+<h2 id="progress">Your progress</h2>
+<div id="dashboard"><p style="color:var(--ink-soft)">Visit the chapters to populate this dashboard.</p></div>
+
+<h2 id="refs">Primary sources</h2>
+<ul>
+  <li>Milakov &amp; Gimelshein, <em>Online normalizer calculation for softmax</em>, 2018 — the online softmax trick.</li>
+  <li>Rabe &amp; Staats, <em>Self-attention Does Not Need O(n²) Memory</em>, 2021 — blockwise attention with rescaling.</li>
+  <li>Dao, Fu, Ermon, Rudra, Ré, <em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em>, 2022.</li>
+  <li>Dao, <em>FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning</em>, 2023 — the algorithm this course implements.</li>
+</ul>
+<p style="color:var(--ink-soft); font-size:0.9rem">Math is rendered with KaTeX from a CDN; if you are offline you will see raw LaTeX, but all code and prose remain readable.</p>
+</main>
+</body>
+</html>

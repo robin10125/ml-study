@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 3 · Safe &amp; Online Softmax</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 3</span> · Safe &amp; Online Softmax</h1>
+<p class="subtitle">One mathematical idea separates Flash Attention from "obviously impossible": the softmax denominator can be computed incrementally, with already-accumulated results corrected retroactively. This chapter derives it, proves it, and drills it by hand. Everything here is about a single row of scores \(x_1, \dots, x_N\).</p>
+
+<h2 id="overflow">3.1 Naive softmax explodes</h2>
+<p>The textbook formula \(\mathrm{softmax}(x)_i = e^{x_i} / \sum_j e^{x_j}\) is unusable in floating point. \(e^x\) overflows fp32 (max \(\approx 3.4\times10^{38}\)) once \(x \gt 88.7\), and overflows fp16 (max 65504) once \(x \gt 11.09\). Attention scores routinely exceed 11. One overflowed score makes the denominator <code>inf</code> and every weight <code>nan</code> — and a single <code>nan</code> anywhere destroys training.</p>
+
+<h2 id="safe-softmax">3.2 Safe softmax: subtract the max</h2>
+<p>For <em>any</em> constant \(m\):</p>
+$$ \frac{e^{x_i - m}}{\sum_j e^{x_j - m}} = \frac{e^{x_i}e^{-m}}{e^{-m}\sum_j e^{x_j}} = \frac{e^{x_i}}{\sum_j e^{x_j}}. $$
+<p>The shift is <strong>exactly</strong> free — the factor \(e^{-m}\) cancels. Choosing \(m = \max_i x_i\) makes every exponent \(\le 0\), so every \(e^{x_i-m} \in (0, 1]\): no overflow, and the denominator is at least 1 (the max contributes \(e^0 = 1\)). The standard implementation makes <strong>three passes</strong> over the row:</p>
+<pre><code>m = max(x)                  # pass 1
+l = sum(exp(x - m))         # pass 2
+p = exp(x - m) / l          # pass 3
+</code></pre>
+<p>Three passes is precisely our problem: a tiled kernel sees each chunk of the row <em>once</em>, and would like never to see it again.</p>
+
+<div class="quiz" data-concept="ch3.html#safe-softmax" data-concept-label="§3.2 Safe softmax">
+  <div class="q-text"><p>From memory: (a) prove that subtracting any constant \(m\) from all inputs leaves softmax exactly unchanged; (b) why is \(m=\max\) the right choice numerically — name what it guarantees about both the numerator terms and the denominator; (c) above roughly what score does \(e^x\) overflow in fp32 and in fp16?</p></div>
+  <div class="hint">(a) Factor the numerator and denominator. (b) After the shift, what is the largest exponent?</div>
+  <div class="answer"><p>(a) \(e^{x_i-m} = e^{x_i}e^{-m}\); the common factor \(e^{-m}\) appears in numerator and denominator and cancels — an algebraic identity, not an approximation. (b) With \(m=\max\), all exponents are \(\le 0\) so all \(e^{x_i-m}\in(0,1]\) (no overflow), and the denominator \(\ge 1\) (the max term is exactly 1), so the division can't blow up either. (c) fp32: \(x \gtrsim 88.7\); fp16: \(x \gtrsim 11.09\) (max value 65504).</p></div>
+</div>
+
+<h2 id="online-softmax">3.3 Online softmax: merging partial results</h2>
+<p>The question that unlocks everything: suppose we computed safe-softmax <em>statistics</em> over two separate chunks of the row, \(A\) and \(B\):</p>
+$$ m_A = \max_{i\in A} x_i, \quad \ell_A = \sum_{i\in A} e^{x_i - m_A}, \qquad m_B = \max_{i\in B} x_i, \quad \ell_B = \sum_{i\in B} e^{x_i - m_B}. $$
+<p>Can we get the statistics of \(A \cup B\) without revisiting any \(x_i\)? Yes. The true max is \(m = \max(m_A, m_B)\). For the denominator, note \(\ell_A\) is a sum of exponentials shifted by the <em>wrong</em> constant \(m_A\) instead of \(m\) — but a shift can be repaired by one multiplication:</p>
+$$ e^{m_A - m}\,\ell_A = e^{m_A - m}\sum_{i\in A} e^{x_i - m_A} = \sum_{i\in A} e^{x_i - m}. $$
+<p>Hence the <strong>merge rule</strong>:</p>
+<div class="box keypoint"><div class="box-title">Online softmax merge rule</div>
+$$ m = \max(m_A, m_B), \qquad \ell = e^{m_A - m}\,\ell_A + e^{m_B - m}\,\ell_B. $$
+Both correction factors \(e^{m_A-m}, e^{m_B-m}\) are \(\le 1\) (never overflow), and the result is <em>exactly</em> the safe-softmax statistics of the union. The operation is associative and commutative — chunks can be merged in any order, which is also what makes tree-reductions and "split-K" attention variants possible.
+</div>
+<p>Processing a row tile by tile is just repeated merging: keep running state \((m, \ell)\), initialized to \((-\infty, 0)\) (the statistics of an empty set — note \(e^{-\infty - m} = 0\) gracefully wipes the empty term), and fold in each new tile's local statistics \((\tilde m, \tilde\ell)\):</p>
+$$ m^{\text{new}} = \max(m, \tilde m), \qquad \ell^{\text{new}} = e^{m - m^{\text{new}}}\,\ell + e^{\tilde m - m^{\text{new}}}\,\tilde\ell. $$
+
+<div class="quiz" data-concept="ch3.html#online-softmax" data-concept-label="§3.3 The merge rule">
+  <div class="q-text"><p><strong>The most important derivation in the course.</strong> From memory, derive the merge rule: given \((m_A, \ell_A)\) and \((m_B, \ell_B)\), produce \((m, \ell)\) for the union, and show the algebra proving \(\ell\) is exact. State why neither correction factor can overflow.</p></div>
+  <div class="hint">\(\ell_A\) was computed with the wrong shift. Multiply by what, to convert a sum of \(e^{x_i - m_A}\) into a sum of \(e^{x_i - m}\)?</div>
+  <div class="hint">\(e^{m_A - m} \cdot e^{x_i - m_A} = e^{x_i - m}\).</div>
+  <div class="answer"><p>\(m = \max(m_A, m_B)\); \(\ell = e^{m_A-m}\ell_A + e^{m_B-m}\ell_B\). Proof: \(e^{m_A-m}\ell_A = \sum_{i\in A} e^{m_A - m + x_i - m_A} = \sum_{i\in A} e^{x_i-m}\), same for \(B\); adding gives \(\sum_{i\in A\cup B} e^{x_i - m}\), the exact safe denominator of the union. Since \(m \ge m_A\) and \(m \ge m_B\), both exponents are \(\le 0\), so both factors lie in \((0, 1]\).</p></div>
+</div>
+
+<div class="quiz" data-concept="ch3.html#online-softmax" data-concept-label="§3.3 Online softmax">
+  <div class="q-text"><p>Prove by induction on the number of tiles that the running recurrence (starting from \(m^{(0)}=-\infty\), \(\ell^{(0)}=0\)) yields, after folding tiles \(1..t\), exactly \(m^{(t)} = \max_{i \le t\text{-th tile end}} x_i\) and \(\ell^{(t)} = \sum e^{x_i - m^{(t)}}\) over all scores seen so far.</p></div>
+  <div class="hint">The inductive step <em>is</em> the merge rule with \(A\) = "everything so far" and \(B\) = "the new tile". You proved that already.</div>
+  <div class="answer"><p>Base: an empty set has max \(-\infty\) and (vacuously) \(\ell=0\); the first fold gives \(m^{(1)} = \tilde m_1\) and \(\ell^{(1)} = e^{-\infty}\cdot 0 + e^{0}\tilde\ell_1 = \tilde\ell_1\). ✓ Step: assume \((m^{(t-1)}, \ell^{(t-1)})\) are the exact statistics of tiles \(1..t{-}1\); the update is precisely the merge of that set with tile \(t\), which §3.3's merge proof showed yields the exact statistics of the union. By induction the claim holds for all \(t\). After the last tile, \((m,\ell)\) equal the full row's safe-softmax statistics — no approximation at any point.</p></div>
+</div>
+
+<h2 id="accumulator">3.4 The attention accumulator: rescaling history</h2>
+<p>Attention doesn't want the softmax weights themselves; it wants the weighted sum of value vectors \(o = \sum_i p_i v_i\). Define the <strong>unnormalized accumulator</strong> over the scores seen so far, shifted by the current running max:</p>
+$$ o = \sum_{i \,\text{seen}} e^{x_i - m}\, v_i \;\in \mathbb{R}^{d}. $$
+<p>When a new tile arrives and the max rises from \(m\) to \(m^{\text{new}}\), every term of \(o\) carries the now-wrong shift — but they all share it, so <strong>one scalar multiply repairs the entire vector</strong>, exactly as it repaired \(\ell\):</p>
+<div class="box keypoint"><div class="box-title">Per-tile update (this is FlashAttention-2's inner loop)</div>
+<p>For each new tile with scores \(\{x_j\}\) and values \(\{v_j\}\):</p>
+$$ m^{\text{new}} = \max\!\big(m,\; \tilde m\big), \qquad \alpha = e^{m - m^{\text{new}}} $$
+$$ \ell \leftarrow \alpha\,\ell + \sum_{j} e^{x_j - m^{\text{new}}}, \qquad o \leftarrow \alpha\,o + \sum_j e^{x_j - m^{\text{new}}}\, v_j, \qquad m \leftarrow m^{\text{new}} $$
+<p>and after the <em>final</em> tile, normalize <strong>once</strong>:</p>
+$$ \text{output} = o / \ell. $$
+</div>
+<p>Correctness: at every moment, \(o = \sum_{\text{seen}} e^{x_i - m} v_i\) and \(\ell = \sum_{\text{seen}} e^{x_i - m}\) with the <em>same</em> \(m\), so at the end \(o/\ell = \sum_i \frac{e^{x_i - m}}{\sum_k e^{x_k-m}} v_i = \sum_i p_i v_i\) exactly.</p>
+
+<div class="box definition"><div class="box-title">FA-1 vs FA-2: when to divide</div>
+FlashAttention-1 kept the accumulator <em>normalized</em> at all times: after every tile it computed \(o \leftarrow \mathrm{diag}(\ell^{\text{new}})^{-1}(\ell\,\alpha\, o + \dots)\) — divisions and multiplications by \(\ell\) on a \(B_r \times d\) block, every iteration. FlashAttention-2 observed this is wasted <em>non-matmul</em> work (the expensive kind, §1.3): keep \(o\) unnormalized, divide by \(\ell\) once at the very end. Same math, measurably faster. When you read FA-2's paper, this is "reduce non-matmul FLOPs".
+</div>
+
+<div class="quiz" data-concept="ch3.html#accumulator" data-concept-label="§3.4 The accumulator update">
+  <div class="q-text"><p>From memory, write the complete per-tile update for the state \((m, \ell, o)\), including initialization and the final step, and prove the final output equals exact attention for the row. Then explain <em>why</em> a single scalar \(\alpha\) can fix the entire vector \(o\).</p></div>
+  <div class="hint">Three updates share the factor \(\alpha = e^{m - m^{\text{new}}}\). Initialization: statistics of the empty set, \(o = \mathbf{0}\).</div>
+  <div class="hint">Every term in \(o\) is \(e^{x_i - m}v_i\) — they all carry the same wrong shift \(m\).</div>
+  <div class="answer">
+    <p>Init \(m=-\infty\), \(\ell=0\), \(o=\mathbf 0\). Per tile: \(m^{\text{new}} = \max(m, \tilde m)\); \(\alpha = e^{m-m^{\text{new}}}\); \(\ell \leftarrow \alpha\ell + \sum_j e^{x_j - m^{\text{new}}}\); \(o \leftarrow \alpha o + \sum_j e^{x_j-m^{\text{new}}} v_j\); \(m \leftarrow m^{\text{new}}\). End: output \(= o/\ell\).</p>
+    <p>Invariant: \(o\) and \(\ell\) are always the exact shifted sums over seen scores with the shared current shift \(m\). Multiplying \(o\) by \(\alpha\) turns every term \(e^{x_i-m}v_i\) into \(e^{x_i-m^{\text{new}}}v_i\) simultaneously, because the shift error \(e^{m-m^{\text{new}}}\) is common to all terms — that's the linearity of the sum. At the end \(o/\ell = \big(\sum_i e^{x_i-m}v_i\big)/\big(\sum_i e^{x_i-m}\big) = \sum_i p_i v_i\): exact.</p>
+  </div>
+</div>
+
+<div class="quiz" data-concept="ch3.html#accumulator" data-concept-label="§3.4 (FA-1 vs FA-2 box)">
+  <div class="q-text"><p>FlashAttention-2 changed <em>when</em> the division by \(\ell\) happens, compared to FA-1. What is the change, why is it faster (name the hardware reason from §1.3), and why is it mathematically free?</p></div>
+  <div class="hint">Tensor cores vs. everything else.</div>
+  <div class="answer"><p>FA-1 renormalized the \(B_r\times d\) accumulator block on every inner-loop iteration; FA-2 keeps the accumulator unnormalized and divides by \(\ell\) exactly once after the last tile. Divisions/pointwise scaling are <em>non-matmul</em> FLOPs executed on regular ALUs, ~16× slower per FLOP than tensor-core matmul work, so doing them \(T_c\) times instead of once costs real time. It's free to defer because every intermediate \(o\) is just the final \(o\) scaled by constants that cancel in the single final division.</p></div>
+</div>
+
+<h2 id="lse">3.5 One number to remember it all: the log-sum-exp</h2>
+<p>After the last tile we hold \(m\) (final max) and \(\ell\) (final denominator). The backward pass (Chapter 6) will need to <em>reconstruct</em> attention weights. Store the single combined statistic per row:</p>
+$$ L = m + \log \ell = \log \sum_{j} e^{x_j} \quad\text{(the row's log-sum-exp)}, $$
+<p>because any weight can then be rebuilt from a raw score in one expression:</p>
+$$ p_j = \frac{e^{x_j - m}}{\ell} = e^{x_j - m - \log\ell} = e^{x_j - L}. $$
+<p>So Flash Attention's entire memory of an \(N\times N\) softmax is one float per row — \(N\) floats. Storing \(L\) rather than the pair \((m, \ell)\) halves that and saves a multiply in backward; it is also numerically safe, since \(\log \ell\) is well-conditioned (\(\ell \ge 1\)). This too is an FA-2 refinement over FA-1, which stored both \(m\) and \(\ell\).</p>
+
+<div class="quiz" data-concept="ch3.html#lse" data-concept-label="§3.5 Log-sum-exp">
+  <div class="q-text"><p>Define \(L\), show that \(p_j = e^{x_j - L}\), and explain what this buys the backward pass concretely (what is stored, what is recomputed, and the storage size per attention row).</p></div>
+  <div class="hint">Substitute \(\ell = e^{L - m}\) into \(e^{x_j-m}/\ell\).</div>
+  <div class="answer"><p>\(L = m + \log\ell = \log\sum_j e^{x_j}\). Then \(e^{x_j - m}/\ell = e^{x_j - m}e^{-\log \ell} = e^{x_j - m - \log\ell} = e^{x_j - L}\). Backward stores only \(L \in \mathbb{R}^N\) (one float per row, plus the saved \(Q,K,V,O\)); each tile of \(P\) is recomputed as \(\exp(S_{\text{tile}} - L)\) after re-doing the cheap \(QK^\top\) tile matmul — replacing \(O(N^2)\) stored activations with \(O(N)\).</p></div>
+</div>
+
+<h2 id="worked">3.6 Run it by hand (do not skip)</h2>
+<p>Watching the recurrence operate on real numbers is what makes it stick. Worked example, scores \(x = [1, 3, 2]\) processed as tile \([1,3]\) then tile \([2]\):</p>
+<div class="fig"><pre>
+Tile 1: x = [1, 3]          m̃ = 3,  ℓ̃ = e^(1-3) + e^(3-3) = 0.1353 + 1 = 1.1353
+  merge: m = max(-∞, 3) = 3
+         ℓ = e^(-∞-3)·0 + e^(3-3)·1.1353 = 1.1353
+
+Tile 2: x = [2]             m̃ = 2,  ℓ̃ = e^(2-2) = 1
+  merge: m_new = max(3, 2) = 3       (max did not change; α = e^(3-3) = 1)
+         ℓ = 1·1.1353 + e^(2-3)·1 = 1.1353 + 0.3679 = 1.5032
+
+Check against full softmax: Σe^xᵢ = e¹+e²+e³ = 30.193;  e^(-3)·30.193 = 1.5032 ✓
+softmax = [e^(1-3), e^(3-3), e^(2-3)]/1.5032 = [0.0900, 0.6652, 0.2447] ✓
+</pre><div class="caption">The denominator comes out exactly right even though tile 1 was processed under the "wrong" assumption that 3 was the global max (here it happened to be right; the exercise below makes it wrong).</div></div>
+
+<div class="quiz" data-concept="ch3.html#worked" data-concept-label="§3.6 Hand-run">
+  <div class="q-text"><p><strong>Pencil-and-paper exercise.</strong> Scores \(x = [2, 0, 4, 1]\) with scalar values \(v = [10, 20, 30, 40]\), processed in tiles \(\{2, 0\}\) then \(\{4, 1\}\) — note the max <em>rises</em> at tile 2, forcing a real rescale of both \(\ell\) and \(o\). Run the full \((m, \ell, o)\) recurrence (4 significant digits) and report the final output \(o/\ell\). Verify against direct softmax-weighted average.</p></div>
+  <div class="hint">Tile 1: \(m=2\), \(\ell = e^0 + e^{-2}\), \(o = 1\cdot 10 + e^{-2}\cdot 20\). Tile 2's local stats: \(\tilde m = 4\), \(\tilde \ell = 1 + e^{-3}\), \(\tilde o = 30 + e^{-3}\cdot 40\).</div>
+  <div class="hint">Merge with \(\alpha = e^{2-4} = 0.1353\): multiply <em>both</em> old \(\ell\) and old \(o\) by \(\alpha\), then add the new tile's contributions (already shifted by 4).</div>
+  <div class="answer">
+    <p>Tile 1: \(m{=}2\), \(\ell = 1 + 0.1353 = 1.1353\), \(o = 10 + 2.7067 = 12.707\).<br>
+    Tile 2: \(m^{\text{new}}{=}4\), \(\alpha = e^{-2} = 0.1353\); \(\ell = 0.1353\cdot1.1353 + (1 + e^{-3}) = 0.1537 + 1.0498 = 1.2034\); \(o = 0.1353\cdot12.707 + (30 + e^{-3}\cdot 40) = 1.7197 + 31.991 = 33.711\).<br>
+    Output \(= 33.711 / 1.2034 = \mathbf{28.01}\).</p>
+    <p>Check: weights \(\propto [e^{-2}, e^{-4}, 1, e^{-3}] = [0.1353, 0.0183, 1, 0.0498]\), sum 1.2034; weighted average \((1.353 + 0.366 + 30 + 1.991)/1.2034 = 33.711/1.2034 = 28.01\) ✓.</p>
+  </div>
+</div>
+
+<div class="quiz" data-concept="ch3.html#online-softmax" data-concept-label="§3.3–3.4 (edge cases)">
+  <div class="q-text"><p>Edge-case interrogation (these become real bugs in Chapter 5): (a) Why is \((m,\ell,o)=(-\infty, 0, \mathbf 0)\) the correct initialization, and what does \(\alpha\) evaluate to on the first real tile? (b) In a <em>masked</em> tile, banned positions get score \(-\infty\); what do they contribute to \(\ell\) and \(o\)? (c) What goes numerically wrong if an <em>entire</em> tile is masked and you compute \(\alpha = e^{m - m^{\text{new}}}\) while both are still \(-\infty\)?</p></div>
+  <div class="hint">(c) \(-\infty - (-\infty)\) is not \(0\) in IEEE arithmetic.</div>
+  <div class="answer"><p>(a) They are the statistics of "no scores seen": max of empty set is \(-\infty\), sums are 0. On the first tile \(\alpha = e^{-\infty - \tilde m} = 0\), which cleanly annihilates the (empty) history. (b) \(e^{-\infty - m^{\text{new}}} = 0\): masked entries add exactly nothing to \(\ell\) or \(o\) — masking integrates seamlessly. (c) \(m - m^{\text{new}} = -\infty - (-\infty) = \mathrm{nan}\), so \(\alpha = e^{\mathrm{nan}} = \mathrm{nan}\) and the state is poisoned. Kernels must either skip fully-masked tiles (the causal-attention block-skipping of §4.6 does this for free) or guard the case explicitly.</p></div>
+</div>
+
+<div class="box recall-pause"><div class="box-title">Before moving on — closed-book check</div>
+You should now be able to write, on a blank page, the five-line per-tile update of \((m, \ell, o)\) with initialization and final division, prove its exactness in two sentences (shared shift + linearity), and define \(L\). Chapter 4 is this recurrence dressed in matrix notation; Chapter 5 is this recurrence dressed in CUDA. If it isn't automatic yet, redo §3.6 with your own numbers.
+</div>
+
+</main>
+</body>
+</html>

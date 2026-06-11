@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 4 · The FlashAttention-2 Algorithm</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 4</span> · The FlashAttention-2 Algorithm</h1>
+<p class="subtitle">Chapter 3's recurrence, promoted from one row to a tile of rows, wrapped in the tiled-matmul structure of Chapter 2, and assigned to the GPU's grid. After this chapter you can write the full algorithm from memory — which is the prerequisite for coding it.</p>
+
+<h2 id="tiling">4.1 Tiling the attention computation</h2>
+<p>Cut the \(N\) query rows into \(T_r = \lceil N/B_r \rceil\) blocks \(Q_1,\dots,Q_{T_r}\) (each \(B_r \times d\)) and the keys/values into \(T_c = \lceil N/B_c\rceil\) blocks \(K_j, V_j\) (each \(B_c \times d\)). Conceptually, the \(N\times N\) score matrix becomes a \(T_r \times T_c\) grid of tiles \(S^{(i,j)} = Q_i K_j^\top \cdot \tau\) (we write \(\tau = 1/\sqrt d\)), each of size \(B_r\times B_c\) — <strong>computed on-chip, used, and discarded; never written to HBM</strong>.</p>
+<div class="fig"><pre>
+                K₁ᵀ  K₂ᵀ  K₃ᵀ  K₄ᵀ          one moment in time, worker i=2:
+              ┌────┬────┬────┬────┐
+          Q₁  │    │    │    │    │          SRAM holds:   Q₂        (Br × d)
+              ├────┼────┼────┼────┤                        K₃, V₃    (Bc × d each)
+          Q₂  │ ✓  │ ✓  │ ██ │    │  ← inner loop j →      S²'³      (Br × Bc)
+              ├────┼────┼────┼────┤          registers:    O₂ acc    (Br × d)
+          Q₃  │    │    │    │    │                        m, ℓ      (Br each)
+              ├────┼────┼────┼────┤
+          Q₄  │    │    │    │    │          HBM sees: Q read once, K/V streamed,
+              └────┴────┴────┴────┘          O and L written once. S: never.
+</pre><div class="caption">Each query block \(Q_i\) is one independent worker (one thread block). It sweeps across its row of score tiles, folding each into the running \((m, \ell, O_i)\) state from §3.4.</div></div>
+<p>What must fit in fast memory simultaneously: \(Q_i\) (\(B_r d\)), \(K_j\) and \(V_j\) (\(2 B_c d\)), the current tile \(S^{(i,j)}\) (\(B_r B_c\)), plus the accumulator and statistics (\(B_r d + 2B_r\), typically in registers). That inequality, \(\;B_r d + 2B_c d + B_r B_c + B_r d + 2B_r \;\lesssim\; M\), is what picks the block sizes: with \(M \approx\) 100–200 KB and \(d = 64\)–128, real FA-2 uses \(B_r \in \{64, 128\}\), \(B_c \in \{32, 64, 128\}\).</p>
+
+<div class="quiz" data-concept="ch4.html#tiling" data-concept-label="§4.1 Tiling">
+  <div class="q-text"><p>From memory: list every array that must be resident in SRAM/registers while worker \(i\) processes tile \(j\), with its shape, and write the constraint that determines the block sizes. Why does larger \(B_r\) reduce HBM traffic (one sentence, anticipating §4.3)?</p></div>
+  <div class="hint">Five things: the query block, two KV blocks, the score tile, the accumulator + its two statistic vectors.</div>
+  <div class="answer"><p>\(Q_i\;(B_r\times d)\), \(K_j\;(B_c\times d)\), \(V_j\;(B_c\times d)\), \(S^{(i,j)}\;(B_r\times B_c)\), \(O_i\) accumulator \((B_r\times d)\) plus \(m,\ell\;(B_r)\). Constraint: \(2B_rd + 2B_cd + B_rB_c + 2B_r \lesssim M\) (elements). Larger \(B_r\) means fewer query blocks, and since <em>each</em> query block streams all of \(K,V\), K/V traffic scales as \(1/B_r\).</p></div>
+</div>
+
+<h2 id="fa2-forward">4.2 The FlashAttention-2 forward pass</h2>
+<p>Here is the complete forward algorithm. Lines 6–10 are exactly §3.4's update, with vectors \(m, \ell \in \mathbb{R}^{B_r}\) holding per-row statistics for the whole tile of rows at once (\(\mathrm{diag}(\alpha)\,O_i\) just means "scale row \(r\) of \(O_i\) by \(\alpha_r\)").</p>
+<div class="box keypoint"><div class="box-title">Algorithm: FA-2 forward, worker for query block \(i\) (runs as one thread block)</div>
+<pre style="background:transparent;color:inherit;padding:0.2rem 0 0">
+ 1:  load Q_i (Br×d) from HBM into SRAM
+ 2:  O_i ← 0 (Br×d);   ℓ ← 0 (Br);   m ← −∞ (Br)        ── in registers
+ 3:  for j = 1 … T_c:
+ 4:      load K_j, V_j (Bc×d) from HBM into SRAM
+ 5:      S = τ · Q_i K_jᵀ                  (Br×Bc)        ── matmul #1
+ 6:      m_new = max(m, rowmax(S))         (Br)
+ 7:      P̃ = exp(S − m_new)               (Br×Bc, row-broadcast)
+ 8:      α = exp(m − m_new)                (Br)
+ 9:      ℓ = α ⊙ ℓ + rowsum(P̃)
+10:      O_i = diag(α) · O_i + P̃ V_j                     ── matmul #2
+11:      m = m_new
+12:  O_i ← diag(ℓ)⁻¹ · O_i                ── normalize ONCE
+13:  write O_i to HBM;   write L_i = m + log ℓ (Br) to HBM
+</pre>
+</div>
+<p>Notice what touches HBM: line 1 (once), line 4 (the stream), line 13 (once). Lines 5–11 — all the \(O(N^2)\) work — happen entirely on-chip. Also notice there are exactly two matmuls per iteration (lines 5 and 10); everything else is the "non-matmul" work FA-2 strives to minimize.</p>
+
+<div class="quiz" data-concept="ch4.html#fa2-forward" data-concept-label="§4.2 The forward algorithm">
+  <div class="q-text"><p>Fill in the blanks from memory. Worker \(i\) has state \((m, \ell, O_i)\) and just computed \(S = \tau Q_iK_j^\top\):</p>
+<pre><code>m_new = ______________________
+P̃     = ______________________
+α     = ______________________
+ℓ     = ______________________
+O_i   = ______________________</code></pre>
+<p>…and what are the two post-loop lines?</p></div>
+  <div class="hint">All exponentials are shifted by \(m_{\text{new}}\); the history is repaired by \(\alpha\).</div>
+  <div class="answer"><p>\(m_{\text{new}} = \max(m, \mathrm{rowmax}(S))\); \(\tilde P = \exp(S - m_{\text{new}})\); \(\alpha = \exp(m - m_{\text{new}})\); \(\ell = \alpha\odot\ell + \mathrm{rowsum}(\tilde P)\); \(O_i = \mathrm{diag}(\alpha)O_i + \tilde P V_j\); then \(m = m_{\text{new}}\). After the loop: \(O_i \leftarrow \mathrm{diag}(\ell)^{-1} O_i\) (write it), and write \(L_i = m + \log \ell\).</p></div>
+</div>
+
+<div class="quiz" data-concept="ch4.html#fa2-forward" data-concept-label="§4.2 The forward algorithm">
+  <div class="q-text"><p><strong>The big one.</strong> On paper, write the entire FA-2 forward algorithm from memory — all 13 lines, with shapes, including what is loaded when and what is written when. Check yourself against §4.2 and repeat tomorrow. (This exact pseudocode is what you'll translate to CUDA in Chapter 5 and to JAX in Chapter 7.)</p></div>
+  <div class="hint">Skeleton: load Q block → init state → loop over KV blocks {load, score, four-line online update} → normalize once → write O and L.</div>
+  <div class="answer"><p>See the boxed algorithm above. Full credit requires: \(\tau\) applied to \(S\); statistics per <em>row</em> (vectors of length \(B_r\)); the single deferred normalization; and writing \(L = m + \log\ell\), not \(m\) and \(\ell\) separately.</p></div>
+</div>
+
+<h2 id="io-complexity">4.3 What did we win? IO analysis</h2>
+<p>Count HBM traffic per (batch, head), in elements:</p>
+<ul>
+  <li>Each worker reads its \(Q_i\) once: total \(Nd\) across workers.</li>
+  <li>Each of the \(T_r\) workers streams <em>all</em> of \(K\) and \(V\): total \(T_r \cdot 2Nd = 2N^2d/B_r\).</li>
+  <li>\(O\) and \(L\) written once: \(Nd + N\).</li>
+</ul>
+$$ \text{Traffic}_{\text{FA}} \;=\; 2Nd + N + \frac{2N^2 d}{B_r} \;=\; \Theta\!\left(\frac{N^2 d}{B_r}\right) \;\overset{B_r = \Theta(M/d)}{=}\; \Theta\!\left(\frac{N^2 d^2}{M}\right), $$
+<p>versus \(\Theta(N^2)\) (about \(4N^2 + 4Nd\)) for the naive pipeline — an improvement factor of \(\Theta(M/d^2)\). Concretely, \(N{=}4096\), \(d{=}64\), \(B_r{=}128\): naive ≈ 68M elements; FA ≈ \(2N^2d/B_r = N^2\) ≈ 17M elements — <strong>4× less traffic</strong>, plus three structural wins the formula doesn't capture: no \(O(N^2)\) memory allocation at all (capacity!), no kernel-launch round trips, and the softmax work now rides along at matmul speed instead of being its own memory-bound kernel. The FA-1 paper also proves a matching lower bound: no exact attention algorithm can beat \(\Theta(N^2d^2/M)\) HBM accesses over all \(M\), so this is not just <em>an</em> optimization, it is <em>the</em> optimal traffic class.</p>
+
+<div class="quiz" data-concept="ch4.html#io-complexity" data-concept-label="§4.3 IO analysis">
+  <div class="q-text"><p>Derive \(\text{Traffic}_{\text{FA}}\) from memory: which tensor dominates, why does it carry a factor \(T_r\), and how does the bound \(\Theta(N^2d^2/M)\) follow? Then compute the traffic for \(N=8192\), \(d=128\), \(B_r=64\) and compare to naive \(4N^2\). What does the comparison tell you about large head dimensions?</p></div>
+  <div class="hint">K and V are re-read by every query-block worker; nothing else is re-read at all.</div>
+  <div class="hint">\(B_r\) is capped by SRAM: all the §4.1 arrays scale with \(B_r d\) or \(B_c d\), so \(B_r = \Theta(M/d)\).</div>
+  <div class="answer"><p>\(K, V\) dominate: each of \(T_r = N/B_r\) workers reads all \(2Nd\) elements → \(2N^2d/B_r\). Substituting \(B_r = \Theta(M/d)\) gives \(\Theta(N^2d^2/M)\). For \(N{=}8192, d{=}128, B_r{=}64\): \(2N^2d/B_r = 2 \cdot 8192^2 \cdot 2 = 4N^2\) — <em>no better than naive in raw bytes!</em> Lesson: the win scales as \(M/d^2\), so big head dims need big \(B_r\), which needs lots of SRAM — exactly why FA-2 works hard to support \(B_r{=}128\) and why head dim 256 is hard. (The capacity and fusion wins survive regardless.)</p></div>
+</div>
+
+<h2 id="fa1-vs-fa2">4.4 What FlashAttention-2 changed (and why)</h2>
+<p>FA-2 computes the same function as FA-1 with the same tiling idea, but ~2× faster, via three changes. <strong>Memorize all three; "what did FA-2 change?" is the canonical interview question on this topic.</strong></p>
+<table>
+<tr><th>#</th><th>Change</th><th>FA-1</th><th>FA-2</th><th>Why it's faster</th></tr>
+<tr><td>1</td><td><strong>Fewer non-matmul FLOPs</strong></td><td>Rescales <em>and renormalizes</em> \(O_i\) by \(\mathrm{diag}(\ell)^{-1}\) every inner iteration; stores both \(m\) and \(\ell\)</td><td>Keeps \(O_i\) unnormalized, divides once at the end; stores only \(L = m + \log\ell\)</td><td>Non-matmul FLOPs run ~16× slower than tensor-core FLOPs (§1.3)</td></tr>
+<tr><td>2</td><td><strong>Parallelize over sequence length</strong></td><td>One thread block per (batch, head); <em>outer</em> loop over K/V blocks, inner over Q blocks — so the running \(O, m, \ell\) must round-trip through HBM between outer iterations</td><td>Loops swapped: each query block is an independent thread block; grid \(= (T_r, h, B)\); accumulator never leaves chip</td><td>Long-sequence training uses small \(B\cdot h\) — FA-1's grid couldn't fill the SMs (§2.7); FA-2 multiplies available parallelism by \(T_r\) <em>and</em> kills the accumulator traffic</td></tr>
+<tr><td>3</td><td><strong>Split-Q warp partitioning</strong></td><td>"Split-K": each warp takes a slice of \(K_j\) → every warp computes a partial result for <em>all</em> rows → row maxes, row sums, and \(\tilde PV_j\) partials must be combined <em>across warps</em> through shared memory + barriers</td><td>"Split-Q": each warp takes a slice of \(Q_i\)'s rows; all warps read the shared \(K_j, V_j\) tiles → each warp owns its rows' statistics and accumulator outright</td><td>Eliminates inter-warp reduction, its shared-memory traffic, and its barriers from the inner loop</td></tr>
+</table>
+<div class="fig"><pre>
+   FA-1 inner loop: split-K                FA-2 inner loop: split-Q
+        K_j slice per warp                      all of K_j shared
+      w0   w1   w2   w3                      ┌───────────────┐
+     ┌────┬────┬────┬────┐              w0 → │ rows  0..15   │  own m,ℓ,O rows
+ Q_i │ S₀ │ S₁ │ S₂ │ S₃ │  all rows    w1 → │ rows 16..31   │  own m,ℓ,O rows
+     │    │    │    │    │  partial!    w2 → │ rows 32..47   │  own m,ℓ,O rows
+     └────┴────┴────┴────┘              w3 → │ rows 48..63   │  own m,ℓ,O rows
+   rowmax/rowsum/PV need                     └───────────────┘
+   cross-warp smem reduction + syncs    no cross-warp communication at all
+</pre><div class="caption">Same total arithmetic; radically different synchronization cost. "Each row's softmax is independent" (§1.1) is finally cashed in at warp granularity.</div></div>
+
+<div class="quiz" data-concept="ch4.html#fa1-vs-fa2" data-concept-label="§4.4 FA-1 → FA-2 changes">
+  <div class="q-text"><p>From memory, state FlashAttention-2's three improvements over FA-1. For each: what was FA-1 doing, what does FA-2 do instead, and what hardware fact makes it matter?</p></div>
+  <div class="hint">One is about arithmetic <em>type</em>, one about <em>grid-level</em> parallelism + loop order, one about <em>warp-level</em> work division.</div>
+  <div class="hint">For #2, remember what FA-1's loop order forced the accumulator to do between outer iterations.</div>
+  <div class="answer"><p>(1) Defer normalization to a single final division and store only \(L\) — because non-matmul FLOPs are ~16× slower than tensor-core FLOPs. (2) Swap loop order and parallelize over sequence length: thread-block grid \((T_r, h, B)\) instead of \((h, B)\), keeping \((m,\ell,O_i)\) on-chip instead of round-tripping HBM — because long-context batches are small and FA-1 couldn't fill the SMs. (3) Partition warps over Q rows (split-Q) instead of over K columns (split-K) — each warp owns complete rows, eliminating inter-warp shared-memory reductions and barriers in the inner loop.</p></div>
+</div>
+
+<h2 id="partitioning">4.5 The full work-partitioning picture</h2>
+<p>Three nested levels, top to bottom — keep this hierarchy in your head while coding Chapter 5:</p>
+<ol>
+  <li><strong>Grid:</strong> thread block \((i, h, b)\) ← query block \(i\) of head \(h\) of batch \(b\). Total \(T_r \cdot h \cdot B\) independent blocks. (Order matters slightly in practice; sequence index first.)</li>
+  <li><strong>Block → warps:</strong> the \(B_r\) rows are divided among 4–8 warps (split-Q). \(K_j, V_j\) live in shared memory, read by all warps.</li>
+  <li><strong>Warp → lanes:</strong> the 32 lanes cooperate on the warp's rows via tensor-core fragments (real FA-2) or per-lane rows + shuffles (simpler kernels). Row statistics stay within the warp.</li>
+</ol>
+
+<div class="quiz" data-concept="ch4.html#partitioning" data-concept-label="§4.5 Work partitioning">
+  <div class="q-text"><p>Training run: \(B=2\), \(h=16\), \(N = 16384\), \(B_r = 128\), on an A100 with 108 SMs. How many thread blocks does FA-1's grid have, how many does FA-2's have, and what fraction of the GPU does each occupy (assume ≥2 blocks per SM is ideal)?</p></div>
+  <div class="hint">FA-1: \(B \cdot h\). FA-2: \(T_r \cdot B \cdot h\) with \(T_r = N/B_r\).</div>
+  <div class="answer"><p>FA-1: \(2 \times 16 = 32\) blocks → at most 32 of 108 SMs active: ≤30% of the chip, before even considering 2-blocks-per-SM. FA-2: \(T_r = 128\), so \(128\times32 = 4096\) blocks → every SM saturated with ~19 waves of work. This single change is most of FA-2's speedup at long sequence lengths.</p></div>
+</div>
+
+<h2 id="causal">4.6 Causal masking: skip, compute, or mask</h2>
+<p>Decoder attention forbids attending to the future: \(S_{xy} = -\infty\) whenever key index \(y \gt\) query index \(x\) (then \(e^{-\infty} = 0\) flows harmlessly through the online update, §3 recall 8). Tiling makes this <em>cheaper</em> than it sounds, because each tile falls into one of three classes:</p>
+<div class="fig"><pre>
+            j=1   j=2   j=3   j=4            query block i=3 (rows 256..383, Br=128)
+          ┌─────┬─────┬─────┬─────┐          key block j  (cols, Bc=128)
+      i=1 │  D  │ skip│ skip│ skip│
+          ├─────┼─────┼─────┼─────┤   FULL : all keys ≤ all queries → no mask needed
+      i=2 │ FULL│  D  │ skip│ skip│   D    : tile straddles the diagonal → per-element mask
+          ├─────┼─────┼─────┼─────┤   skip : all keys &gt; all queries → don't load, don't compute
+      i=3 │ FULL│ FULL│  D  │ skip│
+          ├─────┼─────┼─────┼─────┤   inner loop bound: j ≤ ⌈(i·Br)/Bc⌉
+      i=4 │ FULL│ FULL│ FULL│  D  │
+          └─────┴─────┴─────┴─────┘
+</pre><div class="caption">Roughly half the tiles are skipped outright (≈2× faster than non-causal), almost all the rest need no masking instructions at all, and only the ~\(T_r\) diagonal tiles pay for per-element comparisons.</div></div>
+<p>Note the free bonus: by terminating the loop at the diagonal block, no worker ever processes a fully-masked tile, so the \(\alpha = e^{-\infty-(-\infty)} = \mathrm{nan}\) edge case from Chapter 3 never arises.</p>
+
+<div class="quiz" data-concept="ch4.html#causal" data-concept-label="§4.6 Causal masking">
+  <div class="q-text"><p>For query block \(i\) (0-indexed: global rows \([iB_r, (i{+}1)B_r)\)) and key block \(j\) (cols \([jB_c, (j{+}1)B_c)\)): state the exact conditions for "skip", "full", and "diagonal" tiles, the per-element mask predicate used in diagonal tiles, and the resulting inner-loop upper bound. Why is the speedup factor ≈2 and not exactly 2?</p></div>
+  <div class="hint">Compare the smallest key index of the tile with the largest query index, and vice versa.</div>
+  <div class="answer"><p>Skip: \(jB_c \gt (i{+}1)B_r - 1\) (smallest key exceeds largest query → fully masked). Full: \((j{+}1)B_c - 1 \le iB_r\) (largest key ≤ smallest query → nothing masked). Otherwise diagonal: mask elements where (global) \(y > x\), i.e. <code>if (j*Bc + c &gt; i*Br + r) s = -INF</code>. Loop bound: \(j \le \lfloor((i{+}1)B_r - 1)/B_c\rfloor\). The saving is slightly under half because the diagonal tiles are still computed (and pay masking overhead), so speedup ≈ but ≠ 2×; it approaches 2× as \(T_r\) grows.</p></div>
+</div>
+
+<div class="box recall-pause"><div class="box-title">Gate to Chapter 5</div>
+Do not start the CUDA chapter until you can do these closed-book: (1) write the 13-line forward algorithm; (2) recite the three FA-1→FA-2 changes with reasons; (3) state the grid mapping \((i, h, b)\) and the split-Q idea; (4) derive \(2N^2d/B_r\) and explain the \(\Theta(M/d^2)\) win; (5) classify causal tiles into skip/full/diagonal with the loop bound. Chapter 5 assumes all five are instant.
+</div>
+
+</main>
+</body>
+</html>

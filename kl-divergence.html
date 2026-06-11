@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Forward vs. Reverse KL — an active-recall course</title>
+<style>
+  :root {
+    --bg: #faf9f7;
+    --card: #ffffff;
+    --ink: #2b2b33;
+    --muted: #6e6e7a;
+    --accent: #5b4fd4;
+    --accent-soft: #edebfb;
+    --good: #2e9e5b;
+    --good-soft: #e7f6ed;
+    --bad: #c94f4f;
+    --bad-soft: #fbeaea;
+    --border: #e3e1dc;
+    --code: #f0eee9;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    line-height: 1.6;
+    font-size: 17px;
+  }
+  main { max-width: 780px; margin: 0 auto; padding: 2rem 1.2rem 6rem; }
+  h1 { font-size: 2rem; line-height: 1.2; margin-bottom: 0.3rem; }
+  h2 { font-size: 1.4rem; margin-top: 0; }
+  .subtitle { color: var(--muted); margin-top: 0; }
+  .formula {
+    font-family: "Georgia", serif;
+    font-size: 1.15em;
+    background: var(--code);
+    padding: 0.6rem 1rem;
+    border-radius: 8px;
+    display: inline-block;
+    margin: 0.4rem 0;
+  }
+  code { background: var(--code); padding: 0.1em 0.35em; border-radius: 4px; font-size: 0.92em; }
+  section.lesson {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 1.6rem 1.8rem;
+    margin: 1.6rem 0;
+  }
+  .section-head { display: flex; align-items: baseline; gap: 0.7rem; }
+  .section-num {
+    font-size: 0.8rem; font-weight: 700; letter-spacing: 0.08em;
+    color: var(--accent); text-transform: uppercase;
+  }
+  .lock-note {
+    display: none;
+    color: var(--muted);
+    font-size: 0.95rem;
+    font-style: italic;
+    margin: 0.5rem 0 0;
+  }
+  section.locked .lock-note { display: block; }
+  section.locked .section-body {
+    filter: blur(6px);
+    pointer-events: none;
+    user-select: none;
+    max-height: 220px;
+    overflow: hidden;
+    opacity: 0.55;
+  }
+  /* ---------- recall blocks ---------- */
+  .recall, .numcheck, .mcq {
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--accent);
+    border-radius: 10px;
+    padding: 1rem 1.2rem;
+    margin: 1.2rem 0;
+    background: #fdfdfc;
+  }
+  .prompt { font-weight: 600; margin-top: 0; }
+  .prompt .tag {
+    font-size: 0.7rem; font-weight: 700; letter-spacing: 0.07em;
+    color: var(--accent); background: var(--accent-soft);
+    padding: 0.15em 0.6em; border-radius: 99px;
+    vertical-align: middle; margin-right: 0.5em; text-transform: uppercase;
+  }
+  textarea {
+    width: 100%; min-height: 84px; resize: vertical;
+    font: inherit; font-size: 0.95rem;
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 0.6rem 0.8rem; background: #fff;
+  }
+  textarea:focus, input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+  button {
+    font: inherit; font-size: 0.92rem; font-weight: 600;
+    border: none; border-radius: 8px;
+    padding: 0.5rem 1.1rem; cursor: pointer;
+    background: var(--accent); color: #fff;
+    margin-top: 0.6rem;
+  }
+  button:disabled { background: #c9c7d8; cursor: not-allowed; }
+  button.secondary { background: #fff; color: var(--accent); border: 1px solid var(--accent); }
+  button.ghost { background: transparent; color: var(--muted); border: 1px dashed var(--border); }
+  .gate-hint { font-size: 0.82rem; color: var(--muted); margin: 0.3rem 0 0; }
+  .answer {
+    display: none;
+    margin-top: 1rem; padding: 0.9rem 1.1rem;
+    background: var(--good-soft);
+    border-radius: 8px;
+    border-left: 4px solid var(--good);
+    font-size: 0.97rem;
+  }
+  .answer.shown { display: block; }
+  .answer .label { font-weight: 700; color: var(--good); font-size: 0.8rem; letter-spacing: 0.06em; text-transform: uppercase; }
+  /* ---------- numeric ---------- */
+  .numcheck input[type=text] {
+    font: inherit; width: 130px;
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 0.45rem 0.7rem;
+  }
+  .feedback { margin-top: 0.6rem; font-size: 0.95rem; font-weight: 600; }
+  .feedback.ok { color: var(--good); }
+  .feedback.no { color: var(--bad); }
+  .hintbox {
+    display: none; margin-top: 0.7rem; padding: 0.7rem 1rem;
+    background: var(--accent-soft); border-radius: 8px; font-size: 0.93rem;
+  }
+  .hintbox.shown { display: block; }
+  /* ---------- mcq ---------- */
+  .mcq .opt {
+    display: block; width: 100%; text-align: left;
+    background: #fff; color: var(--ink);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 0.6rem 0.9rem; margin-top: 0.55rem; font-weight: 500;
+  }
+  .mcq .opt:hover:not(:disabled) { border-color: var(--accent); }
+  .mcq .opt.right { background: var(--good-soft); border-color: var(--good); }
+  .mcq .opt.wrong { background: var(--bad-soft); border-color: var(--bad); }
+  .nudge {
+    display: none; margin-top: 0.7rem; padding: 0.7rem 1rem;
+    background: var(--bad-soft); border-left: 4px solid var(--bad);
+    border-radius: 8px; font-size: 0.93rem;
+  }
+  .nudge.shown { display: block; }
+  /* ---------- lab ---------- */
+  #lab-canvas { width: 100%; border: 1px solid var(--border); border-radius: 10px; background: #fff; }
+  .sliders { display: flex; gap: 2rem; flex-wrap: wrap; margin-top: 0.8rem; }
+  .sliders label { font-size: 0.9rem; font-weight: 600; }
+  .sliders input[type=range] { width: 220px; accent-color: var(--accent); display: block; }
+  .kl-readout {
+    font-family: Georgia, serif; font-size: 1.25rem; margin-top: 0.8rem;
+    padding: 0.6rem 1rem; background: var(--code); border-radius: 8px;
+    display: inline-block;
+  }
+  .kl-readout .val { font-weight: 700; color: var(--accent); }
+  .success-banner {
+    display: none; margin-top: 0.8rem; padding: 0.8rem 1.1rem;
+    background: var(--good-soft); border-radius: 8px;
+    border-left: 4px solid var(--good); font-weight: 600;
+  }
+  .success-banner.shown { display: block; }
+  .muted { color: var(--muted); font-size: 0.93rem; }
+  /* ---------- progress nav ---------- */
+  #progress {
+    position: sticky; top: 0; z-index: 5;
+    background: var(--bg);
+    padding: 0.6rem 0; margin-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border);
+    display: flex; gap: 0.4rem; flex-wrap: wrap;
+    font-size: 0.78rem; font-weight: 600;
+  }
+  #progress span {
+    padding: 0.2em 0.7em; border-radius: 99px;
+    background: #eceae5; color: var(--muted);
+  }
+  #progress span.open { background: var(--accent-soft); color: var(--accent); }
+  table.lntable { border-collapse: collapse; font-size: 0.92rem; margin-top: 0.4rem; }
+  table.lntable td { border: 1px solid var(--border); padding: 0.25rem 0.7rem; font-family: Georgia, serif; }
+</style>
+</head>
+<body>
+<main>
+
+<div id="progress">
+  <span id="pn-s0" class="open">0 Warm-up</span>
+  <span id="pn-s1">1 Definition</span>
+  <span id="pn-s2">2 Asymmetry</span>
+  <span id="pn-s3">3 Lab</span>
+  <span id="pn-s4">4 Mechanics</span>
+  <span id="pn-s5">5 In the wild</span>
+  <span id="pn-s6">6 Synthesis</span>
+</div>
+
+<h1>Forward vs. Reverse KL</h1>
+<p class="subtitle">A guided, no-free-answers course. Every answer is locked behind your own attempt — that's the point. Expect ~45–60 minutes. Work in order; sections unlock as you earn them.</p>
+
+<!-- ============================ SECTION 0 ============================ -->
+<section class="lesson" id="s0">
+  <div class="section-head"><span class="section-num">Part 0</span><h2>Warm-up: dump your brain</h2></div>
+  <div class="section-body">
+    <p>Before learning anything, write down everything you currently know <em>or guess</em> about KL divergence. Wrong guesses are valuable — they're the hooks the correct ideas will attach to. If you know nothing, guess from the words: "divergence", "forward", "reverse".</p>
+    <div class="recall">
+      <p class="prompt"><span class="tag">Free recall</span>What is KL divergence? What might "forward" vs. "reverse" mean? Where have you seen it used?</p>
+      <textarea id="warmup-ta" placeholder="No one is grading this. Write at least a few sentences — section 1 unlocks when you do."></textarea>
+      <p class="gate-hint" id="warmup-gate">Keep writing… (section 1 unlocks at 60 characters)</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ SECTION 1 ============================ -->
+<section class="lesson locked" id="s1">
+  <div class="section-head"><span class="section-num">Part 1</span><h2>Build the definition yourself</h2></div>
+  <p class="lock-note">🔒 Locked — finish the warm-up above first.</p>
+  <div class="section-body">
+    <p>Setup: data really comes from a distribution <strong>P</strong> (the truth), but you only have a model <strong>Q</strong>. We'll derive KL from the idea of <em>surprise</em>.</p>
+    <p>Surprise of an outcome <em>x</em> under a distribution is "how unlikely did I think this was": rare events are very surprising, certain events not at all, and surprise of two independent events should add. The function with these properties is the negative log of the probability.</p>
+
+    <div class="recall" data-milestone="">
+      <p class="prompt"><span class="tag">Recall 1.1</span>You believe Q, and outcome <em>x</em> occurs. Write the formula for your surprise. Then: an all-knowing observer who believes the true P sees the same <em>x</em>. Write <em>their</em> surprise. Finally write your <strong>excess</strong> surprise (yours minus theirs) — simplify it into a single log.</p>
+      <textarea placeholder="Attempt it on paper or here. The reveal stays locked until you've written something substantial."></textarea>
+      <button disabled data-reveal>Reveal</button>
+      <p class="gate-hint">Reveal unlocks after a genuine attempt (40+ characters).</p>
+      <div class="answer">
+        <span class="label">Answer</span>
+        <p>Your surprise: <span class="formula">−log Q(x)</span> &nbsp; Their surprise: <span class="formula">−log P(x)</span></p>
+        <p>Excess surprise: −log Q(x) − (−log P(x)) = <span class="formula">log [ P(x) / Q(x) ]</span></p>
+        <p>This single quantity — the log-ratio — is the atom of KL divergence. It's positive when the truth assigned more probability than your model did (you were <em>too</em> surprised), negative when your model over-predicted x.</p>
+      </div>
+    </div>
+
+    <div class="recall">
+      <p class="prompt"><span class="tag">Recall 1.2</span>KL divergence is the <em>average</em> excess surprise. But averaged over what — outcomes drawn from P, or outcomes drawn from Q? Pick one and justify it before revealing. (Hint: who generates the actual data in this story?)</p>
+      <textarea placeholder="Commit to an answer and a reason…"></textarea>
+      <button disabled data-reveal>Reveal</button>
+      <p class="gate-hint">Reveal unlocks after a genuine attempt (40+ characters).</p>
+      <div class="answer">
+        <span class="label">Answer</span>
+        <p>In this story, reality (P) generates the data, so we average over x ~ P:</p>
+        <p><span class="formula">KL(P ∥ Q) = E<sub>x~P</sub> [ log P(x)/Q(x) ] = Σ<sub>x</sub> P(x) log [P(x)/Q(x)]</span></p>
+        <p>This is the <strong>forward KL</strong>. But notice: nothing stops you from averaging the <em>other</em> log-ratio under Q instead:</p>
+        <p><span class="formula">KL(Q ∥ P) = E<sub>x~Q</sub> [ log Q(x)/P(x) ]</span></p>
+        <p>That's the <strong>reverse KL</strong>. Two changes happen at once when you flip: <em>which distribution you sample from</em> and <em>which is on top of the ratio</em>. Memorize the pattern: <strong>the first argument is both the sampler and the numerator.</strong></p>
+        <p class="muted">(Units: log base e → "nats"; log base 2 → "bits". We'll use nats.)</p>
+      </div>
+    </div>
+
+    <div class="mcq" data-milestone="mcq-props">
+      <p class="prompt"><span class="tag">Check 1.3</span>One of these properties does <strong>not</strong> hold for KL divergence. Which?</p>
+      <button class="opt" data-nudge="It does hold — by Jensen's inequality (Gibbs' inequality), KL is never negative. Think about which property a true 'distance' would need that an expectation of an asymmetric ratio can't deliver.">KL(P ∥ Q) ≥ 0 always</button>
+      <button class="opt" data-nudge="This one holds: KL is zero exactly when P = Q (almost everywhere). Look again at the structure of the formula — is it the same if you swap P and Q?">KL(P ∥ Q) = 0 exactly when P = Q</button>
+      <button class="opt" data-correct="1">KL(P ∥ Q) = KL(Q ∥ P)</button>
+      <button class="opt" data-nudge="It genuinely can be infinite (you'll compute such a case in Part 2). The property that fails is more fundamental to this whole course.">KL can be infinite</button>
+      <div class="nudge"></div>
+      <div class="answer">
+        <span class="label">Correct</span>
+        <p>KL is <strong>not symmetric</strong> — and that asymmetry is not a technical nuisance, it's the entire subject of this course. KL(P ∥ Q) and KL(Q ∥ P) measure genuinely different things and produce dramatically different behavior when minimized. You're about to feel that with your own hands.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ SECTION 2 ============================ -->
+<section class="lesson locked" id="s2">
+  <div class="section-head"><span class="section-num">Part 2</span><h2>Feel the asymmetry: compute it by hand</h2></div>
+  <p class="lock-note">🔒 Locked — answer Check 1.3 correctly first.</p>
+  <div class="section-body">
+    <p>A coin truly lands heads/tails with <strong>P = (0.5, 0.5)</strong>. Your model says <strong>Q = (0.9, 0.1)</strong>. Compute both divergences by hand (calculator allowed, natural log). Round to 2 decimal places.</p>
+
+    <div class="numcheck" data-answer="0.51" data-tol="0.015" data-milestone="num-fkl">
+      <p class="prompt"><span class="tag">Compute 2.1</span>KL(P ∥ Q) = Σ P(x) ln [P(x)/Q(x)] = ?</p>
+      <input type="text" placeholder="nats, 2 dp"> <button data-check>Check</button>
+      <button class="secondary" data-hintbtn style="display:none">Show ln values</button>
+      <button class="ghost" data-giveup style="display:none">I've tried 3 times — reveal</button>
+      <div class="hintbox">
+        <table class="lntable">
+          <tr><td>ln(0.5/0.9) = −0.588</td><td>ln(0.5/0.1) = 1.609</td></tr>
+          <tr><td>ln(0.9/0.5) = 0.588</td><td>ln(0.1/0.5) = −1.609</td></tr>
+        </table>
+      </div>
+      <div class="feedback"></div>
+      <div class="answer">
+        <span class="label">Worked answer</span>
+        <p>0.5·ln(0.5/0.9) + 0.5·ln(0.5/0.1) = 0.5·(−0.588) + 0.5·(1.609) = <strong>0.51 nats</strong></p>
+      </div>
+    </div>
+
+    <div class="numcheck" data-answer="0.37" data-tol="0.015" data-milestone="num-rkl">
+      <p class="prompt"><span class="tag">Compute 2.2</span>Now the other direction: KL(Q ∥ P) = Σ Q(x) ln [Q(x)/P(x)] = ?</p>
+      <input type="text" placeholder="nats, 2 dp"> <button data-check>Check</button>
+      <button class="secondary" data-hintbtn style="display:none">Show ln values</button>
+      <button class="ghost" data-giveup style="display:none">I've tried 3 times — reveal</button>
+      <div class="hintbox">
+        <table class="lntable">
+          <tr><td>ln(0.9/0.5) = 0.588</td><td>ln(0.1/0.5) = −1.609</td></tr>
+        </table>
+      </div>
+      <div class="feedback"></div>
+      <div class="answer">
+        <span class="label">Worked answer</span>
+        <p>0.9·ln(0.9/0.5) + 0.1·ln(0.1/0.5) = 0.9·(0.588) + 0.1·(−1.609) = <strong>0.37 nats</strong></p>
+      </div>
+    </div>
+
+    <div class="recall">
+      <p class="prompt"><span class="tag">Recall 2.3</span>Different numbers — same two distributions. Look at your forward-KL computation: which single term made it large, and what does that term <em>mean</em> in words? (Which probability did Q get badly wrong, as judged by P?)</p>
+      <textarea placeholder="Identify the dominating term and translate it into English…"></textarea>
+      <button disabled data-reveal>Reveal</button>
+      <p class="gate-hint">Reveal unlocks after a genuine attempt (40+ characters).</p>
+      <div class="answer">
+        <span class="label">Answer</span>
+        <p>The term 0.5·ln(0.5/0.1) = 0.80 dominates. In words: <em>reality puts a full 50% on tails, but Q only allows 10% — and forward KL weights that error by how often reality actually produces tails (50% of the time).</em></p>
+        <p>Forward KL is the truth grading your model: errors in places <strong>P visits often</strong> get amplified; errors in places P never visits get weight P(x) = 0 and vanish entirely. Hold that thought.</p>
+      </div>
+    </div>
+
+    <p>Now push it to the extreme. Suppose your model goes all-in: <strong>Q = (1, 0)</strong> — it says tails is impossible. P is still (0.5, 0.5).</p>
+
+    <div class="mcq" data-milestone="mcq-inf-f">
+      <p class="prompt"><span class="tag">Check 2.4</span>KL(P ∥ Q) is now…</p>
+      <button class="opt" data-nudge="Write out the tails term: P puts 0.5 on tails, Q puts 0 there. What is ln(0.5/0) doing?">ln 2 ≈ 0.69</button>
+      <button class="opt" data-nudge="It can't be zero — the distributions are wildly different. Look at the tails term: 0.5 · ln(0.5/0).">0</button>
+      <button class="opt" data-correct="1">+∞</button>
+      <button class="opt" data-nudge="Plug in the tails term literally: 0.5 · ln(0.5 / 0). The denominator inside the log is zero.">0.5</button>
+      <div class="nudge"></div>
+      <div class="answer">
+        <span class="label">Correct</span>
+        <p>The tails term is 0.5·ln(0.5/0) = +∞. Forward KL hands out an <strong>infinite penalty</strong> whenever Q assigns zero to anything P can actually produce. A model minimizing forward KL will therefore <em>never dare</em> put zero (or near-zero) where P has mass — it must <strong>cover everything P does</strong>. This is called being <strong>zero-avoiding</strong>.</p>
+      </div>
+    </div>
+
+    <div class="mcq" data-milestone="mcq-inf-r">
+      <p class="prompt"><span class="tag">Check 2.5</span>Same Q = (1, 0), but now the reverse direction: KL(Q ∥ P) = ?</p>
+      <button class="opt" data-nudge="Careful — who is the sampler now? The expectation is over Q, and Q never produces tails. A term with weight Q(x) = 0 contributes nothing (the convention 0·log 0 = 0). What's left?">+∞</button>
+      <button class="opt" data-correct="1">ln 2 ≈ 0.69</button>
+      <button class="opt" data-nudge="Not zero — Q and P still disagree on heads. Compute the heads term: 1 · ln(1/0.5).">0</button>
+      <button class="opt" data-nudge="Write both terms out. Tails has weight Q(tails) = 0 so it drops; heads gives 1 · ln(1/0.5).">1</button>
+      <div class="nudge"></div>
+      <div class="answer">
+        <span class="label">Correct</span>
+        <p>Only the heads term survives: 1·ln(1/0.5) = ln 2 ≈ 0.69 — a small, <em>finite</em> penalty. The tails term has weight Q(tails) = 0, so it simply doesn't count.</p>
+        <p>Sit with the contrast: the <strong>same pair of distributions</strong> costs ∞ one way and 0.69 the other. Reverse KL doesn't care that Q abandoned half of reality — because Q is the sampler, and Q never goes there to be judged. Reverse KL only punishes Q for placing mass where <strong>P</strong> is small (try Q = (0.5, 0.5) vs P = (1,0) mentally: now reverse KL is the infinite one).</p>
+        <p>You now have both halves of the central intuition. Time to watch it play out geometrically.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ SECTION 3 ============================ -->
+<section class="lesson locked" id="s3">
+  <div class="section-head"><span class="section-num">Part 3</span><h2>The lab: you are the optimizer</h2></div>
+  <p class="lock-note">🔒 Locked — finish both computations and both checks in Part 2.</p>
+  <div class="section-body">
+    <p>The true distribution P (gray) is <strong>bimodal</strong>: two bumps at −2 and +2. Your model family is hopelessly simple — a single Gaussian Q(μ, σ). It <em>cannot</em> match P. So minimizing each KL must compromise somehow, and the two directions compromise <strong>differently</strong>. You will find both compromises by hand.</p>
+    <p>First, commit to predictions. The lab stays locked until you do.</p>
+
+    <div class="mcq" data-milestone="pred-f">
+      <p class="prompt"><span class="tag">Predict A</span>If you minimize <strong>forward</strong> KL(P ∥ Q), where will the Gaussian settle? (Recall Part 2: what does forward KL infinitely punish?)</p>
+      <button class="opt">Centered on one bump, narrow</button>
+      <button class="opt">Centered between the bumps, wide enough to cover both</button>
+      <button class="opt">Centered between the bumps, very narrow</button>
+      <div class="nudge"></div>
+      <div class="answer"><span class="label">Prediction locked in</span><p>No spoilers — go find out below.</p></div>
+    </div>
+
+    <div class="mcq" data-milestone="pred-r">
+      <p class="prompt"><span class="tag">Predict B</span>And minimizing <strong>reverse</strong> KL(Q ∥ P)? (What does reverse KL punish, and what does it forgive?)</p>
+      <button class="opt">Centered on one bump, narrow</button>
+      <button class="opt">Centered between the bumps, wide enough to cover both</button>
+      <button class="opt">Centered between the bumps, very narrow</button>
+      <div class="nudge"></div>
+      <div class="answer"><span class="label">Prediction locked in</span><p>Good. Now earn the answer.</p></div>
+    </div>
+
+    <div id="lab" style="display:none">
+      <canvas id="lab-canvas" width="720" height="300"></canvas>
+      <div class="sliders">
+        <label>μ (mean): <span id="mu-val">0.00</span>
+          <input type="range" id="mu" min="-4" max="4" step="0.05" value="0">
+        </label>
+        <label>σ (std): <span id="sig-val">1.00</span>
+          <input type="range" id="sig" min="0.2" max="3" step="0.05" value="1">
+        </label>
+      </div>
+      <div>
+        <button id="start-f">Begin Challenge 1: minimize KL(P ∥ Q)</button>
+        <button id="start-r" disabled>Begin Challenge 2: minimize KL(Q ∥ P)</button>
+      </div>
+      <div class="kl-readout" id="readout" style="display:none"></div>
+      <div class="success-banner" id="lab-success"></div>
+      <div class="recall" id="lab-stuck" style="display:none">
+        <p class="prompt"><span class="tag">Stuck?</span>Don't reveal lightly. First articulate what the current KL value is "charging" you for — then nudge one slider at a time and watch the number.</p>
+        <textarea placeholder="What is the penalty paying for right now? Which regions of x?"></textarea>
+        <button disabled data-reveal>Reveal a hint</button>
+        <p class="gate-hint">Hint unlocks after a genuine attempt (40+ characters).</p>
+        <div class="answer">
+          <span class="label">Hint</span>
+          <p>Forward KL samples from <strong>P</strong> — so it evaluates Q wherever the gray bumps are. Both of them. Reverse KL samples from <strong>Q</strong> — so it evaluates the ratio only under your own curve; mass you place where P ≈ 0 (the valley, the far tails) is expensive, while bumps of P that you ignore cost nothing.</p>
+        </div>
+      </div>
+      <div id="lab-compare" style="display:none">
+        <h3>Compare your two solutions</h3>
+        <div id="compare-text"></div>
+        <p class="muted">The sliders are now free — both KL values display live. Explore: park Q in the valley with small σ and watch which KL screams. Make σ huge and watch the other complain.</p>
+        <div class="recall">
+          <p class="prompt"><span class="tag">Recall 3.1</span>Explain, in terms of <em>which distribution the expectation samples from</em>, why each challenge ended where it did. Why did one solution cover and the other commit to a single bump?</p>
+          <textarea placeholder="Forward landed at … because the expectation is over … so … / Reverse landed at … because …"></textarea>
+          <button disabled data-reveal>Reveal</button>
+          <p class="gate-hint">Reveal unlocks after a genuine attempt (80+ characters).</p>
+          <div class="answer">
+            <span class="label">Answer</span>
+            <p><strong>Forward, KL(P ∥ Q) = E<sub>P</sub>[log P/Q]:</strong> samples come from P, i.e. from <em>both</em> bumps. Any bump where Q is tiny makes log(P/Q) explode — the Part 2 infinity in soft form. The only way a single Gaussian can keep Q non-negligible at both bumps is to sit between them and widen. It accepts wasting mass on the valley (where P ≈ 0) because forward KL never samples the valley, so that waste is barely charged. Result: <strong>mass-covering / mean-seeking / zero-avoiding</strong>. (Fun fact: for a Gaussian family, the exact forward-KL optimum is moment matching — Q takes P's true mean and variance.)</p>
+            <p><strong>Reverse, KL(Q ∥ P) = E<sub>Q</sub>[log Q/P]:</strong> samples come from Q itself. Mass Q puts in the valley gets judged by log(Q/P) with P ≈ 0 there — ruinous. So Q retreats until everywhere it stands, P is large: snugly onto one bump. The other bump? Q never samples it, so abandoning it is <em>free</em>. Result: <strong>mode-seeking / zero-forcing</strong> — and note there are two equally good optima (either bump); reverse KL is happy with either and your optimizer's starting point decides.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ SECTION 4 ============================ -->
+<section class="lesson locked" id="s4">
+  <div class="section-head"><span class="section-num">Part 4</span><h2>The mechanics, nailed down</h2></div>
+  <p class="lock-note">🔒 Locked — complete both lab challenges.</p>
+  <div class="section-body">
+    <p>You've seen the behavior. Now make the mechanism so explicit you could re-derive it cold in six months. No formulas revealed until you produce them.</p>
+
+    <div class="recall" data-milestone="recall-zeroavoid" data-min="100">
+      <p class="prompt"><span class="tag">Recall 4.1</span>Write the forward KL integral. Then explain precisely why minimizing it makes Q "zero-avoiding": which regions of x control the integral, what happens to the integrand where P &gt; 0 but Q → 0, and what happens where Q &gt; 0 but P → 0?</p>
+      <textarea placeholder="∫ … — and the two boundary cases…"></textarea>
+      <button disabled data-reveal>Reveal</button>
+      <p class="gate-hint">This one needs a real answer — reveal unlocks at 100 characters.</p>
+      <div class="answer">
+        <span class="label">Answer</span>
+        <p><span class="formula">KL(P ∥ Q) = ∫ p(x) log [p(x)/q(x)] dx</span></p>
+        <ul>
+          <li><strong>Where p &gt; 0 but q → 0:</strong> the integrand p·log(p/q) → +∞. Catastrophic. So Q is forced to keep mass <em>everywhere P has mass</em> — zero-avoiding, mass-covering.</li>
+          <li><strong>Where q &gt; 0 but p → 0:</strong> the integrand has weight p ≈ 0, so it contributes ≈ nothing. Q putting mass in places P never visits is <em>nearly free</em>. That's why the lab's forward solution happily covered the empty valley.</li>
+        </ul>
+        <p>Slogan: <strong>wherever P goes, Q must follow.</strong></p>
+      </div>
+    </div>
+
+    <div class="recall" data-milestone="recall-zeroforce" data-min="100">
+      <p class="prompt"><span class="tag">Recall 4.2</span>Same exercise for reverse KL: integral, then the two boundary cases. Why "zero-forcing"? Why is dropping an entire mode of P completely free?</p>
+      <textarea placeholder="∫ … — and the two boundary cases…"></textarea>
+      <button disabled data-reveal>Reveal</button>
+      <p class="gate-hint">Reveal unlocks at 100 characters.</p>
+      <div class="answer">
+        <span class="label">Answer</span>
+        <p><span class="formula">KL(Q ∥ P) = ∫ q(x) log [q(x)/p(x)] dx</span></p>
+        <ul>
+          <li><strong>Where q &gt; 0 but p → 0:</strong> integrand q·log(q/p) → +∞. So Q must put zero (or near-zero) mass wherever P is tiny — it is <em>forced toward zero</em> outside P's high-density regions: zero-forcing.</li>
+          <li><strong>Where p &gt; 0 but q → 0:</strong> weight q ≈ 0 ⇒ contributes nothing. Q can drop entire modes of P at no cost — mode-seeking.</li>
+        </ul>
+        <p>Slogan: <strong>Q only goes where P already is.</strong> Together: forward KL overestimates support (too broad, covers, blurs); reverse KL underestimates support (too narrow, commits, sharpens).</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ SECTION 5 ============================ -->
+<section class="lesson locked" id="s5">
+  <div class="section-head"><span class="section-num">Part 5</span><h2>Where each one lives in the wild</h2></div>
+  <p class="lock-note">🔒 Locked — complete both recalls in Part 4.</p>
+  <div class="section-body">
+    <p>The direction of the KL is never an arbitrary choice — it's usually dictated by <em>what you can sample from</em>, and it silently decides whether your model covers or commits. Diagnose each case before revealing.</p>
+
+    <div class="mcq" data-milestone="mcq-mle">
+      <p class="prompt"><span class="tag">Case 5.1</span>Maximum likelihood estimation: you maximize the average log-likelihood E<sub>x~data</sub>[log q<sub>θ</sub>(x)]. Which KL (between the data distribution p<sub>data</sub> and your model q<sub>θ</sub>) is this secretly minimizing?</p>
+      <button class="opt" data-correct="1">Forward: KL(p<sub>data</sub> ∥ q<sub>θ</sub>)</button>
+      <button class="opt" data-nudge="Whose samples appear in the objective — the model's, or the dataset's? The distribution you sample from is the first argument. You never sample from q during MLE.">Reverse: KL(q<sub>θ</sub> ∥ p<sub>data</sub>)</button>
+      <button class="opt" data-nudge="They are not equivalent here — only one of them differs from the MLE objective by a constant in θ. Expand KL(p_data ∥ q) and see which part depends on θ.">Either — they're equivalent at the optimum</button>
+      <div class="nudge"></div>
+      <div class="answer">
+        <span class="label">Correct — and verify the algebra in your head</span>
+        <p>KL(p<sub>data</sub> ∥ q) = E<sub>p<sub>data</sub></sub>[log p<sub>data</sub>] − E<sub>p<sub>data</sub></sub>[log q]. The first term doesn't contain θ, so minimizing the KL ⇔ maximizing E<sub>data</sub>[log q] ⇔ MLE. (Same story for cross-entropy loss in classification.)</p>
+        <p><strong>Consequence you can now predict:</strong> MLE-trained models are mass-covering. A language model trained purely by MLE must put probability on <em>everything</em> in the data distribution — including the dull, the rare, and the weird — and when its capacity falls short, it blurs across modes rather than dropping any.</p>
+      </div>
+    </div>
+
+    <div class="mcq" data-milestone="mcq-vi">
+      <p class="prompt"><span class="tag">Case 5.2</span>Variational inference approximates an intractable posterior p(z|x) with a simple q(z), minimizing <strong>reverse</strong> KL(q ∥ p). Why reverse, when forward would arguably give a more honest, covering approximation?</p>
+      <button class="opt" data-nudge="It's not about differentiability — both directions are differentiable in q's parameters. Think about what you'd need in order to *evaluate* each expectation. Which distribution can you actually draw samples from?">Reverse KL has nicer gradients</button>
+      <button class="opt" data-correct="1">Forward KL needs expectations under p — and you can't sample the intractable posterior. You <em>can</em> sample your own q.</button>
+      <button class="opt" data-nudge="Mode-seeking is a side effect (often an unwanted one — VI famously underestimates posterior variance!), not the reason. The reason is about what's computable.">Mode-seeking behavior is what you want from a posterior</button>
+      <div class="nudge"></div>
+      <div class="answer">
+        <span class="label">Correct</span>
+        <p>E<sub>q</sub>[log q/p] only needs samples from q (which you control) and p up to a normalizing constant — that's exactly the ELBO. Forward KL would need E<sub>p</sub>[·], i.e. samples from the very posterior you can't compute. The direction is chosen by <strong>tractability</strong>, and you inherit its personality as a side effect: VI posteriors are zero-forcing, so they tend to lock onto one mode and <strong>underestimate uncertainty</strong>. Now you know why, mechanically.</p>
+      </div>
+    </div>
+
+    <div class="mcq" data-milestone="mcq-rlhf">
+      <p class="prompt"><span class="tag">Case 5.3</span>In RLHF, the policy π is penalized with E<sub>x~π</sub>[log π(x)/π<sub>ref</sub>(x)] to keep it close to the reference model. Which direction is this, and what failure mode does its personality predict?</p>
+      <button class="opt" data-nudge="Check the sampler: the expectation is over x ~ π, and π sits on top of the ratio. First argument = sampler = numerator. So which KL is it — and what does that direction let π abandon for free?">Forward KL(π<sub>ref</sub> ∥ π) — the policy must keep covering everything the reference does</button>
+      <button class="opt" data-correct="1">Reverse KL(π ∥ π<sub>ref</sub>) — mode-seeking, so the policy can collapse onto a narrow slice of the reference's behavior</button>
+      <button class="opt" data-nudge="The two directions are very much not interchangeable here — one allows diversity collapse and the other forbids it. Identify the sampler first.">Direction doesn't matter for a penalty term</button>
+      <div class="nudge"></div>
+      <div class="answer">
+        <span class="label">Correct</span>
+        <p>Sampler is π, numerator is π — reverse KL with respect to the reference. It only punishes π for doing things π<sub>ref</sub> finds unlikely; it never punishes π for <em>abandoning</em> things π<sub>ref</sub> could do. Combined with reward-maximization (which loves concentrating on high-reward outputs), this predicts the well-known <strong>diversity collapse / mode collapse</strong> of RLHF-tuned models: fewer distinct phrasings, more samey outputs. The KL direction in one penalty term shapes the personality of the whole model.</p>
+      </div>
+    </div>
+
+    <div class="mcq" data-milestone="mcq-onemode">
+      <p class="prompt"><span class="tag">Case 5.4</span>Your approximating family is too simple to represent all of P's modes, and a <em>blurry average of modes would be useless</em> — you need one sharp, coherent answer (e.g., a single plausible image, a single executable plan). Which KL do you minimize?</p>
+      <button class="opt" data-nudge="Forward KL is the blur-maker: forced to cover every mode, a limited model lands *between* them — your lab Challenge 1 Gaussian straddling the valley. Is that the 'one sharp answer'?">Forward KL(P ∥ Q)</button>
+      <button class="opt" data-correct="1">Reverse KL(Q ∥ P)</button>
+      <div class="nudge"></div>
+      <div class="answer">
+        <span class="label">Correct</span>
+        <p>Reverse KL commits to one mode and stays sharp — exactly the lab's Challenge 2. This is the design rule worth keeping:</p>
+        <p><strong>Need calibrated coverage of everything that can happen (density estimation, compression, honest uncertainty)? → forward KL.<br>
+        Need one coherent, high-probability answer and can afford to drop alternatives (VI, RL-style fine-tuning, sharp generation)? → reverse KL.</strong></p>
+        <p class="muted">Bonus thread to pull later: knowledge distillation classically uses forward KL(teacher ∥ student) so the student covers the teacher; recent LLM distillation work sometimes prefers reverse KL precisely to avoid the student blurring over teacher modes it can't fit.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ SECTION 6 ============================ -->
+<section class="lesson locked" id="s6">
+  <div class="section-head"><span class="section-num">Part 6</span><h2>Final synthesis: the blank page</h2></div>
+  <p class="lock-note">🔒 Locked — finish all four cases in Part 5.</p>
+  <div class="section-body">
+    <p>The strongest test: reconstruct everything from nothing. Without scrolling up, write a complete explanation of forward vs. reverse KL as if teaching a friend. It must include: (1) both formulas and what differs between them, (2) the two infinity/boundary arguments, (3) what each does on a bimodal target, (4) one real application of each and <em>why</em> that direction is used there.</p>
+
+    <div class="recall" data-min="400">
+      <p class="prompt"><span class="tag">Final recall</span>The whole picture, from memory.</p>
+      <textarea style="min-height:200px" placeholder="Teach it. The model summary unlocks at 400 characters — roughly the minimum for an honest attempt."></textarea>
+      <button disabled data-reveal>Compare with model summary</button>
+      <p class="gate-hint">Unlocks at 400 characters. If you get stuck, that's a finding — go re-derive the missing piece first.</p>
+      <div class="answer">
+        <span class="label">Model summary — grade yourself against it</span>
+        <p><strong>Definitions.</strong> KL(P ∥ Q) = E<sub>x~P</sub>[log P(x)/Q(x)] ≥ 0, zero iff P = Q, asymmetric. The first argument is both the <em>sampler</em> and the <em>numerator</em>. Forward KL = KL(P ∥ Q) where P is the true/target distribution; reverse KL = KL(Q ∥ P). It measures expected excess surprise from believing Q when reality is the first argument.</p>
+        <p><strong>Boundary mechanics.</strong> Forward: where P &gt; 0 but Q → 0 the integrand p·log(p/q) → ∞, so Q must cover all of P's support (<em>zero-avoiding</em>); where P ≈ 0, anything Q does is nearly free. Reverse: where Q &gt; 0 but P → 0 the integrand q·log(q/p) → ∞, so Q must vacate regions P doesn't occupy (<em>zero-forcing</em>); modes of P that Q ignores cost nothing because Q never samples them.</p>
+        <p><strong>Bimodal target, single-Gaussian family.</strong> Forward KL → one wide Gaussian between the bumps (mass-covering / mean-seeking; for Gaussians, exactly moment matching). Reverse KL → a narrow Gaussian on one bump, either bump, other abandoned free (mode-seeking; multiple optima).</p>
+        <p><strong>In the wild.</strong> MLE / cross-entropy = forward KL(p<sub>data</sub> ∥ q) (the data term is the only θ-dependent part) → trained models must cover the data distribution. Variational inference and the RLHF KL penalty = reverse KL, chosen because you can only sample your own q/π — with the side effects that direction implies: variance underestimation in VI, diversity collapse in RLHF.</p>
+        <p><strong>Mantra.</strong> Forward: <em>wherever P goes, Q must follow.</em> Reverse: <em>Q only goes where P already is.</em></p>
+        <hr>
+        <p class="muted"><strong>To make it stick:</strong> redo the blank-page recall tomorrow, in 3 days, and in a week — without opening anything else first. If you want to go deeper afterwards: derive that forward-KL-optimal Gaussians moment-match; look up α-divergences (forward and reverse KL are the two endpoints of one family); and read about Jensen–Shannon divergence as the symmetrized compromise.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ================= progress / unlock machinery ================= */
+  const done = new Set();
+  const requirements = {
+    s1: ["warmup"],
+    s2: ["mcq-props"],
+    s3: ["num-fkl", "num-rkl", "mcq-inf-f", "mcq-inf-r"],
+    s4: ["lab-forward", "lab-reverse"],
+    s5: ["recall-zeroavoid", "recall-zeroforce"],
+    s6: ["mcq-mle", "mcq-vi", "mcq-rlhf", "mcq-onemode"]
+  };
+  function milestone(name) {
+    if (!name || done.has(name)) return;
+    done.add(name);
+    for (const [sec, reqs] of Object.entries(requirements)) {
+      if (reqs.every(r => done.has(r))) {
+        const el = document.getElementById(sec);
+        if (el && el.classList.contains("locked")) {
+          el.classList.remove("locked");
+          const pn = document.getElementById("pn-" + sec);
+          if (pn) pn.classList.add("open");
+        }
+      }
+    }
+    if (done.has("pred-f") && done.has("pred-r")) {
+      document.getElementById("lab").style.display = "block";
+      drawLab();
+    }
+  }
+
+  /* ================= warm-up gate ================= */
+  const warmTa = document.getElementById("warmup-ta");
+  warmTa.addEventListener("input", () => {
+    const n = warmTa.value.trim().length;
+    const gate = document.getElementById("warmup-gate");
+    if (n >= 60) {
+      gate.textContent = "✓ Good. Section 1 is open below.";
+      milestone("warmup");
+    } else {
+      gate.textContent = "Keep writing… (section 1 unlocks at 60 characters — " + (60 - n) + " to go)";
+    }
+  });
+
+  /* ================= recall blocks ================= */
+  document.querySelectorAll(".recall").forEach(block => {
+    const ta = block.querySelector("textarea");
+    const btn = block.querySelector("button[data-reveal]");
+    if (!ta || !btn) return;
+    const min = parseInt(block.dataset.min || "40", 10);
+    ta.addEventListener("input", () => {
+      btn.disabled = ta.value.trim().length < min;
+    });
+    btn.addEventListener("click", () => {
+      block.querySelector(".answer").classList.add("shown");
+      btn.style.display = "none";
+      const gh = block.querySelector(".gate-hint");
+      if (gh) gh.style.display = "none";
+      milestone(block.dataset.milestone);
+    });
+  });
+
+  /* ================= numeric checks ================= */
+  document.querySelectorAll(".numcheck").forEach(block => {
+    const input = block.querySelector("input");
+    const checkBtn = block.querySelector("button[data-check]");
+    const hintBtn = block.querySelector("button[data-hintbtn]");
+    const giveupBtn = block.querySelector("button[data-giveup]");
+    const fb = block.querySelector(".feedback");
+    const ans = parseFloat(block.dataset.answer);
+    const tol = parseFloat(block.dataset.tol);
+    let attempts = 0, solved = false;
+
+    function finish(revealed) {
+      solved = true;
+      input.disabled = true;
+      checkBtn.disabled = true;
+      block.querySelector(".answer").classList.add("shown");
+      if (giveupBtn) giveupBtn.style.display = "none";
+      milestone(block.dataset.milestone);
+      fb.className = "feedback " + (revealed ? "no" : "ok");
+      fb.textContent = revealed
+        ? "Revealed — make sure you can now reproduce the computation unaided."
+        : "✓ Correct.";
+    }
+
+    checkBtn.addEventListener("click", () => {
+      if (solved) return;
+      const v = parseFloat(input.value.replace(",", "."));
+      if (isNaN(v)) { fb.className = "feedback no"; fb.textContent = "Enter a number (in nats)."; return; }
+      if (Math.abs(v - ans) <= tol) { finish(false); return; }
+      attempts++;
+      fb.className = "feedback no";
+      fb.textContent = attempts === 1
+        ? "Not quite. Re-check which distribution provides the weights and which sits on top of the log."
+        : "Still off. Write out both terms explicitly: weight × ln(ratio), then add.";
+      if (attempts >= 1 && hintBtn) hintBtn.style.display = "inline-block";
+      if (attempts >= 3 && giveupBtn) giveupBtn.style.display = "inline-block";
+    });
+    input.addEventListener("keydown", e => { if (e.key === "Enter") checkBtn.click(); });
+    if (hintBtn) hintBtn.addEventListener("click", () => {
+      block.querySelector(".hintbox").classList.add("shown");
+      hintBtn.style.display = "none";
+    });
+    if (giveupBtn) giveupBtn.addEventListener("click", () => finish(true));
+  });
+
+  /* ================= MCQs ================= */
+  document.querySelectorAll(".mcq").forEach(block => {
+    const opts = block.querySelectorAll(".opt");
+    const nudge = block.querySelector(".nudge");
+    const isPrediction = (block.dataset.milestone || "").startsWith("pred-");
+    let answered = false;
+    opts.forEach(opt => {
+      opt.addEventListener("click", () => {
+        if (answered) return;
+        if (isPrediction || opt.dataset.correct) {
+          answered = true;
+          opt.classList.add("right");
+          opts.forEach(o => { o.disabled = true; });
+          if (nudge) nudge.classList.remove("shown");
+          const a = block.querySelector(".answer");
+          if (a) a.classList.add("shown");
+          milestone(block.dataset.milestone);
+        } else {
+          opt.classList.add("wrong");
+          setTimeout(() => opt.classList.remove("wrong"), 900);
+          if (nudge) {
+            nudge.textContent = opt.dataset.nudge || "Not that one — reason it out again.";
+            nudge.classList.add("shown");
+          }
+        }
+      });
+    });
+  });
+
+  /* ================= the lab ================= */
+  const canvas = document.getElementById("lab-canvas");
+  const ctx = canvas.getContext("2d");
+  const muSlider = document.getElementById("mu");
+  const sigSlider = document.getElementById("sig");
+  const readout = document.getElementById("readout");
+  const successBanner = document.getElementById("lab-success");
+
+  const XMIN = -7, XMAX = 7, N = 1401;
+  const DX = (XMAX - XMIN) / (N - 1);
+  const xs = new Float64Array(N), ps = new Float64Array(N);
+  function gauss(x, m, s) {
+    return Math.exp(-0.5 * ((x - m) / s) ** 2) / (s * Math.sqrt(2 * Math.PI));
+  }
+  for (let i = 0; i < N; i++) {
+    xs[i] = XMIN + i * DX;
+    ps[i] = 0.5 * gauss(xs[i], -2, 0.6) + 0.5 * gauss(xs[i], 2, 0.6);
+  }
+  const TINY = 1e-300;
+  function computeKLs(mu, sig) {
+    let f = 0, r = 0;
+    for (let i = 0; i < N; i++) {
+      const p = ps[i], q = gauss(xs[i], mu, sig);
+      if (p > TINY) f += p * Math.log(p / Math.max(q, TINY));
+      if (q > TINY) r += q * Math.log(q / Math.max(p, TINY));
+    }
+    return [f * DX, r * DX];
+  }
+
+  // grid-search optima (computed lazily after first paint)
+  let bestF = null, bestR = null;
+  function gridSearch() {
+    bestF = { v: Infinity }; bestR = { v: Infinity };
+    for (let mu = -4; mu <= 4.001; mu += 0.05) {
+      for (let s = 0.2; s <= 3.001; s += 0.05) {
+        const [f, r] = computeKLs(mu, s);
+        if (f < bestF.v) bestF = { v: f, mu: mu, s: s };
+        if (r < bestR.v) bestR = { v: r, mu: mu, s: s };
+      }
+    }
+  }
+
+  // phases: null (idle) | 'f' | 'r' | 'compare'
+  let phase = null;
+  const userBest = {};
+
+  function drawLab() {
+    const W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+    const xlo = -5, xhi = 5, ymax = 0.75;
+    const X = x => (x - xlo) / (xhi - xlo) * W;
+    const Y = y => H - 22 - y / ymax * (H - 40);
+
+    // axis
+    ctx.strokeStyle = "#ccc"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, H - 22); ctx.lineTo(W, H - 22); ctx.stroke();
+    ctx.fillStyle = "#999"; ctx.font = "12px sans-serif"; ctx.textAlign = "center";
+    for (let t = -4; t <= 4; t += 2) ctx.fillText(t, X(t), H - 7);
+
+    // P filled
+    ctx.beginPath();
+    ctx.moveTo(X(xlo), Y(0));
+    for (let x = xlo; x <= xhi; x += 0.02) {
+      ctx.lineTo(X(x), Y(0.5 * gauss(x, -2, 0.6) + 0.5 * gauss(x, 2, 0.6)));
+    }
+    ctx.lineTo(X(xhi), Y(0)); ctx.closePath();
+    ctx.fillStyle = "rgba(120,120,130,0.25)"; ctx.fill();
+    ctx.strokeStyle = "rgba(120,120,130,0.8)"; ctx.stroke();
+
+    // Q line
+    const mu = parseFloat(muSlider.value), sig = parseFloat(sigSlider.value);
+    ctx.beginPath();
+    let first = true;
+    for (let x = xlo; x <= xhi; x += 0.02) {
+      const yy = Y(gauss(x, mu, sig));
+      if (first) { ctx.moveTo(X(x), yy); first = false; } else ctx.lineTo(X(x), yy);
+    }
+    ctx.strokeStyle = "#5b4fd4"; ctx.lineWidth = 2.5; ctx.stroke();
+    ctx.lineWidth = 1;
+
+    // legend
+    ctx.textAlign = "left"; ctx.font = "13px sans-serif";
+    ctx.fillStyle = "rgba(120,120,130,1)"; ctx.fillText("P (truth, fixed)", 12, 18);
+    ctx.fillStyle = "#5b4fd4"; ctx.fillText("Q(μ=" + mu.toFixed(2) + ", σ=" + sig.toFixed(2) + ")  — you", 12, 36);
+  }
+
+  function tolFor(best) { return 0.02 + 0.015 * best.v; }
+
+  function update() {
+    document.getElementById("mu-val").textContent = parseFloat(muSlider.value).toFixed(2);
+    document.getElementById("sig-val").textContent = parseFloat(sigSlider.value).toFixed(2);
+    drawLab();
+    if (!phase) return;
+    const mu = parseFloat(muSlider.value), sig = parseFloat(sigSlider.value);
+    const [f, r] = computeKLs(mu, sig);
+    if (phase === "f" || phase === "r") {
+      const v = phase === "f" ? f : r;
+      const name = phase === "f" ? "KL(P ∥ Q)" : "KL(Q ∥ P)";
+      readout.innerHTML = name + " = <span class='val'>" + v.toFixed(3) + "</span> nats";
+      const best = phase === "f" ? bestF : bestR;
+      if (best && v <= best.v + tolFor(best)) {
+        userBest[phase] = { mu: mu, sig: sig, v: v };
+        challengeSolved();
+      }
+    } else if (phase === "compare") {
+      readout.innerHTML =
+        "KL(P ∥ Q) = <span class='val'>" + f.toFixed(3) + "</span> &nbsp;·&nbsp; " +
+        "KL(Q ∥ P) = <span class='val'>" + r.toFixed(3) + "</span> nats";
+    }
+  }
+
+  function challengeSolved() {
+    successBanner.classList.add("shown");
+    if (phase === "f") {
+      phase = null;
+      milestone("lab-forward");
+      successBanner.innerHTML = "✓ Challenge 1 solved at μ ≈ " + userBest.f.mu.toFixed(2) +
+        ", σ ≈ " + userBest.f.sig.toFixed(2) +
+        ". Before moving on: is that where you predicted? Note <em>how wide</em> Q had to get. Now do Challenge 2.";
+      document.getElementById("start-r").disabled = false;
+      document.getElementById("start-f").disabled = true;
+    } else if (phase === "r") {
+      phase = "compare";
+      milestone("lab-reverse");
+      successBanner.innerHTML = "✓ Challenge 2 solved at μ ≈ " + userBest.r.mu.toFixed(2) +
+        ", σ ≈ " + userBest.r.sig.toFixed(2) + ". Compare panel unlocked below — Part 4 is now open too.";
+      document.getElementById("start-r").disabled = true;
+      document.getElementById("lab-compare").style.display = "block";
+      document.getElementById("compare-text").innerHTML =
+        "<p>Your <strong>forward</strong> solution: μ ≈ " + userBest.f.mu.toFixed(2) + ", σ ≈ " + userBest.f.sig.toFixed(2) +
+        " — one wide Gaussian straddling <em>both</em> bumps (and wasting mass on the empty valley).</p>" +
+        "<p>Your <strong>reverse</strong> solution: μ ≈ " + userBest.r.mu.toFixed(2) + ", σ ≈ " + userBest.r.sig.toFixed(2) +
+        " — a narrow Gaussian committed to <em>one</em> bump, the other abandoned entirely. " +
+        "(Try the mirror bump at μ = " + (-userBest.r.mu).toFixed(2) + " — reverse KL is equally happy there. Two optima!)</p>";
+      update();
+    }
+  }
+
+  function startChallenge(ph) {
+    if (!bestF) gridSearch();
+    phase = ph;
+    successBanner.classList.remove("shown");
+    readout.style.display = "inline-block";
+    document.getElementById("lab-stuck").style.display = "block";
+    muSlider.value = ph === "f" ? "3.5" : "0";
+    sigSlider.value = ph === "f" ? "0.4" : "2.8";
+    update();
+  }
+  document.getElementById("start-f").addEventListener("click", () => startChallenge("f"));
+  document.getElementById("start-r").addEventListener("click", () => startChallenge("r"));
+  muSlider.addEventListener("input", update);
+  sigSlider.addEventListener("input", update);
+})();
+</script>
+</body>
+</html>

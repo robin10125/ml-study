@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 2 · GPU Architecture &amp; CUDA Basics</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 2</span> · GPU Architecture &amp; CUDA Basics</h1>
+<p class="subtitle">Everything about Flash Attention's design is dictated by the shape of GPU hardware. This chapter builds that mental model from zero and ends with the tiled matmul — the kernel that Flash Attention generalizes.</p>
+
+<h2 id="throughput">2.1 The GPU is a throughput machine</h2>
+<p>A CPU core minimizes the <em>latency</em> of one instruction stream: big caches, branch prediction, out-of-order execution. A GPU instead maximizes <em>throughput</em>: it is built from dozens of <strong>Streaming Multiprocessors (SMs)</strong> — 36 on an RTX 2070, 108 on an A100, 132 on an H100 — each of which juggles <em>thousands</em> of lightweight threads. When some threads stall waiting for memory (which takes hundreds of clock cycles), the SM instantly switches to other threads that are ready. <strong>Latency isn't avoided; it's hidden under a flood of parallel work.</strong> This only works if you give the GPU vastly more threads than it has arithmetic units — a key reason "not enough parallel blocks" (poor <em>occupancy</em>, §2.7) is a first-class performance bug, and one that FlashAttention-2 specifically fixes over FA-1.</p>
+
+<h2 id="cuda-model">2.2 The CUDA programming model: threads, warps, blocks, grid</h2>
+<p>A CUDA <strong>kernel</strong> is a C++ function, marked <code>__global__</code>, executed simultaneously by many threads. The threads are organized in a two-level hierarchy <em>you</em> choose at launch time:</p>
+<ul>
+  <li>A <strong>grid</strong> of <strong>thread blocks</strong> (up to 3-D indices). Blocks are independent: they may run in any order, on any SM, with <em>no</em> way to synchronize with each other during the kernel. A block runs on exactly one SM, start to finish.</li>
+  <li>Each block contains up to 1024 <strong>threads</strong> (also indexable in 3-D). Threads in the same block can share fast on-chip memory and synchronize with a barrier.</li>
+</ul>
+<p>Inside the kernel, each thread discovers who it is via built-in variables and almost always converts them to a global index:</p>
+<pre><code>__global__ void vec_add(const float* a, const float* b, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;   // my unique element
+    if (i &lt; n) c[i] = a[i] + b[i];                   // guard: grid may overshoot n
+}
+
+// host code: ceil(n/256) blocks of 256 threads
+vec_add&lt;&lt;&lt;(n + 255) / 256, 256&gt;&gt;&gt;(d_a, d_b, d_c, n);
+</code></pre>
+
+<div class="box definition"><div class="box-title">Warps — the unit the hardware actually runs</div>
+The SM does not execute threads one by one. It executes <strong>warps</strong>: groups of <strong>32 consecutive threads</strong> (threads 0–31, 32–63, … of a block) that march in lockstep, all executing the same instruction on different data (<em>SIMT</em>). Two consequences you must internalize:
+<ul>
+  <li><strong>Divergence:</strong> if threads within one warp take different <code>if</code> branches, the warp executes <em>both</em> paths serially, masking threads off — up to 32× slowdown. Branching that is uniform across a warp is free.</li>
+  <li><strong>Memory requests are issued per warp</strong>, which is what makes the next section's coalescing rule possible.</li>
+</ul>
+Warps can also exchange data among their 32 lanes directly through registers (§2.6) — no memory involved. FlashAttention-2's "work partitioning" story (§4.5) is entirely about how warps within a block divide up a tile.
+</div>
+
+<div class="quiz" data-concept="ch2.html#cuda-model" data-concept-label="§2.2 Threads, warps, blocks, grid">
+  <div class="q-text"><p>From memory: (a) define grid, block, warp, and thread, including the two hard rules about blocks (where they run, and what they cannot do); (b) what is warp divergence and what is its worst-case cost; (c) write the standard global-index expression for a 1-D kernel.</p></div>
+  <div class="hint">One level of the hierarchy can synchronize and share memory; the other cannot at all.</div>
+  <div class="hint">Warp = 32 consecutive threads of a block, lockstep.</div>
+  <div class="answer">
+    <p>(a) A kernel launch creates a <em>grid</em> of <em>blocks</em>; each block runs entirely on one SM and blocks <em>cannot synchronize or communicate with each other</em> during the kernel. Blocks contain up to 1024 <em>threads</em> which can share <code>__shared__</code> memory and synchronize via <code>__syncthreads()</code>. The hardware executes threads in <em>warps</em> of 32 in lockstep.</p>
+    <p>(b) Divergence: threads of one warp taking different branches forces serial execution of each path with inactive lanes masked; worst case ~32×.</p>
+    <p>(c) <code>int i = blockIdx.x * blockDim.x + threadIdx.x;</code></p>
+  </div>
+</div>
+
+<h2 id="memory-hierarchy">2.3 The memory hierarchy — the entire reason Flash Attention exists</h2>
+<p>Numbers below are for an A100; the <em>ratios</em> are what matter and they are similar on every modern NVIDIA GPU, including consumer cards.</p>
+<table>
+<tr><th>Memory</th><th>Scope / lifetime</th><th>Size</th><th>Bandwidth</th><th>Latency</th></tr>
+<tr><td><strong>Registers</strong></td><td>per thread</td><td>up to 255 × 4 B per thread (256 KB per SM)</td><td>operand-speed (effectively "free")</td><td>~0 (pipelined)</td></tr>
+<tr><td><strong>Shared memory / L1</strong> <em>("SRAM")</em></td><td>per block, lifetime of the block</td><td>up to 164 KB per SM (A100); 64 KB (RTX 2070); 228 KB (H100)</td><td>~19 TB/s aggregate</td><td>~20–30 cycles</td></tr>
+<tr><td><strong>L2 cache</strong></td><td>whole GPU (hardware-managed)</td><td>40 MB (A100)</td><td>~4–7 TB/s</td><td>~200 cycles</td></tr>
+<tr><td><strong>HBM / global memory</strong></td><td>whole GPU, persists across kernels</td><td>40–80 GB</td><td>1.5–2.0 TB/s</td><td>~400–800 cycles</td></tr>
+</table>
+<p>Read the SRAM row again: roughly <strong>10× the bandwidth of HBM and 20× lower latency, but ~500,000× smaller than HBM</strong>. The Flash Attention papers call shared memory "SRAM", and the entire algorithm is one idea: <em>do all \(O(N^2)\) work while the operands sit in that tiny fast layer, and touch HBM only \(O(Nd)\) times</em>. Note also: shared memory dies with its block, and the only memory that persists between kernels is HBM — that is why the naive 3-kernel attention of §1.2 was forced to round-trip \(S\) and \(P\) through HBM.</p>
+
+<div class="quiz" data-concept="ch2.html#memory-hierarchy" data-concept-label="§2.3 The memory hierarchy">
+  <div class="q-text"><p>Reproduce the four-level memory hierarchy table from memory: name, scope/lifetime, approximate size, and approximate bandwidth, with roughly correct ratios between levels. Then state which level the "S" in "SRAM" refers to in the FlashAttention paper, and the one fact about kernel-to-kernel communication this table implies.</p></div>
+  <div class="hint">Registers → shared/L1 → L2 → HBM. The two ratios to know: SRAM is ~10× HBM bandwidth, and ~half a million times smaller.</div>
+  <div class="answer"><p>Registers (per-thread, ~KB, ALU-speed); shared memory/L1 (per-block, ~100–200 KB per SM, ~19 TB/s); L2 (device-wide cache, tens of MB, ~5 TB/s); HBM (device-wide, tens of GB, ~2 TB/s, persists across kernels). "SRAM" = on-chip shared memory (+ registers). Since only HBM outlives a kernel, separate kernels can only hand data to each other through slow HBM — the structural reason kernel fusion pays.</p></div>
+</div>
+
+<h2 id="coalescing">2.4 Global memory coalescing</h2>
+<p>When a warp executes a load, the hardware merges the 32 threads' addresses into as few 32-byte memory transactions as possible. If thread \(t\) reads <code>ptr[base + t]</code> — <strong>consecutive threads, consecutive addresses</strong> — the warp's 128 bytes arrive in 4 transactions: perfectly <em>coalesced</em>. If instead thread \(t\) reads <code>ptr[t * stride]</code> with a large stride, every thread needs its own transaction: up to 32× more traffic for the same useful data.</p>
+<p>Practical rule for matrices stored row-major: <strong>let adjacent threads handle adjacent elements within a row</strong> (the last, contiguous index). You will see this rule shape every load loop in the Chapter 5 kernel.</p>
+
+<div class="quiz" data-concept="ch2.html#coalescing" data-concept-label="§2.4 Coalescing">
+  <div class="q-text"><p>A row-major matrix <code>M</code> of shape (R, C) is in global memory. Pattern A: thread \(t\) reads <code>M[t][j]</code> (a column). Pattern B: thread \(t\) reads <code>M[i][t]</code> (a row). Which is coalesced and why, in terms of what the warp's address pattern looks like? What's the worst-case traffic ratio between them?</p></div>
+  <div class="hint">Write each as a flat address: <code>M[r][c] = M[r*C + c]</code>. Which one makes the flat address consecutive in \(t\)?</div>
+  <div class="answer"><p>B is coalesced: addresses are <code>i*C + t</code> — consecutive for consecutive lanes, so the warp's request collapses into ~4 transactions. A generates addresses <code>t*C + j</code>, stride \(C\) elements apart: with \(C \ge 32\), 32 separate transactions, each fetching 32 bytes to use only 4 — up to ~32× the traffic (8× if counting 32-byte sectors vs 4-byte use).</p></div>
+</div>
+
+<h2 id="shared-sync">2.5 Shared memory and barriers</h2>
+<p>A block can allocate fast on-chip memory with <code>__shared__</code>, visible to all of the block's threads:</p>
+<pre><code>__shared__ float tile[64][64];          // 16 KB of this block's SM budget
+tile[threadIdx.y][threadIdx.x] = ...;   // threads fill it cooperatively
+__syncthreads();                        // barrier: wait until ALL threads wrote
+float x = tile[k][threadIdx.x];         // now any thread may read any entry
+</code></pre>
+<p><code>__syncthreads()</code> is a block-wide barrier. The discipline that you will use in every kernel in this course:</p>
+<div class="box keypoint"><div class="box-title">The load–sync–compute–sync rhythm</div>
+<ol style="margin:0.3rem 0">
+<li><strong>Load:</strong> all threads cooperatively copy a tile from HBM into shared memory (coalesced!).</li>
+<li><strong>__syncthreads()</strong> — nobody reads a tile entry someone else hasn't written yet.</li>
+<li><strong>Compute:</strong> every thread reads the shared tile freely, many times. This is where the data reuse happens.</li>
+<li><strong>__syncthreads()</strong> — nobody overwrites the tile for the next iteration while a slow thread is still reading it.</li>
+</ol>
+Forgetting barrier #2 gives wrong answers <em>sometimes</em> (a race); forgetting #1's coalescing gives right answers, slowly. Also beware: <code>__syncthreads()</code> must be reached by <em>all</em> threads of the block — never put it inside a branch that only some threads take.
+</div>
+<p><em>One level deeper (optional now, revisited in §5.9):</em> shared memory is divided into 32 <strong>banks</strong> (4-byte wide, addresses interleaved). If multiple threads of a warp hit different addresses in the <em>same</em> bank simultaneously, the accesses serialize ("bank conflict"). All threads reading the <em>same</em> address is fine — it broadcasts.</p>
+
+<h2 id="tiled-matmul">2.6 Worked example: tiled matrix multiplication</h2>
+<p>Compute \(C = AB\), all \(N\times N\), one thread per output element. The naive kernel:</p>
+<pre><code>__global__ void matmul_naive(const float* A, const float* B, float* C, int N) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row &gt;= N || col &gt;= N) return;
+    float acc = 0.f;
+    for (int k = 0; k &lt; N; k++)
+        acc += A[row * N + k] * B[k * N + col];
+    C[row * N + col] = acc;
+}
+</code></pre>
+
+<div class="quiz" data-concept="ch2.html#tiled-matmul" data-concept-label="§2.6 Tiled matmul">
+  <div class="q-text"><p>In <code>matmul_naive</code>, how many times is each element of \(A\) loaded from memory over the whole computation (ignoring caches)? What is the total load traffic in elements? Then: if a block of \(T\times T\) threads first stages \(T \times T\) tiles of \(A\) and \(B\) in shared memory, by what factor does global traffic drop?</p></div>
+  <div class="hint">Element \(A[i][k]\) is needed by every thread computing row \(i\) of \(C\). How many such threads are there?</div>
+  <div class="hint">In the tiled version, a tile element is loaded from HBM once per block, then read from SRAM by \(T\) threads.</div>
+  <div class="answer"><p>Each \(A[i][k]\) is needed by the \(N\) threads computing \(C[i][\cdot]\), so it is loaded \(N\) times: total traffic \(2N^3\) element-loads. With \(T\times T\) tiling, each block loads each tile element once and reuses it \(T\) times from shared memory, so traffic falls to \(2N^3/T\) — a factor-\(T\) reduction (e.g. 32×). This load-once-reuse-\(T\)-times pattern is exactly what Flash Attention does to \(K\) and \(V\) tiles.</p></div>
+</div>
+
+<p>Now the tiled version. Study it until every line is obvious — the Chapter 5 attention kernel reuses every idea here:</p>
+<pre><code>template&lt;int T&gt;                                   // tile size, e.g. 32
+__global__ void matmul_tiled(const float* A, const float* B, float* C, int N) {
+    __shared__ float As[T][T];
+    __shared__ float Bs[T][T];
+    int row = blockIdx.y * T + threadIdx.y;
+    int col = blockIdx.x * T + threadIdx.x;
+    float acc = 0.f;
+
+    for (int t = 0; t &lt; N; t += T) {              // march tiles along the k axis
+        // cooperative, coalesced loads: threadIdx.x is the fast (contiguous) index
+        As[threadIdx.y][threadIdx.x] =
+            (row &lt; N &amp;&amp; t + threadIdx.x &lt; N) ? A[row * N + t + threadIdx.x] : 0.f;
+        Bs[threadIdx.y][threadIdx.x] =
+            (t + threadIdx.y &lt; N &amp;&amp; col &lt; N) ? B[(t + threadIdx.y) * N + col] : 0.f;
+        __syncthreads();
+
+        for (int k = 0; k &lt; T; k++)
+            acc += As[threadIdx.y][k] * Bs[k][threadIdx.x];
+        __syncthreads();
+    }
+    if (row &lt; N &amp;&amp; col &lt; N) C[row * N + col] = acc;
+}
+</code></pre>
+<p>Note three things: (1) the accumulator lives in a <em>register</em> across all tile iterations and is written to HBM exactly once at the end — Flash Attention does the same with the output row \(O_i\) and its softmax statistics; (2) out-of-range loads store 0, which is harmless for a sum — attention will instead use \(-\infty\) scores, harmless for a softmax; (3) both <code>__syncthreads()</code> are load-bearing.</p>
+
+<div class="quiz" data-concept="ch2.html#shared-sync" data-concept-label="§2.5 Shared memory and barriers">
+  <div class="q-text"><p>Explain precisely what goes wrong if (a) the first <code>__syncthreads()</code> in the tile loop is removed; (b) the second one is removed. Which bug is a correctness bug in both cases?</p></div>
+  <div class="hint">Warps of the same block do not run in lockstep with each other — one warp can race ahead a whole loop iteration.</div>
+  <div class="answer"><p>(a) A thread may read <code>As[threadIdx.y][k]</code> before the thread responsible for writing that entry has written it — it reads stale/garbage data. (b) A fast warp loops around and <em>overwrites</em> the tile for iteration \(t{+}T\) while a slow warp is still reading iteration \(t\)'s values. Both are data races and both corrupt results nondeterministically — the second one is the one people forget.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch2.html#tiled-matmul" data-concept-label="§2.6 Tiled matmul">
+  <div class="q-text"><p><strong>Coding recall (do it for real):</strong> close this page and write <code>matmul_tiled</code> from scratch, including both boundary guards and both barriers. Then compare against the listing above line by line. If you have a GPU, also write a <code>main()</code> that checks it against a CPU triple loop on a 300×300 matrix (a deliberately non-multiple-of-T size).</p></div>
+  <div class="hint">Structure: declare 2 shared tiles → compute my (row, col) → zero an accumulator → loop tiles: {cooperative guarded loads, sync, inner k loop, sync} → guarded store.</div>
+  <div class="hint">For the loads, the rule from §2.4: <code>threadIdx.x</code> must index the contiguous dimension of both <code>A</code> and <code>B</code>.</div>
+  <div class="answer"><p>See the listing in §2.6. Grade yourself on: coalesced indexing for <em>both</em> tiles (this is the part most people get wrong for <code>B</code>), guards on loads (writing 0) and on the final store, and both barriers present. Host-side skeleton: <code>cudaMalloc</code> → <code>cudaMemcpy</code> H→D → launch with grid \(\lceil N/T\rceil \times \lceil N/T\rceil\), block \(T\times T\) → <code>cudaMemcpy</code> D→H → compare with tolerance ~1e-3 (fp32 summation order differs).</p></div>
+</div>
+
+<h2 id="warp-shuffle">2.6b Warp-level reductions (shuffles)</h2>
+<p>Threads of a warp can read each other's registers directly with shuffle intrinsics — no shared memory, no barrier. The workhorse is <code>__shfl_xor_sync(mask, v, offset)</code>: each lane receives <code>v</code> from the lane whose index differs by XOR <code>offset</code>. A butterfly over offsets 16, 8, 4, 2, 1 reduces across all 32 lanes in 5 steps, leaving the result in <em>every</em> lane:</p>
+<pre><code>__device__ float warp_max(float v) {
+    for (int off = 16; off &gt; 0; off &gt;&gt;= 1)
+        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off));
+    return v;                       // all 32 lanes now hold the warp max
+}
+__device__ float warp_sum(float v) {
+    for (int off = 16; off &gt; 0; off &gt;&gt;= 1)
+        v += __shfl_xor_sync(0xffffffffu, v, off);
+    return v;
+}
+</code></pre>
+<p>Real FlashAttention-2 uses exactly these to compute row maxes and row sums when one attention row is spread across the lanes of a warp. Our teaching kernel in Chapter 5 assigns a whole row to one thread (so reductions are plain loops), then §5.9 shows where shuffles enter.</p>
+
+<div class="quiz" data-concept="ch2.html#warp-shuffle" data-concept-label="§2.6b Warp shuffles">
+  <div class="q-text"><p>Write <code>warp_sum</code> from memory and explain why the XOR-butterfly pattern leaves the correct total in <em>all</em> 32 lanes after exactly 5 steps.</p></div>
+  <div class="hint">After the <code>off=16</code> step, lane \(i\) holds the sum of lanes \(i\) and \(i\oplus 16\). What invariant holds after each subsequent step?</div>
+  <div class="answer"><p>Code above. Invariant: after processing offset \(2^k\), every lane holds the sum over all lanes that agree with it on bit positions below the ones processed — i.e. after offsets 16,8,4,2,1 each lane has summed over all 32 lanes (each step doubles the group size: 2, 4, 8, 16, 32). Since every lane performs the same combine, all lanes end with the full sum, which is exactly what you want when every lane needs the softmax denominator.</p></div>
+</div>
+
+<h2 id="occupancy">2.7 Occupancy, registers, and the shared-memory budget</h2>
+<p>An SM can host multiple resident blocks simultaneously, which is where latency-hiding parallelism comes from — but only if the blocks <em>fit</em>. Three budgets are shared by all resident blocks of an SM:</p>
+<ul>
+  <li><strong>Threads:</strong> max ~1024–2048 resident threads per SM.</li>
+  <li><strong>Registers:</strong> 65,536 per SM. A 256-thread block whose threads use 128 registers each consumes 32K registers — only 2 such blocks fit. Exceed 255 registers per thread and the compiler <strong>spills</strong> to (slow, HBM-backed) "local memory".</li>
+  <li><strong>Shared memory:</strong> the per-SM pool (§2.3 table). One important quirk: a kernel using <em>statically declared</em> <code>__shared__</code> arrays is limited to <strong>48 KB</strong> per block for portability; to use more you must allocate it dynamically and opt in with <code>cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes)</code>. Real FlashAttention-2 does this; our teaching kernel stays under 48 KB.</li>
+</ul>
+<p><strong>Occupancy</strong> = resident warps ÷ maximum resident warps. Low occupancy is fine for compute-saturated kernels but deadly for memory-heavy ones, which need many warps in flight to hide HBM latency. Equally important at a larger scale: the <em>grid</em> must contain enough blocks to feed every SM — a grid of 8 blocks on a 108-SM A100 leaves 100 SMs idle no matter how good the kernel is. Hold that thought for §4.5.</p>
+
+<div class="quiz" data-concept="ch2.html#occupancy" data-concept-label="§2.7 Occupancy and budgets">
+  <div class="q-text"><p>A kernel uses two <code>__shared__</code> arrays of <code>float[64][64]</code> each and runs blocks of 64 threads using ~180 registers per thread. (a) How much shared memory per block? (b) Does it satisfy the static limit? (c) On an SM with 64 KB of shared memory and 65,536 registers, how many blocks can be resident, and which resource binds? </p></div>
+  <div class="hint">One <code>float[64][64]</code> = 64·64·4 bytes.</div>
+  <div class="answer"><p>(a) Each array is 16 KB → 32 KB per block. (b) Yes, 32 KB ≤ 48 KB static limit. (c) Shared memory allows ⌊64/32⌋ = 2 blocks; registers need 64·180 ≈ 11.5K per block, allowing 5 — so <strong>shared memory binds at 2 resident blocks</strong> (128 threads = 4 warps resident: low occupancy, acceptable only because each thread does a lot of independent work). These are precisely the numbers of the Chapter 5 kernel.</p></div>
+</div>
+
+<div class="box recall-pause"><div class="box-title">Before moving on — closed-book check</div>
+Say out loud: warp size and what lockstep implies; the four memory levels with rough sizes/bandwidths; the coalescing rule; the load–sync–compute–sync rhythm and what each barrier prevents; why tiling reduces traffic by the tile size; the 48 KB static shared-memory rule. Then — most importantly — make sure you actually wrote the tiled matmul. It is the single best predictor of success in Chapter 5.
+</div>
+
+</main>
+</body>
+</html>

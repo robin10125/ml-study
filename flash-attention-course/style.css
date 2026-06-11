@@ -1,0 +1,273 @@
+/* Flash Attention course — shared styles */
+:root {
+  --accent: #e8590c;
+  --accent-soft: #fff0e6;
+  --ink: #1f2430;
+  --ink-soft: #4b5363;
+  --paper: #fdfcfa;
+  --card: #ffffff;
+  --line: #e3e0da;
+  --code-bg: #14161f;
+  --code-ink: #e6e6ef;
+  --hint-bg: #fff8e1;
+  --hint-line: #f0c419;
+  --answer-bg: #eef7ee;
+  --answer-line: #3d8b40;
+  --def-bg: #eef3fb;
+  --def-line: #3b6fc4;
+  --warn-bg: #fdeeee;
+  --warn-line: #c0392b;
+  --recall-bg: #f6efff;
+  --recall-line: #7d4dc4;
+}
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 16.5px;
+  line-height: 1.65;
+  color: var(--ink);
+  background: var(--paper);
+}
+
+/* ---------- layout: sidebar + content ---------- */
+#sidebar {
+  position: fixed;
+  top: 0; left: 0; bottom: 0;
+  width: 270px;
+  background: #191d27;
+  color: #c9cedb;
+  padding: 1.2rem 1rem 2rem;
+  overflow-y: auto;
+  font-size: 0.88rem;
+}
+#sidebar .brand {
+  font-weight: 700;
+  font-size: 1.02rem;
+  color: #fff;
+  text-decoration: none;
+  display: block;
+  margin-bottom: 0.2rem;
+}
+#sidebar .brand .bolt { color: var(--accent); }
+#sidebar .tagline { font-size: 0.78rem; color: #8a90a0; margin-bottom: 1rem; }
+#sidebar a.chap {
+  display: block;
+  color: #c9cedb;
+  text-decoration: none;
+  padding: 0.42rem 0.6rem;
+  border-radius: 6px;
+  margin: 2px 0;
+}
+#sidebar a.chap:hover { background: #262c3b; color: #fff; }
+#sidebar a.chap.current { background: var(--accent); color: #fff; font-weight: 600; }
+#sidebar .prog { font-size: 0.72rem; color: #8a90a0; margin-left: 0.6rem; }
+
+main {
+  margin-left: 270px;
+  padding: 2.5rem 3rem 5rem;
+  max-width: 950px;
+}
+
+@media (max-width: 900px) {
+  #sidebar { position: static; width: auto; bottom: auto; }
+  main { margin-left: 0; padding: 1.2rem; }
+}
+
+/* ---------- typography ---------- */
+h1 { font-size: 1.9rem; line-height: 1.25; margin: 0 0 0.3rem; }
+h1 .chapno { color: var(--accent); }
+h2 {
+  font-size: 1.35rem;
+  margin-top: 2.6rem;
+  padding-bottom: 0.3rem;
+  border-bottom: 2px solid var(--line);
+}
+h3 { font-size: 1.1rem; margin-top: 1.8rem; }
+.subtitle { color: var(--ink-soft); margin-bottom: 1.5rem; font-size: 1.02rem; }
+a { color: #b4490a; }
+strong { color: #000; }
+table { border-collapse: collapse; margin: 1rem 0; font-size: 0.93rem; }
+th, td { border: 1px solid var(--line); padding: 0.45rem 0.8rem; text-align: left; }
+th { background: #f3f1ec; }
+hr { border: none; border-top: 1px solid var(--line); margin: 2.5rem 0; }
+
+/* ---------- code ---------- */
+pre {
+  background: var(--code-bg);
+  color: var(--code-ink);
+  padding: 1rem 1.2rem;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+code {
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+}
+p code, li code, td code, .q-text code, .hint code, .answer code {
+  background: #efece6;
+  color: #8a3408;
+  padding: 0.08rem 0.32rem;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+pre code { background: none; color: inherit; padding: 0; font-size: inherit; }
+
+/* ---------- callout boxes ---------- */
+.box { border-radius: 8px; padding: 0.9rem 1.2rem; margin: 1.3rem 0; border-left: 5px solid; }
+.box .box-title { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 0.3rem; }
+.definition { background: var(--def-bg); border-color: var(--def-line); }
+.definition .box-title { color: var(--def-line); }
+.warning { background: var(--warn-bg); border-color: var(--warn-line); }
+.warning .box-title { color: var(--warn-line); }
+.keypoint { background: var(--accent-soft); border-color: var(--accent); }
+.keypoint .box-title { color: var(--accent); }
+.recall-pause { background: var(--recall-bg); border-color: var(--recall-line); }
+.recall-pause .box-title { color: var(--recall-line); }
+
+/* ---------- quiz / active recall ---------- */
+.quiz {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-left: 5px solid var(--recall-line);
+  border-radius: 8px;
+  padding: 1rem 1.3rem 1.1rem;
+  margin: 1.6rem 0;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+.quiz .q-label {
+  font-weight: 700;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--recall-line);
+  margin-bottom: 0.4rem;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+.quiz .q-text { margin-bottom: 0.6rem; }
+.quiz .q-controls { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.7rem; }
+.quiz button, .quiz .concept-link {
+  font-size: 0.82rem;
+  padding: 0.32rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: #f6f4f0;
+  color: var(--ink);
+  cursor: pointer;
+  text-decoration: none;
+  font-family: inherit;
+}
+.quiz button:hover, .quiz .concept-link:hover { background: #ece9e2; }
+.quiz button.hint-btn { border-color: var(--hint-line); }
+.quiz button.answer-btn { border-color: var(--answer-line); }
+.quiz button.answer-btn.confirming { background: var(--hint-bg); font-style: italic; }
+.quiz .concept-link { border-color: var(--def-line); color: var(--def-line); }
+.quiz .hint {
+  display: none;
+  background: var(--hint-bg);
+  border-left: 4px solid var(--hint-line);
+  border-radius: 6px;
+  padding: 0.6rem 0.9rem;
+  margin: 0.6rem 0;
+  font-size: 0.95rem;
+}
+.quiz .hint.shown { display: block; }
+.quiz .answer {
+  display: none;
+  background: var(--answer-bg);
+  border-left: 4px solid var(--answer-line);
+  border-radius: 6px;
+  padding: 0.7rem 1rem;
+  margin: 0.7rem 0 0.2rem;
+}
+.quiz .answer.shown { display: block; }
+.quiz .answer .ans-label { font-weight: 700; color: var(--answer-line); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; }
+.quiz label.gotit {
+  font-size: 0.82rem;
+  color: var(--ink-soft);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  cursor: pointer;
+  margin-left: auto;
+}
+
+/* ---------- progress bar ---------- */
+#page-progress {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.6rem 1rem;
+  margin: 1.2rem 0 2rem;
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+}
+#page-progress .bar-outer {
+  background: #ece9e2;
+  border-radius: 999px;
+  height: 9px;
+  margin-top: 0.4rem;
+  overflow: hidden;
+}
+#page-progress .bar-inner {
+  background: var(--accent);
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  transition: width 0.3s;
+}
+
+/* ---------- prev / next nav ---------- */
+.pagenav {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 3.5rem;
+  gap: 1rem;
+}
+.pagenav a {
+  flex: 1;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.8rem 1rem;
+  text-decoration: none;
+  color: var(--ink);
+  background: var(--card);
+}
+.pagenav a:hover { border-color: var(--accent); }
+.pagenav a .dir { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-soft); }
+.pagenav a.next { text-align: right; }
+
+/* ---------- index dashboard ---------- */
+.dash-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.55rem 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 0.95rem;
+}
+.dash-row .dash-title { flex: 1; }
+.dash-row .dash-bar { width: 220px; background: #ece9e2; border-radius: 999px; height: 9px; overflow: hidden; }
+.dash-row .dash-fill { background: var(--accent); height: 100%; border-radius: 999px; }
+.dash-row .dash-count { width: 70px; text-align: right; color: var(--ink-soft); font-size: 0.85rem; }
+
+/* ---------- misc ---------- */
+.fig {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 1rem 1.2rem;
+  margin: 1.3rem 0;
+}
+.fig pre { background: #f6f4f0; color: var(--ink); border: none; font-size: 0.8rem; }
+.fig .caption { font-size: 0.85rem; color: var(--ink-soft); margin-top: 0.4rem; }
+.katex { font-size: 1.05em; }
+.katex-display { overflow-x: auto; overflow-y: hidden; padding: 0.2rem 0; }

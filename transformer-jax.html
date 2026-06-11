@@ -1,0 +1,1010 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>A Transformer from Scratch in JAX — an active-recall course</title>
+<style>
+  :root {
+    --bg: #faf9f7;
+    --card: #ffffff;
+    --ink: #2b2b33;
+    --muted: #6e6e7a;
+    --accent: #1a7f6b;
+    --accent-soft: #e4f3ef;
+    --good: #2e9e5b;
+    --good-soft: #e7f6ed;
+    --bad: #c94f4f;
+    --bad-soft: #fbeaea;
+    --border: #e3e1dc;
+    --code: #f0eee9;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    line-height: 1.6;
+    font-size: 17px;
+  }
+  main { max-width: 820px; margin: 0 auto; padding: 2rem 1.2rem 6rem; }
+  h1 { font-size: 2rem; line-height: 1.2; margin-bottom: 0.3rem; }
+  h2 { font-size: 1.4rem; margin-top: 0; }
+  h3 { font-size: 1.1rem; }
+  .subtitle { color: var(--muted); margin-top: 0; }
+  .formula {
+    font-family: "Georgia", serif;
+    font-size: 1.1em;
+    background: var(--code);
+    padding: 0.5rem 0.9rem;
+    border-radius: 8px;
+    display: inline-block;
+    margin: 0.4rem 0;
+  }
+  code { background: var(--code); padding: 0.1em 0.35em; border-radius: 4px; font-size: 0.9em; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  pre {
+    background: #232330; color: #e8e8f0;
+    padding: 1rem 1.2rem; border-radius: 10px;
+    overflow-x: auto; font-size: 0.82rem; line-height: 1.55;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  pre code { background: none; padding: 0; color: inherit; font-size: inherit; }
+  section.lesson {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 1.6rem 1.8rem;
+    margin: 1.6rem 0;
+  }
+  .section-head { display: flex; align-items: baseline; gap: 0.7rem; }
+  .section-num {
+    font-size: 0.8rem; font-weight: 700; letter-spacing: 0.08em;
+    color: var(--accent); text-transform: uppercase;
+  }
+  .lock-note { display: none; color: var(--muted); font-size: 0.95rem; font-style: italic; margin: 0.5rem 0 0; }
+  section.locked .lock-note { display: block; }
+  section.locked .section-body {
+    filter: blur(6px); pointer-events: none; user-select: none;
+    max-height: 220px; overflow: hidden; opacity: 0.55;
+  }
+  .recall, .numcheck, .mcq {
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--accent);
+    border-radius: 10px;
+    padding: 1rem 1.2rem;
+    margin: 1.2rem 0;
+    background: #fdfdfc;
+  }
+  .prompt { font-weight: 600; margin-top: 0; }
+  .prompt .tag {
+    font-size: 0.7rem; font-weight: 700; letter-spacing: 0.07em;
+    color: var(--accent); background: var(--accent-soft);
+    padding: 0.15em 0.6em; border-radius: 99px;
+    vertical-align: middle; margin-right: 0.5em; text-transform: uppercase;
+  }
+  textarea {
+    width: 100%; min-height: 84px; resize: vertical;
+    font: inherit; font-size: 0.95rem;
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 0.6rem 0.8rem; background: #fff;
+  }
+  .recall.codeex textarea {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.84rem; min-height: 190px; background: #fcfcf6;
+    tab-size: 4;
+  }
+  textarea:focus, input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+  button {
+    font: inherit; font-size: 0.92rem; font-weight: 600;
+    border: none; border-radius: 8px;
+    padding: 0.5rem 1.1rem; cursor: pointer;
+    background: var(--accent); color: #fff;
+    margin-top: 0.6rem;
+  }
+  button:disabled { background: #c2cfcb; cursor: not-allowed; }
+  button.secondary { background: #fff; color: var(--accent); border: 1px solid var(--accent); }
+  button.ghost { background: transparent; color: var(--muted); border: 1px dashed var(--border); }
+  .gate-hint { font-size: 0.82rem; color: var(--muted); margin: 0.3rem 0 0; }
+  .answer {
+    display: none;
+    margin-top: 1rem; padding: 0.9rem 1.1rem;
+    background: var(--good-soft);
+    border-radius: 8px;
+    border-left: 4px solid var(--good);
+    font-size: 0.97rem;
+  }
+  .answer.shown { display: block; }
+  .answer .label { font-weight: 700; color: var(--good); font-size: 0.8rem; letter-spacing: 0.06em; text-transform: uppercase; }
+  .answer ul.checklist { padding-left: 1.2rem; }
+  .answer ul.checklist li { margin: 0.25rem 0; }
+  .numcheck input[type=text] {
+    font: inherit; width: 150px;
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 0.45rem 0.7rem;
+  }
+  .feedback { margin-top: 0.6rem; font-size: 0.95rem; font-weight: 600; }
+  .feedback.ok { color: var(--good); }
+  .feedback.no { color: var(--bad); }
+  .hintbox {
+    display: none; margin-top: 0.7rem; padding: 0.7rem 1rem;
+    background: var(--accent-soft); border-radius: 8px; font-size: 0.93rem;
+  }
+  .hintbox.shown { display: block; }
+  .mcq .opt {
+    display: block; width: 100%; text-align: left;
+    background: #fff; color: var(--ink);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 0.6rem 0.9rem; margin-top: 0.55rem; font-weight: 500;
+  }
+  .mcq .opt:hover:not(:disabled) { border-color: var(--accent); }
+  .mcq .opt.right { background: var(--good-soft); border-color: var(--good); }
+  .mcq .opt.wrong { background: var(--bad-soft); border-color: var(--bad); }
+  .nudge {
+    display: none; margin-top: 0.7rem; padding: 0.7rem 1rem;
+    background: var(--bad-soft); border-left: 4px solid var(--bad);
+    border-radius: 8px; font-size: 0.93rem;
+  }
+  .nudge.shown { display: block; }
+  .muted { color: var(--muted); font-size: 0.93rem; }
+  #rope-canvas { width: 100%; border: 1px solid var(--border); border-radius: 10px; background: #fff; }
+  .sliders { display: flex; gap: 2rem; flex-wrap: wrap; margin-top: 0.8rem; }
+  .sliders label { font-size: 0.9rem; font-weight: 600; }
+  .sliders input[type=range] { width: 220px; accent-color: var(--accent); display: block; }
+  #rope-readout {
+    font-family: Georgia, serif; font-size: 1.1rem; margin-top: 0.8rem;
+    padding: 0.6rem 1rem; background: var(--code); border-radius: 8px;
+    display: inline-block;
+  }
+  #progress {
+    position: sticky; top: 0; z-index: 5;
+    background: var(--bg);
+    padding: 0.6rem 0; margin-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border);
+    display: flex; gap: 0.4rem; flex-wrap: wrap;
+    font-size: 0.76rem; font-weight: 600;
+  }
+  #progress span { padding: 0.2em 0.7em; border-radius: 99px; background: #eceae5; color: var(--muted); }
+  #progress span.open { background: var(--accent-soft); color: var(--accent); }
+  table.cfg { border-collapse: collapse; font-size: 0.9rem; margin: 0.6rem 0; }
+  table.cfg td, table.cfg th { border: 1px solid var(--border); padding: 0.3rem 0.8rem; text-align: left; }
+  table.cfg th { background: var(--code); }
+</style>
+</head>
+<body>
+<main>
+
+<div id="progress">
+  <span id="pn-s0" class="open">0 Warm-up</span>
+  <span id="pn-s1">1 JAX &amp; skeleton</span>
+  <span id="pn-s2">2 RMSNorm</span>
+  <span id="pn-s3">3 RoPE</span>
+  <span id="pn-s4">4 GQA attention</span>
+  <span id="pn-s5">5 Dense &amp; MoE</span>
+  <span id="pn-s6">6 Loss &amp; training</span>
+  <span id="pn-s7">7 Synthesis</span>
+</div>
+
+<h1>A Transformer from Scratch in JAX</h1>
+<p class="subtitle">GQA attention · RoPE · SwiGLU dense + Mixture-of-Experts · cross-entropy loss · the full training loop. Same rules as the KL course: every reference implementation is locked behind your own attempt. You will write each component <em>before</em> you see it. Expect 2–3 sessions. Keep a Python file open beside this page and actually run your code as you go — <code>pip install jax</code> is all you need.</p>
+
+<!-- ============================ SECTION 0 ============================ -->
+<section class="lesson" id="s0">
+  <div class="section-head"><span class="section-num">Part 0</span><h2>Warm-up: dump your brain</h2></div>
+  <div class="section-body">
+    <p>Before anything: sketch what you already believe a decoder-only transformer looks like, end to end. Token ids go in, a loss comes out — what happens in between? Name every component you can, even vaguely ("some kind of normalization somewhere?"). Also jot what you know about JAX, GQA, RoPE, and MoE — guesses welcome.</p>
+    <div class="recall">
+      <p class="prompt"><span class="tag">Free recall</span>The whole pipeline, as you currently understand it. What are the pieces? In what order? What do "GQA", "RoPE", "MoE" stand for and do?</p>
+      <textarea id="warmup-ta" placeholder="Nobody is grading this. Section 1 unlocks when you've written enough to expose your current mental model."></textarea>
+      <p class="gate-hint" id="warmup-gate">Keep writing… (section 1 unlocks at 80 characters)</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ SECTION 1 ============================ -->
+<section class="lesson locked" id="s1">
+  <div class="section-head"><span class="section-num">Part 1</span><h2>The JAX mental model &amp; the skeleton</h2></div>
+  <p class="lock-note">🔒 Locked — finish the warm-up first.</p>
+  <div class="section-body">
+    <p>We build with <strong>no framework</strong> — no Flax, no Haiku. Just <code>jax.numpy</code> functions and plain Python dicts of arrays. This forces the two ideas that make JAX <em>JAX</em>:</p>
+    <ol>
+      <li><strong>Functions are pure.</strong> A model is not an object with hidden state; it is a function <code>forward(params, tokens) → logits</code>. All state — every weight — enters through the front door as an argument. Parameters live in a <em>pytree</em>: a nested structure of dicts/lists with arrays at the leaves. JAX transformations (<code>grad</code>, <code>jit</code>, <code>vmap</code>) operate on whole pytrees transparently.</li>
+      <li><strong>Randomness is explicit.</strong> No global seed. You hold a PRNG <code>key</code>, and you <code>jax.random.split(key)</code> every time you need fresh randomness. Same key in, same numbers out, always.</li>
+    </ol>
+
+    <div class="mcq" data-milestone="mcq-pure">
+      <p class="prompt"><span class="tag">Check 1.1</span>Suppose you hide the weights in a Python object and mutate them in-place inside a method, then wrap that method in <code>@jax.jit</code>. What actually goes wrong?</p>
+      <button class="opt" data-nudge="JAX won't crash — that's the trap. It will run, silently doing the wrong thing. Think about what jit does on the FIRST call: it traces the Python code once to build a computation graph. What happens to values that aren't arguments?">JAX raises an error: mutation is forbidden</button>
+      <button class="opt" data-correct="1">jit traces the function once; the hidden weights get baked in as constants and later in-place updates are silently ignored</button>
+      <button class="opt" data-nudge="Speed isn't the issue. The issue is correctness: trace-time vs run-time. When jit traces your Python, which values become part of the compiled graph and which stay live?">It works but recompiles every step, so it's just slow</button>
+      <div class="nudge"></div>
+      <div class="answer">
+        <span class="label">Correct</span>
+        <p><code>jit</code> runs your Python <em>once</em> with abstract tracer values and compiles the result. Anything not passed as an argument is captured at trace time and frozen. Your "training" would compute gradients against the initial weights forever. This single fact explains the entire JAX style: <strong>params go in as arguments, updated params come out as return values.</strong> Nothing is ever mutated.</p>
+      </div>
+    </div>
+
+    <div class="recall">
+      <p class="prompt"><span class="tag">Recall 1.2</span>From your warm-up sketch (improve it now): list the stages a batch of token ids passes through in a modern decoder-only transformer, in order, from <code>tokens</code> to <code>logits</code>. Include where normalization happens and what the "residual stream" means.</p>
+      <textarea placeholder="tokens → … → … → logits"></textarea>
+      <button disabled data-reveal>Reveal</button>
+      <p class="gate-hint">Reveal unlocks after a genuine attempt (60+ characters).</p>
+      <div class="answer">
+        <span class="label">The skeleton we will build</span>
+<pre><code>tokens (B, T) ints
+  └─ embedding lookup ──────────────► x: (B, T, d_model)   "the residual stream"
+       repeat × n_layers:
+         x = x + Attention( RMSNorm(x) )     # GQA + RoPE inside
+         x = x + FFN( RMSNorm(x) )           # SwiGLU dense, or MoE
+  └─ final RMSNorm
+  └─ unembed (tied with embedding) ─► logits: (B, T, vocab)</code></pre>
+        <p>Two things to internalize. First, <strong>the residual stream is the spine</strong>: every block reads from it (through a norm) and <em>adds</em> its contribution back. Gradients flow unimpeded through the additions, which is why 100-layer transformers train at all. Second, this is <strong>pre-norm</strong>: normalize the <em>input</em> of each sub-block, not its output — empirically far more stable than the original post-norm arrangement.</p>
+        <p>Our fixed configuration for the whole course (memorize it; every shape drill uses it):</p>
+        <table class="cfg">
+          <tr><th>vocab</th><th>d_model</th><th>n_layers</th><th>n_heads</th><th>head_dim</th><th>n_kv_heads</th><th>d_ff</th><th>experts E</th><th>top_k</th><th>B</th><th>T</th></tr>
+          <tr><td>32000</td><td>512</td><td>6</td><td>8</td><td>64</td><td>2</td><td>1408</td><td>8</td><td>2</td><td>8</td><td>128</td></tr>
+        </table>
+        <p class="muted">Layers alternate: even layers use the dense SwiGLU FFN, odd layers use MoE. head_dim = d_model / n_heads = 64.</p>
+      </div>
+    </div>
+
+    <p><strong>Shape drills.</strong> Fluency with shapes is half of implementing a transformer. No revealing — compute these.</p>
+
+    <div class="numcheck" data-answer="16384000" data-tol="0.5" data-milestone="num-embed">
+      <p class="prompt"><span class="tag">Drill 1.3</span>How many parameters are in the embedding table? (A number. No commas.)</p>
+      <input type="text" placeholder="count"> <button data-check>Check</button>
+      <button class="secondary" data-hintbtn style="display:none">Hint</button>
+      <button class="ghost" data-giveup style="display:none">Reveal</button>
+      <div class="hintbox">The embedding maps each of the <code>vocab</code> token ids to a vector of size <code>d_model</code>. It's one matrix.</div>
+      <div class="feedback"></div>
+      <div class="answer"><span class="label">Answer</span><p>vocab × d_model = 32000 × 512 = <strong>16,384,000</strong>. With weight tying (we reuse this matrix transposed as the unembedding), it's the single biggest tensor in our small model — worth knowing.</p></div>
+    </div>
+
+    <div class="numcheck" data-answer="128" data-tol="0.5" data-milestone="num-wk">
+      <p class="prompt"><span class="tag">Drill 1.4</span>In GQA, the key projection is a matrix <code>W_K</code> of shape <code>(d_model, ?)</code>. What is the second dimension? (Careful: keys belong to the <em>KV</em> heads, not the query heads.)</p>
+      <input type="text" placeholder="?"> <button data-check>Check</button>
+      <button class="secondary" data-hintbtn style="display:none">Hint</button>
+      <button class="ghost" data-giveup style="display:none">Reveal</button>
+      <div class="hintbox">Each KV head produces a key vector of size <code>head_dim</code>. How many KV heads are there in our config?</div>
+      <div class="feedback"></div>
+      <div class="answer"><span class="label">Answer</span><p>n_kv_heads × head_dim = 2 × 64 = <strong>128</strong>. Compare: <code>W_Q</code> is (512, 8×64) = (512, 512). The K and V projections are 4× smaller than in standard multi-head attention — this asymmetry <em>is</em> GQA, and you'll see why it matters in Part 4.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ SECTION 2 ============================ -->
+<section class="lesson locked" id="s2">
+  <div class="section-head"><span class="section-num">Part 2</span><h2>RMSNorm: the smallest real component</h2></div>
+  <p class="lock-note">🔒 Locked — finish the check and both drills in Part 1.</p>
+  <div class="section-body">
+    <p>Before every attention and FFN block, we normalize the residual stream. Modern models (Llama, Mistral, &amp;c.) use <strong>RMSNorm</strong>, a stripped-down LayerNorm: no mean subtraction, no bias — just divide each token's vector by its root-mean-square, then scale by a learned per-dimension gain <code>γ</code>.</p>
+    <p class="formula">y = x / RMS(x) · γ, &nbsp; where RMS(x) = √( mean(x²) + ε )</p>
+
+    <div class="numcheck" data-answer="1.13" data-tol="0.01" data-milestone="num-rms">
+      <p class="prompt"><span class="tag">Compute 2.1</span>By hand: x = [3, 4], γ = [1, 1], ignore ε. What is the <em>second</em> component of RMSNorm(x)? (2 dp)</p>
+      <input type="text" placeholder="2 dp"> <button data-check>Check</button>
+      <button class="secondary" data-hintbtn style="display:none">Hint</button>
+      <button class="ghost" data-giveup style="display:none">Reveal</button>
+      <div class="hintbox">mean(x²) = (9 + 16) / 2 = 12.5. Now take the square root, then divide.</div>
+      <div class="feedback"></div>
+      <div class="answer"><span class="label">Answer</span><p>RMS = √12.5 ≈ 3.536, so y₂ = 4 / 3.536 ≈ <strong>1.13</strong>. Notice the output vector always has RMS ≈ 1 (before γ): the block downstream always sees inputs at a predictable scale, no matter how large the residual stream has grown.</p></div>
+    </div>
+
+    <div class="recall codeex" data-milestone="code-rms" data-min="80">
+      <p class="prompt"><span class="tag">Code 2.2</span>Write <code>rms_norm(x, gamma, eps=1e-6)</code> in jax.numpy. It must work for <code>x</code> of shape <code>(B, T, d)</code>, normalizing over the last axis only. Think: which axis, and what keeps the broadcast working?</p>
+      <textarea spellcheck="false" placeholder="def rms_norm(x, gamma, eps=1e-6):
+    ..."></textarea>
+      <button disabled data-reveal>Compare with reference</button>
+      <p class="gate-hint">Write a real attempt first (80+ characters). Better: run it on a random (2, 3, 4) array and check the output's RMS is ≈ 1.</p>
+      <div class="answer">
+        <span class="label">Reference</span>
+<pre><code>def rms_norm(x, gamma, eps=1e-6):
+    ms = jnp.mean(x * x, axis=-1, keepdims=True)      # (B, T, 1)
+    return x * jax.lax.rsqrt(ms + eps) * gamma        # broadcast over d</code></pre>
+        <p>Self-grade — your version must have:</p>
+        <ul class="checklist">
+          <li><code>axis=-1</code> (per-token, over features — not over the batch or time!)</li>
+          <li><code>keepdims=True</code> (or a manual <code>[..., None]</code>) so the division broadcasts</li>
+          <li>ε <em>inside</em> the square root, guarding against an all-zero token</li>
+          <li>γ multiplied last, shape <code>(d,)</code>, broadcasting over (B, T)</li>
+        </ul>
+        <p class="muted">Why no mean subtraction or bias? Empirically they buy nothing in transformers, and removing them is faster and simpler. The params for this layer are just γ, initialized to ones.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ SECTION 3 ============================ -->
+<section class="lesson locked" id="s3">
+  <div class="section-head"><span class="section-num">Part 3</span><h2>RoPE: positions as rotations</h2></div>
+  <p class="lock-note">🔒 Locked — finish the computation and code in Part 2.</p>
+  <div class="section-body">
+    <div class="recall">
+      <p class="prompt"><span class="tag">Recall 3.1</span>First justify the problem. Attention computes softmax(QKᵀ)·V. Why does this see "the cat sat" and "sat the cat" identically if we do nothing about position? Point at the exact mathematical property responsible.</p>
+      <textarea placeholder="What happens to the attention output if you permute the input tokens…"></textarea>
+      <button disabled data-reveal>Reveal</button>
+      <p class="gate-hint">Reveal unlocks after a genuine attempt (50+ characters).</p>
+      <div class="answer">
+        <span class="label">Answer</span>
+        <p>Every query–key score q<sub>i</sub>·k<sub>j</sub> depends only on the two token <em>vectors</em>, never on i or j. Permute the tokens and the score matrix permutes with them — attention is <strong>permutation-equivariant</strong>. A set, not a sequence. Position must be injected somewhere, and where you inject it matters.</p>
+        <p>The old answer: <em>add</em> a position vector to each embedding. RoPE's answer: <em>rotate</em> each query and key by an angle proportional to its position. Pair up the dimensions of q and k — (q₀,q₁), (q₂,q₃), … — treat each pair as a point in a 2-D plane, and rotate pair <em>i</em> of the token at position <em>m</em> by angle m·θᵢ.</p>
+      </div>
+    </div>
+
+    <p>Why rotation specifically? Play with this. Two vectors q (green) and k (gray) start identical; the sliders set their positions m and n, each rotated by position × 45°. Watch the dot product.</p>
+    <canvas id="rope-canvas" width="720" height="270"></canvas>
+    <div class="sliders">
+      <label>m (position of q): <span id="m-val">2</span>
+        <input type="range" id="m-slider" min="0" max="8" step="1" value="2">
+      </label>
+      <label>n (position of k): <span id="n-val">0</span>
+        <input type="range" id="n-slider" min="0" max="8" step="1" value="0">
+      </label>
+    </div>
+    <div id="rope-readout"></div>
+    <p class="muted">Experiment before answering: try (m=2, n=0), then (5, 3), then (8, 6). Then try changing the gap.</p>
+
+    <div class="numcheck" data-answer="0" data-tol="0.02" data-milestone="num-rope">
+      <p class="prompt"><span class="tag">Compute 3.2</span>q = k = [1, 0] before RoPE, with θ = 45° per position. q sits at position 7, k at position 5. After both are rotated, q·k = ? (Verify with the sliders — then make sure you can get it from a formula. What rule are you discovering?)</p>
+      <input type="text" placeholder="2 dp"> <button data-check>Check</button>
+      <button class="secondary" data-hintbtn style="display:none">Hint</button>
+      <button class="ghost" data-giveup style="display:none">Reveal</button>
+      <div class="hintbox">The dot product of two unit vectors is the cosine of the angle <em>between</em> them. q was rotated by 7·45°, k by 5·45°. What's the angle between them now?</div>
+      <div class="feedback"></div>
+      <div class="answer"><span class="label">Answer</span><p>cos((7−5)·45°) = cos 90° = <strong>0</strong>. The discovery: R(mθ)q · R(nθ)k = q·k rotated by (m−n)θ — the score depends only on the <strong>relative</strong> offset m−n, never on absolute position. That is RoPE's entire point: you inject position multiplicatively into Q and K, and attention scores automatically become relative-position-aware. A pair of tokens 2 apart looks the same at the start of the document and at the end.</p>
+      <p>Each dimension-pair i gets its own θᵢ = base<sup>−2i/d</sup> (base = 10000): pair 0 spins fast (resolves adjacent tokens), the last pairs spin glacially (resolve document-scale distances). Like the hands of a clock — second, minute, hour — together they encode position at every scale.</p></div>
+    </div>
+
+    <div class="mcq" data-milestone="mcq-rope-v">
+      <p class="prompt"><span class="tag">Check 3.3</span>RoPE rotates Q and K but <strong>not V</strong>. Why is V left alone?</p>
+      <button class="opt" data-nudge="It would be perfectly differentiable — that's not the obstacle. Ask instead: what role does V play? Position should influence WHERE a token looks. Should it also corrupt WHAT gets retrieved?">Rotating V would break differentiability</button>
+      <button class="opt" data-correct="1">Position should affect only the attention <em>weights</em> (who attends to whom); V carries the content being retrieved, which shouldn't be scrambled by where it happened to sit</button>
+      <button class="opt" data-nudge="Cost is negligible — V is the same size as K. The reason is conceptual, about the division of labor between scores and values.">It would double the compute cost of attention</button>
+      <div class="nudge"></div>
+      <div class="answer">
+        <span class="label">Correct</span>
+        <p>Q·K decides the routing; V is the payload. Rotating V would mean the <em>same word</em> contributes different content depending on its absolute position — exactly the absolute-position dependence RoPE was designed to remove. Clean separation: position lives in the scores, content lives in the values.</p>
+      </div>
+    </div>
+
+    <div class="recall codeex" data-milestone="code-rope" data-min="150">
+      <p class="prompt"><span class="tag">Code 3.4</span>Two functions. <code>rope_freqs(head_dim, T)</code>: precompute <code>cos</code> and <code>sin</code> tables of shape <code>(T, head_dim/2)</code>, using θᵢ = 10000<sup>−2i/head_dim</sup>. <code>apply_rope(x, cos, sin)</code>: rotate <code>x</code> of shape <code>(B, T, H, head_dim)</code>, pairing dimension j with dimension j + head_dim/2 (the "half-split" convention Llama uses). Recall 2-D rotation: (a, b) → (a·cosφ − b·sinφ, a·sinφ + b·cosφ).</p>
+      <textarea spellcheck="false" placeholder="def rope_freqs(head_dim, T, base=10000.0):
+    ...
+
+def apply_rope(x, cos, sin):
+    ..."></textarea>
+      <button disabled data-reveal>Compare with reference</button>
+      <p class="gate-hint">Real attempt required (150+ chars). Test idea: apply_rope with position-0 tables (cos=1, sin=0) must return x unchanged.</p>
+      <div class="answer">
+        <span class="label">Reference</span>
+<pre><code>def rope_freqs(head_dim, T, base=10000.0):
+    inv_freq = 1.0 / (base ** (jnp.arange(0, head_dim, 2) / head_dim))  # (hd/2,)
+    angles = jnp.arange(T)[:, None] * inv_freq[None, :]                 # (T, hd/2)
+    return jnp.cos(angles), jnp.sin(angles)
+
+def apply_rope(x, cos, sin):
+    # x: (B, T, H, hd) — pair dim j with dim j + hd/2
+    x1, x2 = jnp.split(x, 2, axis=-1)
+    cos, sin = cos[None, :, None, :], sin[None, :, None, :]   # (1, T, 1, hd/2)
+    return jnp.concatenate([x1 * cos - x2 * sin,
+                            x1 * sin + x2 * cos], axis=-1)</code></pre>
+        <p>Self-grade:</p>
+        <ul class="checklist">
+          <li>Frequencies come from <code>arange(0, head_dim, 2) / head_dim</code> — exponents 0, 2/d, 4/d, … (a classic off-by-factor bug source)</li>
+          <li>Angle = position × inv_freq via an outer product → (T, hd/2)</li>
+          <li>The rotation formula has the minus sign on the <em>first</em> output half</li>
+          <li>cos/sin broadcast over batch <em>and</em> heads (two inserted axes)</li>
+          <li>Same tables applied to Q and K; V untouched</li>
+        </ul>
+        <p class="muted">There is also an "interleaved" pairing convention (dims 0&amp;1, 2&amp;3, …) — mathematically equivalent, but checkpoints are not interchangeable between conventions. Pick one, stay consistent.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ SECTION 4 ============================ -->
+<section class="lesson locked" id="s4">
+  <div class="section-head"><span class="section-num">Part 4</span><h2>Attention with GQA</h2></div>
+  <p class="lock-note">🔒 Locked — finish the compute, check, and code in Part 3.</p>
+  <div class="section-body">
+    <p>Standard multi-head attention (MHA) gives every one of the 8 query heads its own K and V. <strong>Grouped-Query Attention</strong> keeps all 8 query heads but shares each K/V pair among a <em>group</em> of them: our config has 2 KV heads, so 4 query heads share each one. (At the extremes: n_kv_heads = n_heads is MHA; n_kv_heads = 1 is MQA, multi-query attention.)</p>
+    <p>Why would anyone do this? Not for training speed. Reason it out:</p>
+
+    <div class="numcheck" data-answer="4" data-tol="0.01" data-milestone="num-gqa">
+      <p class="prompt"><span class="tag">Drill 4.1</span>At inference, a model caches K and V for every past token, layer by layer (the "KV cache" — usually the memory bottleneck for long contexts). By what factor does our GQA config shrink the KV cache versus full MHA?</p>
+      <input type="text" placeholder="factor"> <button data-check>Check</button>
+      <button class="secondary" data-hintbtn style="display:none">Hint</button>
+      <button class="ghost" data-giveup style="display:none">Reveal</button>
+      <div class="hintbox">Per token per layer, MHA caches 2 × n_heads × head_dim floats (K and V). GQA caches 2 × n_kv_heads × head_dim. Take the ratio.</div>
+      <div class="feedback"></div>
+      <div class="answer"><span class="label">Answer</span><p>n_heads / n_kv_heads = 8 / 2 = <strong>4×</strong> smaller. That's the entire motivation: 4× longer context in the same memory, 4× less cache bandwidth per decoded token — at a quality cost close to zero (queries stay diverse; it turns out keys/values tolerate sharing well).</p></div>
+    </div>
+
+    <div class="mcq" data-milestone="mcq-scale">
+      <p class="prompt"><span class="tag">Check 4.2</span>Scores are q·k / √head_dim. Why divide by √d<sub>k</sub>? What goes wrong without it?</p>
+      <button class="opt" data-nudge="Overflow isn't the issue at these magnitudes. Think statistically: if q and k have unit-variance entries, what's the variance of a dot product of d_k of them — and what does softmax do to inputs with a large spread?">It prevents numerical overflow in float32</button>
+      <button class="opt" data-correct="1">The dot product of d_k unit-variance terms has variance ≈ d_k; unscaled scores grow with √d_k, saturating softmax into near-one-hot outputs with vanishing gradients</button>
+      <button class="opt" data-nudge="It changes much more than a constant: softmax is nonlinear, so input scale changes the entire shape of the output distribution. What does softmax([10, 0, −10]) look like versus softmax([1, 0, −1])?">It's only a convention — softmax renormalizes anyway</button>
+      <div class="nudge"></div>
+      <div class="answer">
+        <span class="label">Correct</span>
+        <p>A sum of d<sub>k</sub> independent products has standard deviation ~√d<sub>k</sub>. With d<sub>k</sub>=64 that's scores spread ±8 instead of ±1: softmax saturates, the attention pattern becomes a frozen argmax, and gradients through it die. Dividing by √d<sub>k</sub> restores unit variance regardless of head size.</p>
+      </div>
+    </div>
+
+    <div class="mcq" data-milestone="mcq-mask">
+      <p class="prompt"><span class="tag">Check 4.3</span>Causal masking — token t must not see tokens after t. We set masked <em>scores</em> to −∞ <em>before</em> softmax. Why not the simpler-sounding option: zero out the masked attention <em>weights after</em> softmax?</p>
+      <button class="opt" data-nudge="Both are equally easy to write. The problem is mathematical: after zeroing some softmax outputs, what property of the remaining weights is broken?">Setting −∞ is easier to implement</button>
+      <button class="opt" data-nudge="Gradients flow fine through a multiply-by-zero. Check the weights themselves: softmax produced a distribution over ALL keys — if you zero half of it, what do the survivors sum to?">Zeroing after softmax blocks gradient flow</button>
+      <button class="opt" data-correct="1">Zeroing after softmax leaves weights that no longer sum to 1 — future tokens still stole probability mass; e<sup>−∞</sup> = 0 inside softmax keeps a proper distribution over only the visible tokens</button>
+      <div class="nudge"></div>
+      <div class="answer">
+        <span class="label">Correct</span>
+        <p>Softmax normalizes over everything it sees. Mask <em>before</em>, and the visible tokens renormalize among themselves to sum to 1; mask <em>after</em>, and a token attending 90% to the future ends up with weights summing to 0.1 — its output silently shrinks. In code: <code>jnp.where(mask, scores, -jnp.inf)</code> with <code>mask = jnp.tril(jnp.ones((T, T), bool))</code>. (Row 0 always has its own diagonal entry visible, so no row is ever fully −∞.)</p>
+      </div>
+    </div>
+
+    <div class="numcheck" data-answer="5" data-tol="0.05" data-milestone="num-attn">
+      <p class="prompt"><span class="tag">Compute 4.4</span>One query, by hand. After scaling and masking, a query sees two keys with scores [0, ln 3]. Their (1-D) values are v₁ = 2, v₂ = 6. What is the attention output?</p>
+      <input type="text" placeholder="number"> <button data-check>Check</button>
+      <button class="secondary" data-hintbtn style="display:none">Hint</button>
+      <button class="ghost" data-giveup style="display:none">Reveal</button>
+      <div class="hintbox">e⁰ = 1 and e<sup>ln 3</sup> = 3, so the softmax weights are [1/4, 3/4]. Now take the weighted sum of values.</div>
+      <div class="feedback"></div>
+      <div class="answer"><span class="label">Answer</span><p>weights = [0.25, 0.75]; output = 0.25·2 + 0.75·6 = <strong>5</strong>. Attention output is always a convex combination of value vectors — it can interpolate between what tokens say, never extrapolate beyond it.</p></div>
+    </div>
+
+    <div class="recall codeex" data-milestone="code-gqa" data-min="300">
+      <p class="prompt"><span class="tag">Code 4.5</span>The centerpiece. Write <code>gqa_attention(params, x, cos, sin, n_heads, n_kv_heads)</code> for <code>x: (B, T, d_model)</code>. Params: <code>wq (d, n_heads·hd)</code>, <code>wk, wv (d, n_kv_heads·hd)</code>, <code>wo (d, d)</code>. Steps you must get in the right order: project → reshape into heads → RoPE on q and k → expand KV heads to match query heads → scores with scaling → causal mask → softmax → weighted values → merge heads → output projection. Write it before peeking. Seriously.</p>
+      <textarea spellcheck="false" style="min-height:280px" placeholder="def gqa_attention(params, x, cos, sin, n_heads, n_kv_heads):
+    B, T, d = x.shape
+    ..."></textarea>
+      <button disabled data-reveal>Compare with reference</button>
+      <p class="gate-hint">300+ characters of genuine attempt. Test it: output shape must equal input shape, and with all-equal tokens every row of the attention pattern should be uniform over the visible prefix.</p>
+      <div class="answer">
+        <span class="label">Reference</span>
+<pre><code>def gqa_attention(params, x, cos, sin, n_heads, n_kv_heads):
+    B, T, d = x.shape
+    hd = d // n_heads
+
+    q = (x @ params['wq']).reshape(B, T, n_heads,    hd)
+    k = (x @ params['wk']).reshape(B, T, n_kv_heads, hd)
+    v = (x @ params['wv']).reshape(B, T, n_kv_heads, hd)
+
+    q = apply_rope(q, cos, sin)          # rotate q and k — never v
+    k = apply_rope(k, cos, sin)
+
+    rep = n_heads // n_kv_heads          # 4 query heads share each kv head
+    k = jnp.repeat(k, rep, axis=2)       # (B, T, n_heads, hd)
+    v = jnp.repeat(v, rep, axis=2)
+
+    q, k, v = (t.transpose(0, 2, 1, 3) for t in (q, k, v))   # (B, H, T, hd)
+
+    scores = q @ k.transpose(0, 1, 3, 2) / jnp.sqrt(hd)      # (B, H, T, T)
+    mask = jnp.tril(jnp.ones((T, T), dtype=bool))
+    scores = jnp.where(mask, scores, -jnp.inf)
+    att = jax.nn.softmax(scores, axis=-1)
+
+    out = (att @ v).transpose(0, 2, 1, 3).reshape(B, T, d)
+    return out @ params['wo']</code></pre>
+        <p>Self-grade:</p>
+        <ul class="checklist">
+          <li>K/V reshaped with <code>n_kv_heads</code>, Q with <code>n_heads</code> — the whole point of GQA</li>
+          <li>RoPE applied <em>after</em> the head reshape (per-head rotation), to q and k only</li>
+          <li>KV expanded with <code>jnp.repeat</code> on the <em>head</em> axis, by <code>n_heads // n_kv_heads</code></li>
+          <li>Scale by <code>√head_dim</code> (not √d_model — another classic bug)</li>
+          <li><code>-jnp.inf</code> masking before softmax; <code>tril</code> keeps the diagonal (a token sees itself)</li>
+          <li>Final transpose-reshape merges heads back to (B, T, d) <em>before</em> <code>wo</code></li>
+        </ul>
+        <p class="muted">Production note: explicitly materializing the repeated K/V wastes memory; real kernels (and <code>jax.nn.dot_product_attention</code>) handle grouping internally. For learning, <code>repeat</code> makes the semantics impossible to get wrong.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ SECTION 5 ============================ -->
+<section class="lesson locked" id="s5">
+  <div class="section-head"><span class="section-num">Part 5</span><h2>The FFN: SwiGLU dense, then Mixture-of-Experts</h2></div>
+  <p class="lock-note">🔒 Locked — finish all four exercises in Part 4.</p>
+  <div class="section-body">
+    <p>Attention moves information <em>between</em> positions; the FFN transforms each position <em>independently</em> — same function applied to every token vector. Modern models use <strong>SwiGLU</strong>: two parallel up-projections, one passed through SiLU and used to <em>gate</em> the other, then a down-projection:</p>
+    <p class="formula">FFN(x) = ( SiLU(x·W<sub>gate</sub>) ⊙ x·W<sub>up</sub> ) · W<sub>down</sub></p>
+    <p>with W<sub>gate</sub>, W<sub>up</sub>: (512, 1408) and W<sub>down</sub>: (1408, 512), SiLU(z) = z·σ(z). The multiplicative gate lets the network modulate features smoothly — empirically a consistent win over the plain ReLU MLP.</p>
+
+    <div class="recall codeex" data-milestone="code-swiglu" data-min="60">
+      <p class="prompt"><span class="tag">Code 5.1</span>Write <code>swiglu_ffn(params, x)</code>. Three matmuls, one activation, one elementwise product. (<code>jax.nn.silu</code> exists.)</p>
+      <textarea spellcheck="false" placeholder="def swiglu_ffn(params, x):
+    ..."></textarea>
+      <button disabled data-reveal>Compare with reference</button>
+      <p class="gate-hint">Attempt first (60+ characters).</p>
+      <div class="answer">
+        <span class="label">Reference</span>
+<pre><code>def swiglu_ffn(params, x):
+    return (jax.nn.silu(x @ params['w_gate']) * (x @ params['w_up'])) @ params['w_down']</code></pre>
+        <p>Check: SiLU on the <em>gate</em> branch only; the product happens in d_ff space (1408) before projecting back down.</p>
+      </div>
+    </div>
+
+    <h3>Mixture of Experts</h3>
+    <div class="recall">
+      <p class="prompt"><span class="tag">Recall 5.2</span>MoE replaces one FFN with E = 8 parallel FFNs ("experts") plus a tiny <em>router</em>, and each token is processed by only the top_k = 2 experts the router picks for it. Before reading on: what is the economic argument? What does MoE decouple that a dense network ties together? And predict one failure mode of letting a learned router choose freely.</p>
+      <textarea placeholder="What scales with E and what doesn't… and what could the router learn to do that's degenerate…"></textarea>
+      <button disabled data-reveal>Reveal</button>
+      <p class="gate-hint">Reveal unlocks after a genuine attempt (80+ characters).</p>
+      <div class="answer">
+        <span class="label">Answer</span>
+        <p><strong>The decoupling:</strong> parameter count scales with E, but FLOPs per token scale with top_k. Our MoE layer holds 8 experts' worth of knowledge but each token pays for 2. Dense networks force capacity and compute to grow in lockstep; MoE breaks the link — that's how trillion-parameter models run at billions-scale cost.</p>
+        <p><strong>The failure mode:</strong> rich-get-richer collapse. Early in training one expert is randomly slightly better → router sends it more tokens → it trains more, improves more → router sends it everything. You paid for 8 experts and trained 1, with 7 dead. Every practical MoE needs explicit pressure toward balanced routing — coming below.</p>
+      </div>
+    </div>
+
+    <div class="numcheck" data-answer="0.88" data-tol="0.01" data-milestone="num-router">
+      <p class="prompt"><span class="tag">Compute 5.3</span>The router is a single matrix (d_model, E): logits per expert, softmaxed. A token gets router logits [1.0, −1.0] over two experts. What probability goes to expert 1? (2 dp; e ≈ 2.718, e⁻¹ ≈ 0.368)</p>
+      <input type="text" placeholder="2 dp"> <button data-check>Check</button>
+      <button class="secondary" data-hintbtn style="display:none">Hint</button>
+      <button class="ghost" data-giveup style="display:none">Reveal</button>
+      <div class="hintbox">p₁ = e¹ / (e¹ + e⁻¹) = 2.718 / 3.086.</div>
+      <div class="feedback"></div>
+      <div class="answer"><span class="label">Answer</span><p>≈ <strong>0.88</strong>. These probabilities do double duty: they pick the top_k experts <em>and</em> weight the chosen experts' outputs when combining — which is what lets gradients flow back into the router.</p></div>
+    </div>
+
+    <div class="mcq" data-milestone="mcq-aux">
+      <p class="prompt"><span class="tag">Check 5.4</span>The standard fix for routing collapse is an auxiliary <strong>load-balancing loss</strong>, added to the main loss: L<sub>aux</sub> = E · Σ<sub>e</sub> f<sub>e</sub> · p<sub>e</sub>, where f<sub>e</sub> = fraction of tokens routed to expert e and p<sub>e</sub> = mean router probability for e. Why does minimizing this push toward <em>uniform</em> routing?</p>
+      <button class="opt" data-nudge="It's differentiable through the p_e factor (f_e is not differentiable, but p_e is — that's the trick of the product). The question is why its MINIMUM sits at uniform routing. Consider Σ f·p as a dot product of two distributions that track each other.">It can't work — top-k routing isn't differentiable</button>
+      <button class="opt" data-correct="1">Σ f<sub>e</sub>p<sub>e</sub> is minimized, for distributions that track each other, when both are uniform — any expert hogging tokens makes both its f and its p large, and their <em>product</em> punishes the concentration quadratically</button>
+      <button class="opt" data-nudge="It adds no randomness at all — it's a deterministic penalty. Look at the algebra: when is a sum of products f_e · p_e small, given both vectors sum to a constant?">It adds noise to the router so all experts get sampled</button>
+      <div class="nudge"></div>
+      <div class="answer">
+        <span class="label">Correct</span>
+        <p>If routing concentrates, some expert has both high f and high p, and f·p blows up; spreading mass minimizes the sum (for f ≈ p, Σf·p ≈ Σp² is minimized by uniform). The gradient flows through the differentiable p<sub>e</sub>, steering the router away from favorites. The E· prefactor normalizes so perfect balance gives L<sub>aux</sub> = 1 regardless of expert count. Weighted small (~0.01) — enough to keep experts alive, not enough to override learned specialization.</p>
+      </div>
+    </div>
+
+    <div class="recall codeex" data-milestone="code-moe" data-min="300">
+      <p class="prompt"><span class="tag">Code 5.5</span>Write <code>moe_ffn(params, x, top_k=2)</code> returning <code>(output, aux_loss)</code>. Params: <code>router (d, E)</code> and stacked expert weights <code>w_gate, w_up (E, d, d_ff)</code>, <code>w_down (E, d_ff, d)</code>. Strategy for the learning version (and it's a JAX lesson in itself): run <em>every</em> expert on <em>every</em> token with <code>jax.vmap</code> over the expert axis, then combine with per-token weights that are zero outside the top-k. Pieces you'll want: <code>jax.lax.top_k</code>, <code>jax.nn.one_hot</code>, an einsum. Renormalize the top-k weights to sum to 1. Compute the aux loss from Check 5.4.</p>
+      <textarea spellcheck="false" style="min-height:280px" placeholder="def moe_ffn(params, x, top_k=2):
+    B, T, d = x.shape
+    logits = ...
+    ..."></textarea>
+      <button disabled data-reveal>Compare with reference</button>
+      <p class="gate-hint">300+ characters of genuine attempt. Sanity test: with top_k = E and a uniform router, output should ≈ the average of all experts.</p>
+      <div class="answer">
+        <span class="label">Reference</span>
+<pre><code>def moe_ffn(params, x, top_k=2):
+    B, T, d = x.shape
+    E = params['router'].shape[-1]
+
+    logits = x @ params['router']                      # (B, T, E)
+    probs  = jax.nn.softmax(logits, axis=-1)
+    top_p, top_i = jax.lax.top_k(probs, top_k)         # (B, T, k) each
+    top_p = top_p / top_p.sum(axis=-1, keepdims=True)  # renormalize over chosen
+
+    # dense combine weights: (B, T, E), zero off the top-k
+    combine = (top_p[..., None] * jax.nn.one_hot(top_i, E)).sum(axis=2)
+
+    # run every expert on every token (pedagogical; prod kernels scatter/gather)
+    def expert(wg, wu, wd):
+        return (jax.nn.silu(x @ wg) * (x @ wu)) @ wd   # (B, T, d)
+    all_out = jax.vmap(expert)(params['w_gate'],
+                               params['w_up'],
+                               params['w_down'])       # (E, B, T, d)
+    out = jnp.einsum('ebtd,bte->btd', all_out, combine)
+
+    # load-balancing aux loss
+    f = (combine > 0).mean(axis=(0, 1))                # fraction routed to e
+    p = probs.mean(axis=(0, 1))                        # mean router prob for e
+    aux = E * jnp.sum(f * p)
+    return out, aux</code></pre>
+        <p>Self-grade:</p>
+        <ul class="checklist">
+          <li>Top-k selected from softmax probs; selected weights renormalized to sum to 1</li>
+          <li>Combine weights built so non-selected experts get exactly 0</li>
+          <li><code>vmap</code> maps over the stacked expert axis — one <code>expert()</code> written, eight run</li>
+          <li>The einsum contracts the expert axis with per-token weights</li>
+          <li>aux uses <em>both</em> f (hard counts) and p (soft probs) — gradient flows via p</li>
+          <li>Returns the aux loss instead of swallowing it (the training loop needs it!)</li>
+        </ul>
+        <p class="muted">The compute-all-experts trick costs E/top_k = 4× extra FLOPs here. Real systems gather each expert's tokens into contiguous buffers, with capacity limits and all-to-all communication — same math, brutal engineering. Understand this version first.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ SECTION 6 ============================ -->
+<section class="lesson locked" id="s6">
+  <div class="section-head"><span class="section-num">Part 6</span><h2>Assembly, the loss, and the training loop</h2></div>
+  <p class="lock-note">🔒 Locked — finish the codes and checks in Part 5.</p>
+  <div class="section-body">
+    <p>You have every organ. Build the body.</p>
+
+    <div class="recall codeex" data-milestone="code-forward" data-min="250">
+      <p class="prompt"><span class="tag">Code 6.1</span>Write <code>forward(params, tokens) → (logits, aux_total)</code>. Structure: embedding lookup → precompute RoPE tables once → loop over layers applying the two pre-norm residual sub-blocks (even layers dense FFN, odd layers MoE — accumulate their aux losses) → final RMSNorm → unembed by reusing the embedding matrix transposed (weight tying). Try it from the Part 1 skeleton without scrolling back.</p>
+      <textarea spellcheck="false" style="min-height:260px" placeholder="def forward(params, tokens):
+    ..."></textarea>
+      <button disabled data-reveal>Compare with reference</button>
+      <p class="gate-hint">250+ characters of genuine attempt.</p>
+      <div class="answer">
+        <span class="label">Reference (with init, so you can actually run it)</span>
+<pre><code>N_HEADS, N_KV_HEADS, HEAD_DIM = 8, 2, 64
+
+def forward(params, tokens):
+    B, T = tokens.shape
+    x = params['embed'][tokens]                        # (B, T, d)
+    cos, sin = rope_freqs(HEAD_DIM, T)
+    aux_total = 0.0
+    for layer in params['layers']:
+        h = rms_norm(x, layer['ln1'])
+        x = x + gqa_attention(layer['attn'], h, cos, sin, N_HEADS, N_KV_HEADS)
+        h = rms_norm(x, layer['ln2'])
+        if 'router' in layer['ffn']:                   # MoE layer
+            ff, aux = moe_ffn(layer['ffn'], h)
+            aux_total = aux_total + aux
+        else:                                          # dense layer
+            ff = swiglu_ffn(layer['ffn'], h)
+        x = x + ff
+    x = rms_norm(x, params['ln_f'])
+    logits = x @ params['embed'].T                     # weight tying
+    return logits, aux_total
+
+def init_params(key, vocab=32000, d=512, n_layers=6, d_ff=1408, E=8):
+    def dense(key, shape):
+        # scale 1/sqrt(fan_in) keeps output variance ~ input variance
+        return jax.random.normal(key, shape) / jnp.sqrt(shape[0])
+    keys = iter(jax.random.split(key, 200))
+    layers = []
+    for i in range(n_layers):
+        attn = {'wq': dense(next(keys), (d, N_HEADS * HEAD_DIM)),
+                'wk': dense(next(keys), (d, N_KV_HEADS * HEAD_DIM)),
+                'wv': dense(next(keys), (d, N_KV_HEADS * HEAD_DIM)),
+                'wo': dense(next(keys), (d, d))}
+        if i % 2 == 1:                                 # odd layers: MoE
+            ffn = {'router': dense(next(keys), (d, E)),
+                   'w_gate': dense(next(keys), (E, d, d_ff)),
+                   'w_up':   dense(next(keys), (E, d, d_ff)),
+                   'w_down': dense(next(keys), (E, d_ff, d))}
+        else:                                          # even layers: dense
+            ffn = {'w_gate': dense(next(keys), (d, d_ff)),
+                   'w_up':   dense(next(keys), (d, d_ff)),
+                   'w_down': dense(next(keys), (d_ff, d))}
+        layers.append({'ln1': jnp.ones(d), 'ln2': jnp.ones(d),
+                       'attn': attn, 'ffn': ffn})
+    return {'embed': jax.random.normal(next(keys), (vocab, d)) * 0.02,
+            'layers': layers, 'ln_f': jnp.ones(d)}</code></pre>
+        <p>Self-grade the forward pass: pre-norm (<code>rms_norm</code> <em>inside</em> the residual branch), <code>x +</code> on both sub-blocks, RoPE tables computed once and reused by every layer, aux losses summed across MoE layers and returned, unembedding via <code>params['embed'].T</code>. Note the 3-D vs 2-D expert weights are what distinguish MoE from dense layers in the pytree. (A Python loop over layers is fine — <code>jit</code> unrolls it. The fancy alternative, <code>jax.lax.scan</code> over stacked layer weights, compiles faster for deep models.)</p>
+      </div>
+    </div>
+
+    <h3>The loss</h3>
+    <p>A language model is trained to predict token t+1 from tokens ≤ t — every position is a training example simultaneously, thanks to the causal mask.</p>
+
+    <div class="numcheck" data-answer="3" data-tol="0.01" data-milestone="num-shift">
+      <p class="prompt"><span class="tag">Drill 6.2</span>From the token sequence [5, 9, 2, 7], how many (input position → target) prediction pairs does one forward pass train on?</p>
+      <input type="text" placeholder="count"> <button data-check>Check</button>
+      <button class="ghost" data-giveup style="display:none">Reveal</button>
+      <div class="feedback"></div>
+      <div class="answer"><span class="label">Answer</span><p><strong>3</strong>: 5→9, [5,9]→2, [5,9,2]→7. In code: <code>inputs = tokens[:, :-1]</code>, <code>targets = tokens[:, 1:]</code> — the famous shift-by-one. (So a batch of length T+1 sequences yields B·T training signals per step.)</p></div>
+    </div>
+
+    <div class="mcq" data-milestone="mcq-kl">
+      <p class="prompt"><span class="tag">Check 6.3</span>The loss is cross-entropy: −log q<sub>θ</sub>(correct next token), averaged. If you did the KL course: which KL divergence, between which two distributions, is this minimizing — and what personality does that direction impose on the trained model?</p>
+      <button class="opt" data-correct="1">Forward KL(p<sub>data</sub> ∥ q<sub>θ</sub>) — mass-covering: the model must put probability on <em>everything</em> the data distribution can produce</button>
+      <button class="opt" data-nudge="Check the sampler: whose samples appear in the loss — sequences drawn from the model, or sequences from the dataset? First argument = sampler = numerator.">Reverse KL(q<sub>θ</sub> ∥ p<sub>data</sub>) — mode-seeking: the model commits to the most common continuations</button>
+      <button class="opt" data-nudge="They differ sharply when the model can't fit the data perfectly — which is always. One of them differs from cross-entropy by a θ-independent constant; the other doesn't.">Either — equivalent for this purpose</button>
+      <div class="nudge"></div>
+      <div class="answer">
+        <span class="label">Correct</span>
+        <p>E<sub>data</sub>[−log q] = KL(p<sub>data</sub> ∥ q) + H(p<sub>data</sub>), and the entropy term has no θ in it. Pretraining is forward-KL minimization: zero-avoiding, cover-everything. (And the RLHF stage that often follows penalizes <em>reverse</em> KL to a reference — the two directions you studied, stacked in one pipeline.)</p>
+      </div>
+    </div>
+
+    <div class="numcheck" data-answer="0.24" data-tol="0.01" data-milestone="num-ce">
+      <p class="prompt"><span class="tag">Compute 6.4</span>Vocab of 3. Logits [2, 0, 0], correct token is index 0. Cross-entropy loss in nats? (2 dp; e² ≈ 7.389)</p>
+      <input type="text" placeholder="2 dp"> <button data-check>Check</button>
+      <button class="secondary" data-hintbtn style="display:none">Hint</button>
+      <button class="ghost" data-giveup style="display:none">Reveal</button>
+      <div class="hintbox">p₀ = e² / (e² + e⁰ + e⁰) = 7.389 / 9.389 ≈ 0.787. Loss = −ln p₀.</div>
+      <div class="feedback"></div>
+      <div class="answer"><span class="label">Answer</span><p>−ln(0.787) ≈ <strong>0.24 nats</strong>. Note you never materialize the full softmax in practice — <code>log_softmax</code> then pick out the target's entry (numerically stabler than <code>log(softmax(·))</code>).</p></div>
+    </div>
+
+    <div class="numcheck" data-answer="10.37" data-tol="0.05" data-milestone="num-init">
+      <p class="prompt"><span class="tag">Predict 6.5</span>The single best sanity check in deep learning: before the first gradient step, with random weights, what loss <em>should</em> your model print? (2 dp. Reason it out — what distribution does an untrained model's softmax approximate, and what's −log of any one token under it?)</p>
+      <input type="text" placeholder="2 dp"> <button data-check>Check</button>
+      <button class="secondary" data-hintbtn style="display:none">Hint</button>
+      <button class="ghost" data-giveup style="display:none">Reveal</button>
+      <div class="hintbox">Random logits ⇒ roughly uniform over the vocabulary ⇒ probability ≈ 1/32000 on the correct token. Loss = −ln(1/32000) = ln 32000.</div>
+      <div class="feedback"></div>
+      <div class="answer"><span class="label">Answer</span><p>ln 32000 ≈ <strong>10.37 nats</strong>. Burn this ritual in: print the first loss, compare to ln(vocab). Much higher → init scale bug. Much lower → you're leaking the answer (classic: forgot the causal mask, every token attends to its own target). This one number catches half of all transformer bugs.</p></div>
+    </div>
+
+    <div class="recall codeex" data-milestone="code-loss" data-min="120">
+      <p class="prompt"><span class="tag">Code 6.6</span>Write <code>loss_fn(params, tokens)</code> for <code>tokens: (B, T+1)</code> ints: shift, forward, log_softmax, gather the target log-probs (<code>jnp.take_along_axis</code>), mean negative log-likelihood, plus <code>0.01 ×</code> the MoE aux loss. One scalar out.</p>
+      <textarea spellcheck="false" placeholder="def loss_fn(params, tokens):
+    inputs, targets = ...
+    ..."></textarea>
+      <button disabled data-reveal>Compare with reference</button>
+      <p class="gate-hint">Attempt first (120+ characters).</p>
+      <div class="answer">
+        <span class="label">Reference</span>
+<pre><code>def loss_fn(params, tokens):
+    inputs, targets = tokens[:, :-1], tokens[:, 1:]
+    logits, aux = forward(params, inputs)              # (B, T, V)
+    logp = jax.nn.log_softmax(logits, axis=-1)
+    nll = -jnp.take_along_axis(logp, targets[..., None], axis=-1).squeeze(-1)
+    return nll.mean() + 0.01 * aux</code></pre>
+        <p>Self-grade: shift by one (inputs lose the last token, targets lose the first); <code>log_softmax</code> not <code>log(softmax)</code>; <code>take_along_axis</code> needs the targets expanded to match rank; aux loss added with a small coefficient — forget it and your experts will quietly collapse a few thousand steps in.</p>
+      </div>
+    </div>
+
+    <h3>The training loop</h3>
+    <div class="recall codeex" data-milestone="code-train" data-min="200">
+      <p class="prompt"><span class="tag">Code 6.7</span>Last exercise. Write the jitted train step and the loop. Requirements: <code>jax.value_and_grad</code> for loss + gradients in one pass; AdamW via <code>optax</code> (or hand-rolled if you're feeling pure); <code>@jax.jit</code> on the step function — and recall from Part 1 <em>why</em> params and opt_state must thread through as arguments and returns. Batch sampling: random windows of length T+1 from a long token array (numpy is fine outside jit). Print loss every 100 steps and check step 0 against your 6.5 prediction.</p>
+      <textarea spellcheck="false" style="min-height:240px" placeholder="opt = ...
+
+@jax.jit
+def train_step(params, opt_state, batch):
+    ...
+
+for step in range(...):
+    ..."></textarea>
+      <button disabled data-reveal>Compare with reference</button>
+      <p class="gate-hint">200+ characters of genuine attempt.</p>
+      <div class="answer">
+        <span class="label">Reference</span>
+<pre><code>import numpy as np
+import optax
+
+B, T = 8, 128
+opt = optax.adamw(learning_rate=3e-4, b1=0.9, b2=0.95, weight_decay=0.1)
+
+params = init_params(jax.random.PRNGKey(0))
+opt_state = opt.init(params)
+
+@jax.jit
+def train_step(params, opt_state, batch):
+    loss, grads = jax.value_and_grad(loss_fn)(params, batch)
+    updates, opt_state = opt.update(grads, opt_state, params)
+    params = optax.apply_updates(params, updates)
+    return params, opt_state, loss          # new state OUT — never mutated
+
+data = np.array(token_ids, dtype=np.int32)  # one long tokenized corpus
+
+for step in range(5000):
+    ix = np.random.randint(0, len(data) - T - 1, size=B)
+    batch = jnp.stack([data[i : i + T + 1] for i in ix])   # (B, T+1)
+    params, opt_state, loss = train_step(params, opt_state, batch)
+    if step % 100 == 0:
+        print(step, float(loss))            # step 0 should print ≈ 10.37</code></pre>
+        <p>Self-grade:</p>
+        <ul class="checklist">
+          <li><code>value_and_grad</code>, not separate <code>loss_fn</code> + <code>grad</code> calls (one forward pass, not two)</li>
+          <li>Everything that changes — params, opt_state — flows in as arguments and out as returns; nothing global, nothing mutated (Part 1's lesson, now load-bearing)</li>
+          <li><code>jit</code> wraps the <em>whole</em> step: forward, backward, and update fuse into one compiled call</li>
+          <li>Batch shapes constant across steps — change a shape and jit silently recompiles (the classic "why is every step slow" bug)</li>
+          <li><code>float(loss)</code> only at print time: it forces a device→host sync, so doing it every step would serialize the pipeline</li>
+        </ul>
+        <p class="muted">That's a complete, runnable GPT. Feed it any tokenized text (even character-level Shakespeare with vocab ≈ 65 — then your 6.5 ritual predicts ln 65 ≈ 4.17) and watch the loss fall. Sampling/generation is the natural next project: re-run the forward pass with a growing prefix, or properly — add a KV cache, and suddenly Part 4's GQA memory math is about <em>your</em> RAM.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ SECTION 7 ============================ -->
+<section class="lesson locked" id="s7">
+  <div class="section-head"><span class="section-num">Part 7</span><h2>Final synthesis: the blank page</h2></div>
+  <p class="lock-note">🔒 Locked — finish all seven exercises in Part 6.</p>
+  <div class="section-body">
+    <p>The real test. Without scrolling up, write the complete data flow from token ids to a completed optimizer step. It must include: (1) every tensor shape along the way using our config, (2) where and why RoPE is applied and to which tensors, (3) how GQA differs from MHA and what it buys, (4) the dense-vs-MoE forks of the FFN and why MoE needs the aux loss, (5) the loss including the shift, and (6) the three JAX disciplines a train step must respect (purity, jit tracing, explicit randomness). Then — ideally — close this page and write the actual code in a fresh file.</p>
+    <div class="recall" data-min="500">
+      <p class="prompt"><span class="tag">Final recall</span>The whole model, from memory.</p>
+      <textarea style="min-height:220px" placeholder="tokens (8, 128) → embed → (8, 128, 512) → … unlocks at 500 characters; a real attempt needs more."></textarea>
+      <button disabled data-reveal>Compare with model summary</button>
+      <p class="gate-hint">If a step is fuzzy, that's the finding — go re-derive it in its section before revealing.</p>
+      <div class="answer">
+        <span class="label">Model summary — grade yourself</span>
+        <p><strong>Flow with shapes.</strong> tokens (8, 129) → shift to inputs (8, 128) / targets (8, 128) → embed lookup (8, 128, 512). Per layer: RMSNorm → GQA attention: Q (8, 128, 8, 64), K/V (8, 128, 2, 64), RoPE rotates Q and K (never V), repeat KV ×4 to 8 heads, scores (8, 8, 128, 128) scaled by √64, tril mask with −∞ before softmax, weighted V → merge → (8, 128, 512), add to residual. RMSNorm → FFN: dense SwiGLU (silu-gated, d_ff 1408) on even layers; on odd layers MoE — router (512→8), softmax, top-2, renormalize, weighted combination of expert outputs, aux = E·Σf·p accumulated. Add to residual. Final RMSNorm → logits via tied embedᵀ (8, 128, 32000).</p>
+        <p><strong>Loss.</strong> log_softmax, gather target log-probs, mean NLL + 0.01·aux. It's forward KL(p_data ∥ q): mass-covering. First-step loss ≈ ln 32000 ≈ 10.37 — always check.</p>
+        <p><strong>Why each design choice.</strong> Pre-norm residuals: stable gradient highway. RMSNorm: LayerNorm minus the parts that don't matter. RoPE: rotations make q·k depend only on relative offset m−n; multi-frequency pairs encode all scales. GQA: share K/V across query-head groups → 4× smaller KV cache at inference, near-zero quality cost. MoE: params scale with E, FLOPs with top_k; the aux loss prevents rich-get-richer expert collapse via the differentiable p in f·p.</p>
+        <p><strong>JAX disciplines.</strong> Pure functions — params in as pytree args, new params out, never mutated (jit freezes anything else as constants). One jitted train_step with value_and_grad, constant shapes to avoid recompiles. Randomness only through split PRNG keys.</p>
+        <hr>
+        <p class="muted"><strong>To make it stick:</strong> redo this blank page tomorrow and in a week. Then build the follow-ups that test real understanding: a KV cache + sampling loop (GQA's payoff becomes tangible), <code>jax.lax.scan</code> over layers, and a real scatter/gather MoE. When your character-level model starts producing almost-Shakespeare around loss ≈ 1.5, you'll have earned it from first principles.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ================= progress / unlock machinery ================= */
+  const done = new Set();
+  const requirements = {
+    s1: ["warmup"],
+    s2: ["mcq-pure", "num-embed", "num-wk"],
+    s3: ["num-rms", "code-rms"],
+    s4: ["num-rope", "mcq-rope-v", "code-rope"],
+    s5: ["num-gqa", "mcq-scale", "mcq-mask", "num-attn", "code-gqa"],
+    s6: ["code-swiglu", "num-router", "mcq-aux", "code-moe"],
+    s7: ["code-forward", "num-shift", "mcq-kl", "num-ce", "num-init", "code-loss", "code-train"]
+  };
+  function milestone(name) {
+    if (!name || done.has(name)) return;
+    done.add(name);
+    for (const [sec, reqs] of Object.entries(requirements)) {
+      if (reqs.every(r => done.has(r))) {
+        const el = document.getElementById(sec);
+        if (el && el.classList.contains("locked")) {
+          el.classList.remove("locked");
+          const pn = document.getElementById("pn-" + sec);
+          if (pn) pn.classList.add("open");
+        }
+      }
+    }
+  }
+
+  /* ================= warm-up gate ================= */
+  const warmTa = document.getElementById("warmup-ta");
+  warmTa.addEventListener("input", () => {
+    const n = warmTa.value.trim().length;
+    const gate = document.getElementById("warmup-gate");
+    if (n >= 80) {
+      gate.textContent = "✓ Good. Section 1 is open below.";
+      milestone("warmup");
+    } else {
+      gate.textContent = "Keep writing… (section 1 unlocks at 80 characters — " + (80 - n) + " to go)";
+    }
+  });
+
+  /* ================= recall / code blocks ================= */
+  document.querySelectorAll(".recall").forEach(block => {
+    const ta = block.querySelector("textarea");
+    const btn = block.querySelector("button[data-reveal]");
+    if (!ta || !btn) return;
+    const min = parseInt(block.dataset.min || "40", 10);
+    ta.addEventListener("input", () => {
+      btn.disabled = ta.value.trim().length < min;
+    });
+    btn.addEventListener("click", () => {
+      block.querySelector(".answer").classList.add("shown");
+      btn.style.display = "none";
+      const gh = block.querySelector(".gate-hint");
+      if (gh) gh.style.display = "none";
+      milestone(block.dataset.milestone);
+    });
+  });
+
+  /* ================= numeric checks ================= */
+  document.querySelectorAll(".numcheck").forEach(block => {
+    const input = block.querySelector("input");
+    const checkBtn = block.querySelector("button[data-check]");
+    const hintBtn = block.querySelector("button[data-hintbtn]");
+    const giveupBtn = block.querySelector("button[data-giveup]");
+    const fb = block.querySelector(".feedback");
+    const ans = parseFloat(block.dataset.answer);
+    const tol = parseFloat(block.dataset.tol);
+    let attempts = 0, solved = false;
+
+    function finish(revealed) {
+      solved = true;
+      input.disabled = true;
+      checkBtn.disabled = true;
+      block.querySelector(".answer").classList.add("shown");
+      if (giveupBtn) giveupBtn.style.display = "none";
+      milestone(block.dataset.milestone);
+      fb.className = "feedback " + (revealed ? "no" : "ok");
+      fb.textContent = revealed
+        ? "Revealed — make sure you can now reproduce this unaided."
+        : "✓ Correct.";
+    }
+
+    checkBtn.addEventListener("click", () => {
+      if (solved) return;
+      const v = parseFloat(input.value.replace(/[,_\s]/g, ""));
+      if (isNaN(v)) { fb.className = "feedback no"; fb.textContent = "Enter a number."; return; }
+      if (Math.abs(v - ans) <= tol) { finish(false); return; }
+      attempts++;
+      fb.className = "feedback no";
+      fb.textContent = attempts === 1
+        ? "Not quite. Re-read the setup — which quantities actually go into this?"
+        : "Still off. Write the computation out explicitly, term by term, before guessing again.";
+      if (attempts >= 1 && hintBtn) hintBtn.style.display = "inline-block";
+      if (attempts >= 3 && giveupBtn) giveupBtn.style.display = "inline-block";
+    });
+    input.addEventListener("keydown", e => { if (e.key === "Enter") checkBtn.click(); });
+    if (hintBtn) hintBtn.addEventListener("click", () => {
+      block.querySelector(".hintbox").classList.add("shown");
+      hintBtn.style.display = "none";
+    });
+    if (giveupBtn) giveupBtn.addEventListener("click", () => finish(true));
+  });
+
+  /* ================= MCQs ================= */
+  document.querySelectorAll(".mcq").forEach(block => {
+    const opts = block.querySelectorAll(".opt");
+    const nudge = block.querySelector(".nudge");
+    let answered = false;
+    opts.forEach(opt => {
+      opt.addEventListener("click", () => {
+        if (answered) return;
+        if (opt.dataset.correct) {
+          answered = true;
+          opt.classList.add("right");
+          opts.forEach(o => { o.disabled = true; });
+          if (nudge) nudge.classList.remove("shown");
+          const a = block.querySelector(".answer");
+          if (a) a.classList.add("shown");
+          milestone(block.dataset.milestone);
+        } else {
+          opt.classList.add("wrong");
+          setTimeout(() => opt.classList.remove("wrong"), 900);
+          if (nudge) {
+            nudge.textContent = opt.dataset.nudge || "Not that one — reason it out again.";
+            nudge.classList.add("shown");
+          }
+        }
+      });
+    });
+  });
+
+  /* ================= RoPE visualizer ================= */
+  const canvas = document.getElementById("rope-canvas");
+  const ctx = canvas.getContext("2d");
+  const mS = document.getElementById("m-slider");
+  const nS = document.getElementById("n-slider");
+  const THETA = Math.PI / 4;   // 45° per position
+
+  function drawArrow(cx, cy, r, angle, color, label) {
+    const x = cx + r * Math.cos(-angle), y = cy + r * Math.sin(-angle);
+    ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(x, y); ctx.stroke();
+    const ah = 9, a1 = Math.atan2(y - cy, x - cx);
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x - ah * Math.cos(a1 - 0.4), y - ah * Math.sin(a1 - 0.4));
+    ctx.lineTo(x - ah * Math.cos(a1 + 0.4), y - ah * Math.sin(a1 + 0.4));
+    ctx.closePath(); ctx.fill();
+    ctx.font = "bold 14px sans-serif";
+    ctx.fillText(label, cx + (r + 16) * Math.cos(-angle) - 5, cy + (r + 16) * Math.sin(-angle) + 5);
+    ctx.lineWidth = 1;
+  }
+
+  function drawRope() {
+    const W = canvas.width, H = canvas.height;
+    const m = parseInt(mS.value, 10), n = parseInt(nS.value, 10);
+    document.getElementById("m-val").textContent = m;
+    document.getElementById("n-val").textContent = n;
+    ctx.clearRect(0, 0, W, H);
+    const cx = W / 2, cy = H / 2, r = 95;
+
+    ctx.strokeStyle = "#ddd";
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx - r - 14, cy); ctx.lineTo(cx + r + 14, cy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx, cy - r - 14); ctx.lineTo(cx, cy + r + 14); ctx.stroke();
+
+    // position ticks on the circle
+    ctx.fillStyle = "#bbb"; ctx.font = "10px sans-serif";
+    for (let p = 0; p <= 8; p++) {
+      const a = p * THETA;
+      ctx.fillText(p, cx + (r + 6) * Math.cos(-a) - 3, cy + (r + 6) * Math.sin(-a) + 3);
+    }
+
+    drawArrow(cx, cy, r, n * THETA, "#8a8a94", "k (pos " + n + ")");
+    drawArrow(cx, cy, r, m * THETA, "#1a7f6b", "q (pos " + m + ")");
+
+    const dot = Math.cos((m - n) * THETA);
+    document.getElementById("rope-readout").innerHTML =
+      "q·k = cos((m−n)·45°) = cos(" + (m - n) + "·45°) = <strong>" + dot.toFixed(3) + "</strong>" +
+      " &nbsp;·&nbsp; gap m−n = " + (m - n) +
+      " <span class='muted'>— change m and n together, keep the gap: the dot product never moves.</span>";
+  }
+  mS.addEventListener("input", drawRope);
+  nS.addEventListener("input", drawRope);
+  drawRope();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 1 · Attention &amp; the Memory Wall</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 1</span> · Attention &amp; the Memory Wall</h1>
+<p class="subtitle">Before optimizing attention, we must be able to say — with numbers — what exactly is slow about it. Spoiler: it is not the arithmetic.</p>
+
+<h2 id="attention-def">1.1 Scaled dot-product attention</h2>
+<p>For one attention head processing one sequence of \(N\) tokens, we have three matrices: queries \(Q \in \mathbb{R}^{N\times d}\), keys \(K \in \mathbb{R}^{N\times d}\), and values \(V \in \mathbb{R}^{N\times d}\), where \(d\) is the <em>head dimension</em> (typically 64 or 128). Attention computes:</p>
+$$ S = \frac{QK^\top}{\sqrt{d}} \in \mathbb{R}^{N\times N}, \qquad P = \mathrm{softmax}_{\text{row}}(S) \in \mathbb{R}^{N\times N}, \qquad O = PV \in \mathbb{R}^{N\times d}. $$
+<p>Row \(i\) of \(S\) holds the dot product of query \(i\) with <em>every</em> key. The softmax is applied <strong>independently to each row</strong>:</p>
+$$ P_{ij} = \frac{e^{S_{ij}}}{\sum_{k=1}^{N} e^{S_{ik}}}, $$
+<p>so row \(i\) of \(P\) is a probability distribution over the \(N\) keys, and row \(i\) of \(O\) is the corresponding weighted average of the value vectors. The row-independence of softmax is going to matter enormously: it means different query rows can be processed by different GPU threads with no communication.</p>
+
+<div class="box definition"><div class="box-title">Why divide by √d?</div>
+If the entries of \(q\) and \(k\) are roughly independent with mean 0 and variance 1, the dot product \(q \cdot k = \sum_{k=1}^{d} q_k k_k\) has variance \(d\), i.e. standard deviation \(\sqrt{d}\). Dividing by \(\sqrt{d}\) keeps scores at unit variance regardless of \(d\), preventing softmax from saturating into a near one-hot distribution (which would have vanishing gradients). In code this is a single scalar, usually called <code>sm_scale</code> or <code>softmax_scale</code>; FlashAttention kernels take it as a parameter.
+</div>
+
+<p><strong>Batches and heads.</strong> A real model runs attention for a batch of \(B\) sequences and \(h\) heads. Crucially, every (batch, head) pair is a <em>completely independent</em> \((N, d)\) attention problem. So the real input is a 4-D tensor, e.g. shape \((B, h, N, d)\), and we get \(B \cdot h\) independent problems. Keep this in mind: it becomes the GPU's grid of thread blocks in Chapter 5.</p>
+
+<div class="quiz" data-concept="ch1.html#attention-def" data-concept-label="§1.1 Scaled dot-product attention">
+  <div class="q-text"><p><strong>From memory</strong>, write the three equations of scaled dot-product attention, give the shape of every matrix involved (for one head), and state which axis the softmax is applied over and why that axis-independence will matter for parallelization.</p></div>
+  <div class="hint">There are exactly three named intermediate/output matrices: scores, weights, output. Two of them are square.</div>
+  <div class="hint">Softmax turns each <em>row</em> of scores into a probability distribution over keys. What does "rows are independent" buy you when assigning work to threads?</div>
+  <div class="answer">
+    <p>\(S = QK^\top/\sqrt{d}\) with \(Q,K,V \in \mathbb{R}^{N\times d}\) and \(S \in \mathbb{R}^{N\times N}\); \(P = \mathrm{softmax}_{\text{row}}(S) \in \mathbb{R}^{N\times N}\); \(O = PV \in \mathbb{R}^{N\times d}\).</p>
+    <p>Softmax is applied over each <strong>row</strong> (over keys, for a fixed query). Because each row's softmax and each row of \(O\) depend only on that row of \(S\), different query rows can be computed completely independently — no synchronization between threads handling different queries. The hard coupling is <em>within</em> a row: the denominator \(\sum_k e^{S_{ik}}\) needs every score in the row.</p>
+  </div>
+</div>
+
+<div class="quiz" data-concept="ch1.html#attention-def" data-concept-label="§1.1 (the √d box)">
+  <div class="q-text"><p>Why is the score matrix scaled by \(1/\sqrt{d}\) rather than, say, \(1/d\) or not at all? Give the variance argument.</p></div>
+  <div class="hint">What is the variance of a sum of \(d\) independent products of unit-variance terms?</div>
+  <div class="answer"><p>For entries with mean 0 and variance 1, \(\mathrm{Var}(q\cdot k) = \sum_{k=1}^d \mathrm{Var}(q_k k_k) = d\), so the standard deviation grows as \(\sqrt{d}\). Dividing by \(\sqrt{d}\) normalizes scores to unit variance for any head size, keeping softmax in a regime with useful gradients. \(1/d\) would over-shrink (variance \(1/d \to 0\)), making attention nearly uniform.</p></div>
+</div>
+
+<h2 id="naive-algo">1.2 The standard (naive) implementation</h2>
+<p>Written the obvious way — as any framework would execute it eagerly — attention is three separate GPU operations:</p>
+<pre><code># shapes for one (batch, head):  Q,K,V: (N,d)
+S = Q @ K.T / sqrt(d)     # kernel 1: matmul       — writes S (N×N) to GPU memory
+P = softmax(S, axis=-1)   # kernel 2: row softmax   — reads S, writes P (N×N)
+O = P @ V                 # kernel 3: matmul        — reads P, writes O (N×d)
+</code></pre>
+<p>Each line is a separate <em>kernel launch</em>, and kernels can only communicate through global GPU memory. So the \(N\times N\) matrices \(S\) and \(P\) are fully <strong>materialized</strong>: written out to memory by one kernel and read back by the next. Additionally, for training, \(P\) is kept alive until the backward pass needs it — that is \(O(N^2)\) <em>activation memory per head per layer</em>.</p>
+
+<div class="quiz" data-concept="ch1.html#naive-algo" data-concept-label="§1.2 The naive implementation">
+  <div class="q-text"><p>For a model with \(B=8\), \(h=32\) heads, \(N=8192\), how many bytes does materializing just the attention-weight tensor \(P\) take in fp16? Work it out before reaching for a calculator.</p></div>
+  <div class="hint">\(P\) has \(N^2\) entries per (batch, head); fp16 is 2 bytes per entry.</div>
+  <div class="hint">\(8192^2 = 2^{26} \approx 67\text{M}\) entries. Then multiply by \(2 \cdot 8 \cdot 32\).</div>
+  <div class="answer"><p>\(N^2 = 8192^2 = 2^{26} \approx 6.71\times 10^7\) entries; at 2 bytes that is \(\approx 134\) MB per (batch, head). Times \(B\cdot h = 256\): \(\approx \mathbf{34.4\ GB}\) — for a <em>single layer's</em> attention weights. That exceeds an entire A100-40GB before any other activation, which is why long-context training was impractical before Flash Attention.</p></div>
+</div>
+
+<h2 id="flops">1.3 Counting the arithmetic (FLOPs)</h2>
+<p>A matrix multiply of an \((m\times k)\) by a \((k\times n)\) matrix takes \(mnk\) multiplications and \(mnk\) additions: \(2mnk\) FLOPs. So per (batch, head):</p>
+<ul>
+  <li>\(QK^\top\): \((N\times d)\cdot(d\times N)\) → \(2N^2d\) FLOPs</li>
+  <li>softmax: an exponential, a few adds and one divide per entry → \(O(N^2)\), roughly \(5N^2\)</li>
+  <li>\(PV\): \((N\times N)\cdot(N\times d)\) → \(2N^2d\) FLOPs</li>
+</ul>
+$$ \text{FLOPs}_{\text{fwd}} \approx 4N^2d + O(N^2). $$
+<p>For \(N = 4096\), \(d = 64\): about \(4.3\) GFLOP per (batch, head). An A100 does 312 <em>tera</em>-FLOPs/s in fp16; even your laptop-class GPU does several TFLOPs. Arithmetic alone would make attention finish in well under a millisecond. It doesn't. So the time must be going somewhere else.</p>
+
+<div class="quiz" data-concept="ch1.html#flops" data-concept-label="§1.3 Counting FLOPs">
+  <div class="q-text"><p>Derive, from memory, the leading-order FLOP count of the attention forward pass per (batch, head), explaining where each term comes from. Why does the softmax term not matter asymptotically — and (preview) why will it nevertheless matter to FlashAttention-2?</p></div>
+  <div class="hint">Two matmuls dominate. Count FLOPs for \((m\times k)(k \times n)\) as \(2mnk\).</div>
+  <div class="hint">For the preview: think about what hardware unit executes a matmul versus an <code>exp</code>. Are they equally fast?</div>
+  <div class="answer">
+    <p>\(QK^\top\) costs \(2N^2d\), \(PV\) costs \(2N^2d\), softmax costs \(O(N^2)\); total \(\approx 4N^2d\). Softmax is smaller by a factor of \(d\) (≥64), so it's asymptotically negligible.</p>
+    <p>But on modern GPUs matmul FLOPs run on <strong>tensor cores</strong>, which are ~16× faster than the general-purpose units that execute <code>exp</code>, <code>max</code>, and divisions. So a "negligible" \(O(N^2)\) of non-matmul work can consume a meaningful fraction of runtime. Reducing this non-matmul work is one of FlashAttention-2's three improvements over FA-1 (§4.4).</p>
+  </div>
+</div>
+
+<h2 id="memory-traffic">1.4 Counting the memory traffic (bytes)</h2>
+<p>Now count what the naive three-kernel version moves to and from GPU global memory (HBM), in <em>elements</em> per (batch, head):</p>
+<table>
+<tr><th>Kernel</th><th>Reads</th><th>Writes</th></tr>
+<tr><td>\(S = QK^\top\)</td><td>\(Q, K\): \(2Nd\)</td><td>\(S\): \(N^2\)</td></tr>
+<tr><td>\(P = \mathrm{softmax}(S)\)</td><td>\(S\): \(N^2\)</td><td>\(P\): \(N^2\)</td></tr>
+<tr><td>\(O = PV\)</td><td>\(P, V\): \(N^2 + Nd\)</td><td>\(O\): \(Nd\)</td></tr>
+</table>
+<p>Total \(\approx 4N^2 + 4Nd\) elements. Since \(N \gg d\) for long sequences, traffic is \(\Theta(N^2)\) — entirely dominated by writing and re-reading the two square matrices that nobody actually wants as output.</p>
+
+<div class="box definition"><div class="box-title">Arithmetic intensity &amp; the roofline model</div>
+<p><strong>Arithmetic intensity</strong> \(I\) = FLOPs performed ÷ bytes moved to/from memory. Every machine has a <em>ridge point</em> \(I^* = \frac{\text{peak FLOPs/s}}{\text{memory bandwidth}}\). The roofline model says attainable throughput is
+\( \min(\text{peak FLOPs/s},\; I \cdot \text{bandwidth}) \):
+if your kernel's \(I \lt I^*\) it is <strong>memory-bound</strong> — the arithmetic units idle, waiting for bytes — and the only way to go faster is to move fewer bytes.</p>
+<p>A100 (fp16 tensor core): \(312\,\text{TFLOPs} / 2.0\,\text{TB/s} \approx 156\) FLOPs/byte. An RTX 2070 in fp32: \(7.5\,\text{TFLOPs} / 0.45\,\text{TB/s} \approx 17\) FLOPs/byte. Either way: tens to hundreds of FLOPs must be performed per byte loaded, or the GPU starves.</p>
+</div>
+
+<p>Apply this to naive attention in fp16 (2 bytes/element):</p>
+$$ I_{\text{attention}} \approx \frac{4N^2 d}{2\,(4N^2 + 4Nd)} \xrightarrow{N \gg d} \frac{d}{2} = 32 \;\;(d{=}64). $$
+<p>32 FLOPs/byte vs. a ridge of 156: the naive pipeline runs at roughly \(32/156 \approx 20\%\) of the A100's compute peak <em>at best</em> — and the softmax kernel alone is catastrophically worse: ~5 FLOPs per entry while reading and writing 4 bytes per entry, an intensity around 1.</p>
+
+<div class="quiz" data-concept="ch1.html#memory-traffic" data-concept-label="§1.4 Memory traffic &amp; roofline">
+  <div class="q-text"><p>Define arithmetic intensity and the ridge point. Then compute the arithmetic intensity of the standalone softmax kernel (read \(N^2\) fp32 values, write \(N^2\), ~5 FLOPs per value) and classify it on an A100 (fp32 non-tensor peak ≈ 19.5 TFLOPs, bandwidth ≈ 2 TB/s).</p></div>
+  <div class="hint">Intensity = FLOPs ÷ bytes. Each element is read once (4 bytes) and written once (4 bytes).</div>
+  <div class="hint">Ridge = peak/bandwidth ≈ 19500/2000 GFLOPs per GB/s ≈ 10 FLOPs/byte.</div>
+  <div class="answer"><p>Intensity \(= 5N^2 / (8N^2) \approx 0.6\) FLOPs/byte. The ridge point is \(\approx 10\) FLOPs/byte, so softmax is memory-bound by a factor of ~16: it runs at ~6% of compute peak and its runtime is essentially <em>bytes moved ÷ bandwidth</em>. Making the exponentials faster would change nothing; only moving fewer bytes helps.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch1.html#memory-traffic" data-concept-label="§1.4 Memory traffic">
+  <div class="q-text"><p>From memory: list the reads and writes (in elements, per batch-head) of each of the three naive attention kernels, and give the total leading-order traffic. Which tensors account for it?</p></div>
+  <div class="hint">Each square matrix is written once and read once — count them.</div>
+  <div class="answer"><p>Matmul 1 reads \(2Nd\), writes \(N^2\); softmax reads \(N^2\), writes \(N^2\); matmul 2 reads \(N^2 + Nd\), writes \(Nd\). Total \(\approx 4N^2 + 4Nd = \Theta(N^2)\), dominated by \(S\) (written + read) and \(P\) (written + read) — intermediates that are not part of the function's actual input or output, which are only \(\Theta(Nd)\).</p></div>
+</div>
+
+<h2 id="bound">1.5 The verdict: attention is memory-bound</h2>
+<div class="box keypoint"><div class="box-title">Key point</div>
+The inputs and outputs of attention total \(4Nd\) elements, but the naive implementation moves \(\Theta(N^2)\) elements through HBM. For \(N = 4096, d = 64\): the function's true I/O is ~1M elements, yet the implementation moves ~67M. <strong>~98.5% of all memory traffic is self-inflicted</strong> — intermediate matrices the algorithm invented for its own convenience. Eliminate that traffic and attention can run near compute speed.
+</div>
+
+<h2 id="preview">1.6 What it would take to fix it</h2>
+<p>The obvious fix is <strong>kernel fusion</strong>: one kernel that computes \(S\), softmax, and \(PV\) for a chunk of the problem while everything stays in fast on-chip memory, writing only the final \(O\) to HBM. On-chip memory is tiny (~100–200 KB per SM, Chapter 2), so we must work on <strong>tiles</strong>: a block of queries against a block of keys/values at a time, like tiled matrix multiplication.</p>
+<p>But there is an obstruction, and it is the crux of the whole topic:</p>
+<div class="box warning"><div class="box-title">The obstruction</div>
+\(P_{ij} = e^{S_{ij}} / \sum_k e^{S_{ik}}\). The denominator sums over the <strong>entire row</strong> — all \(N\) scores for query \(i\). When we've only seen the first tile of keys, we cannot normalize, so we seemingly cannot compute any part of \(O_i = \sum_j P_{ij} V_j\) yet. Softmax looks fundamentally non-tileable.
+</div>
+<p>Chapter 3 dissolves this obstruction with the <em>online softmax</em>: maintain a running max and running denominator, and <em>retroactively rescale</em> previously accumulated output whenever they change. It computes exact softmax — no approximation — one tile at a time.</p>
+<p>There's a second problem: training needs \(P\) for the backward pass, and \(P\) is exactly what we refuse to store. The fix (Chapter 6) is <strong>recomputation</strong>: store only a length-\(N\) vector of row statistics (\(L = m + \log\ell\)) and rebuild tiles of \(P\) on the fly during backward — trading cheap FLOPs for expensive bytes, which §1.4 just taught us is a great trade.</p>
+
+<div class="quiz" data-concept="ch1.html#preview" data-concept-label="§1.6 What it would take">
+  <div class="q-text"><p>Two questions, from memory: (a) What property of row-wise softmax prevents straightforward tiling of attention? (b) Training needs \(P\) in the backward pass, but Flash Attention never stores it — what is the strategy, and why is it a <em>good</em> trade rather than a regrettable one?</p></div>
+  <div class="hint">(a) Look at the denominator of \(P_{ij}\). What does it range over?</div>
+  <div class="hint">(b) Recall the roofline: which resource is scarce, bytes or FLOPs?</div>
+  <div class="answer">
+    <p>(a) The softmax denominator \(\sum_{k=1}^N e^{S_{ik}}\) couples every entry of row \(i\): with only a tile of keys seen, weights can't be normalized, so the output contribution can't be finalized.</p>
+    <p>(b) Recomputation: save only the per-row log-sum-exp \(L_i\) (\(N\) floats vs. \(N^2\)), and recompute tiles of \(S\) and \(P = e^{S-L}\) during backward. Attention is memory-bound — the GPU has idle FLOPs but no spare bandwidth — so spending extra FLOPs to avoid \(\Theta(N^2)\) HBM traffic (and \(\Theta(N^2)\) activation storage) makes both training faster <em>and</em> dramatically more memory-efficient.</p>
+  </div>
+</div>
+
+<div class="box recall-pause"><div class="box-title">Before moving on — closed-book check</div>
+On a blank sheet: (1) the three attention equations with shapes; (2) total forward FLOPs; (3) total naive HBM traffic; (4) the definition of memory-bound; (5) the one property of softmax that blocks tiling. If any of the five doesn't come out in under a minute, re-read its section now — Chapters 4–7 assume all five are reflexes.
+</div>
+
+</main>
+</body>
+</html>
