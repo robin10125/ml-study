@@ -124,8 +124,8 @@ def _pallas_fwd_kernel(q_ref, k_ref, v_ref, o_ref, lse_ref, *,
 
     def body(j, carry):
         m, l, acc = carry
-        kj = pl.load(k_ref, (pl.dslice(j * block_k, block_k), slice(None)))
-        vj = pl.load(v_ref, (pl.dslice(j * block_k, block_k), slice(None)))
+        kj = k_ref[pl.dslice(j * block_k, block_k), :]
+        vj = v_ref[pl.dslice(j * block_k, block_k), :]
         s = jnp.dot(q, kj.T) * scale                  # (block_q, block_k)
         if causal:
             rows = i * block_q + jax.lax.broadcasted_iota(

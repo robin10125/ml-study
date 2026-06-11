@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 5 · FA-2 Forward Pass in CUDA</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 5</span> · FA-2 Forward Pass in CUDA</h1>
+<p class="subtitle">This is a workbook. You will build a complete, compilable FlashAttention-2-style forward kernel in five steps, writing each piece <em>before</em> seeing it. The finished program (<a href="code/flash_fwd.cu">code/flash_fwd.cu</a>) compiles with <code>nvcc -O3 -arch=native</code> and passes verification against a CPU reference to ~1e-7 — it was tested on real hardware before being included here.</p>
+
+<h2 id="kernel-spec">5.0 The spec — and what we simplify</h2>
+<p>We implement the 13-line algorithm of §4.2 with these choices:</p>
+<table>
+<tr><th>Choice</th><th>Our teaching kernel</th><th>Real FlashAttention-2</th></tr>
+<tr><td>Precision</td><td>fp32 everywhere</td><td>fp16/bf16 inputs, fp32 accumulators</td></tr>
+<tr><td>Matmuls</td><td>plain per-thread loops</td><td>tensor cores (<code>mma</code> instructions via CUTLASS/CuTe)</td></tr>
+<tr><td>Work split</td><td><strong>one thread = one query row</strong>; block = \(B_r\) threads</td><td>one <em>warp</em> = a slice of query rows (split-Q, §4.4); 4–8 warps</td></tr>
+<tr><td>Sizes</td><td>\(d=64\), \(B_r=B_c=64\), template constants</td><td>tuned per head-dim/GPU; smem &gt; 48 KB via dynamic alloc</td></tr>
+<tr><td>Layout</td><td><code>[B, H, N, d]</code> contiguous</td><td><code>[B, N, H, d]</code> (matches how QKV projections emerge)</td></tr>
+<tr><td>Pipelining</td><td>none</td><td><code>cp.async</code> overlaps next tile's loads with compute</td></tr>
+</table>
+<p>Every simplification changes <em>speed</em>, none changes the <em>algorithm</em>: the grid mapping, the SRAM-resident tiles, the online-softmax inner loop, the single deferred normalization, and the \(L\) write are all exactly FA-2. §5.8 closes the gap to the real thing conceptually.</p>
+<p>"One thread = one query row" deserves one comment: it works precisely because of §1.1 — softmax rows are independent, so a thread can carry its row's entire state \((m, \ell, o[d])\) privately in registers, and the <em>only</em> cooperation threads need is staging the shared \(K_j, V_j\) tiles. It is the same division of labor as FA-2's split-Q, just at thread rather than warp granularity.</p>
+
+<div class="quiz" data-concept="ch5.html#kernel-spec" data-concept-label="§5.0 The spec">
+  <div class="q-text"><p>Why can a single thread own a whole query row without ever synchronizing with other threads about softmax state — and what is then the <em>only</em> reason this kernel contains <code>__syncthreads()</code> at all?</p></div>
+  <div class="hint">What is shared between rows in the algorithm of §4.2? Only two tensors.</div>
+  <div class="answer"><p>Row \(i\)'s statistics \((m_i, \ell_i)\) and output \(O_i\) depend only on row \(i\) of \(S\) — softmax rows are independent (§1.1) — so a thread's state never interacts with another thread's. The barriers exist solely for the cooperatively staged \(K_j, V_j\) tiles in shared memory: one barrier so nobody computes with a half-loaded tile, one so nobody overwrites a tile still being read (§2.5 rhythm).</p></div>
+</div>
+
+<h2 id="launch">5.1 Step 1 — launch configuration and indexing</h2>
+<p><strong>Write first:</strong> the kernel signature, the grid/block mapping from §4.5, and the pointer arithmetic that gives each thread block its (batch, head) slice and each thread its query row. Inputs <code>Q, K, V</code>, outputs <code>O</code> (all <code>[B,H,N,d]</code>) and <code>L</code> (<code>[B,H,N]</code>), runtime <code>int N</code>, <code>float scale</code>.</p>
+
+<div class="quiz" data-concept="ch4.html#partitioning" data-concept-label="§4.5 Work partitioning">
+  <div class="q-text"><p>Write: (a) the host-side <code>dim3 grid(...)</code> and block size for \(B\) batches, \(H\) heads, sequence length \(N\), row-block \(B_r\); (b) the first ~10 lines of the kernel: recover <code>row</code> (my global query index) and the five base pointers for my (batch, head). Mind integer overflow for large tensors.</p></div>
+  <div class="hint">Grid axes: x ← query block (the FA-2 sequence-parallel axis!), y ← head, z ← batch. Block: \(B_r\) threads, 1-D.</div>
+  <div class="hint">The (batch, head) pair flattens to <code>bh = blockIdx.z * gridDim.y + blockIdx.y</code>; each head slice holds <code>N*d</code> floats. Use <code>size_t</code> for the product.</div>
+  <div class="answer">
+<pre><code>// host:
+dim3 grid((N + Br - 1) / Br, H, B);     // x: T_r query blocks, y: heads, z: batch
+flash_fwd&lt;D, BR, BC, false&gt;&lt;&lt;&lt;grid, BR&gt;&gt;&gt;(Q, K, V, O, L, N, scale);
+
+// kernel:
+const int tid = threadIdx.x;
+const int row = blockIdx.x * Br + tid;            // my global query index
+
+const size_t bh = (size_t)blockIdx.z * gridDim.y + blockIdx.y;
+const float* Qh = Q + bh * N * d;
+const float* Kh = K + bh * N * d;
+const float* Vh = V + bh * N * d;
+float*       Oh = O + bh * N * d;
+float*       Lh = L + bh * N;
+</code></pre>
+<p>Grading notes: grid.x must be the rounded-up \(T_r\) (so <code>row &lt; N</code> guards are needed later when \(N\) isn't a multiple of \(B_r\)); the <code>size_t</code> cast prevents 32-bit overflow at <code>B·H·N·d</code> ≳ 2³¹.</p>
+  </div>
+</div>
+
+<h2 id="loads">5.2 Step 2 — declarations and the cooperative K/V load</h2>
+<p>Per-block shared memory: the two streamed tiles. Per-thread registers: my query row, my accumulator, my score row, my statistics.</p>
+<pre><code>__shared__ float Ks[Bc][d];      // 64*64*4 = 16 KB
+__shared__ float Vs[Bc][d];      // 16 KB   → 32 KB/block, under the 48 KB limit
+
+float q[d], o[d], s[Bc];         // ~192 floats: near the 255-register ceiling;
+float m = -INFINITY, l = 0.f;    // some spilling is acceptable in this version
+
+if (row &lt; N)
+    for (int k = 0; k &lt; d; k++) q[k] = Qh[(size_t)row * d + k];
+for (int k = 0; k &lt; d; k++) o[k] = 0.f;
+</code></pre>
+<p><strong>Write first:</strong> the inner-loop opening — all \(B_r\) threads cooperatively copying the \(B_c \times d\) tiles \(K_j, V_j\) into <code>Ks/Vs</code>, with out-of-range rows zero-filled, followed by the barrier.</p>
+
+<div class="quiz" data-concept="ch2.html#coalescing" data-concept-label="§2.4 Coalescing + §2.5 barriers">
+  <div class="q-text"><p>Write the cooperative load: \(B_c \cdot d = 4096\) elements, \(B_r = 64\) threads, so each thread moves 64 elements. Make consecutive threads touch consecutive addresses, guard rows past \(N\) with zeros, and place the barrier. Then answer: is your access pattern coalesced, and why?</p></div>
+  <div class="hint">Flatten: let each thread walk <code>idx = tid; idx &lt; Bc*d; idx += Br</code> and split <code>idx</code> into row <code>idx / d</code> and column <code>idx % d</code> of the tile.</div>
+  <div class="hint">With this flattening, thread <code>tid</code> and <code>tid+1</code> access global offsets that differ by exactly 1 float. That's the definition of coalesced.</div>
+  <div class="answer">
+<pre><code>for (int j0 = 0; j0 &lt; N; j0 += Bc) {                  // KV-tile loop (line 3 of §4.2)
+    for (int idx = tid; idx &lt; Bc * d; idx += Br) {
+        int r = idx / d, c = idx % d;
+        bool in_range = (j0 + r) &lt; N;
+        Ks[r][c] = in_range ? Kh[(size_t)(j0 + r) * d + c] : 0.f;
+        Vs[r][c] = in_range ? Vh[(size_t)(j0 + r) * d + c] : 0.f;
+    }
+    __syncthreads();
+    ...
+</code></pre>
+<p>Coalesced: for a fixed strided-loop step, threads <code>tid..tid+31</code> have consecutive <code>idx</code>, hence consecutive <code>c</code> within one tile row (since \(d = 64 \ge 32\) keeps a warp inside one row), hence consecutive global addresses → ~4 transactions per warp. The zero-fill is safe because a zero K row produces score 0 — but only because we <em>also</em> mask out-of-range columns with \(-\infty\) in step 3; the zero here just prevents reading garbage.</p>
+  </div>
+</div>
+
+<h2 id="scores">5.3 Step 3 — the score row, with masking</h2>
+<p><strong>Write first:</strong> each thread computes its row of the score tile, \(s_c = \tau \,(q \cdot K_c)\) for \(c = 0..B_c{-}1\), tracking the tile row-max \(\tilde m\) as it goes, with two mask conditions applied by setting \(s_c = -\infty\): column out of range (\(j_0 + c \ge N\)), and — if causal — column in my future (\(j_0 + c \gt \text{row}\)).</p>
+
+<div class="quiz" data-concept="ch4.html#causal" data-concept-label="§4.6 Causal masking">
+  <div class="q-text"><p>Write the score loop (everything from here on sits inside <code>if (row &lt; N) { ... }</code> — why inside, while the load loop above was <em>not</em> guarded?). Also recall from Chapter 3: why is \(-\infty\) the correct mask value rather than, say, a large negative constant or skipping the column?</p></div>
+  <div class="hint">Threads with <code>row ≥ N</code> still have to participate in the cooperative loads and barriers; they just must not write outputs.</div>
+  <div class="hint">What does \(e^{-\infty}\) contribute to \(\ell\) and \(o\) in the online update?</div>
+  <div class="answer">
+<pre><code>if (row &lt; N) {
+    float mt = -INFINITY;
+    for (int c = 0; c &lt; Bc; c++) {
+        float dot = 0.f;
+        #pragma unroll
+        for (int k = 0; k &lt; d; k++) dot += q[k] * Ks[c][k];
+        bool masked = (j0 + c &gt;= N) || (causal &amp;&amp; j0 + c &gt; row);
+        s[c] = masked ? -INFINITY : dot * scale;
+        mt = fmaxf(mt, s[c]);
+    }
+</code></pre>
+<p>The load loop is unguarded because every thread of the block must reach <code>__syncthreads()</code> (§2.5) and the loads are useful work regardless of the thread's own row. \(-\infty\) is correct because \(e^{-\infty - m_{\text{new}}} = 0\): the masked column contributes exactly nothing to \(\ell\) or \(o\) with zero special-case code (§3 recall on edge cases). A finite constant like \(-10^9\) would contribute \(e^{-10^9 - m}\,{=}\,0\) too in practice but breaks \(L\)'s exactness guarantees in edge cases and is a famous source of subtle bugs when scales change. Note also <code>Ks[c][k]</code> is read by all threads at the same address simultaneously — a shared-memory <em>broadcast</em>, no bank conflict (§2.5).</p>
+  </div>
+</div>
+
+<h2 id="online-update">5.4 Step 4 — the online softmax update (the heart)</h2>
+<p><strong>Write first, from memory of §4.2 lines 6–11:</strong> given <code>m</code>, <code>l</code>, <code>o[d]</code>, the fresh score row <code>s[Bc]</code> and its max <code>mt</code>, fold the tile in. Five small statements plus two loops. Then close the tile loop with the second barrier.</p>
+
+<div class="quiz" data-concept="ch4.html#fa2-forward" data-concept-label="§4.2 The forward algorithm">
+  <div class="q-text"><p>Write the update. Then trace it for the very first tile (where \(m = -\infty\), \(\ell = 0\)): what do <code>alpha</code> and the two rescales do, and why does no special "first tile" branch exist?</p></div>
+  <div class="hint">Order matters: compute <code>m_new</code> and <code>alpha</code> <em>before</em> touching <code>l</code> and <code>o</code>; update <code>m</code> last.</div>
+  <div class="hint">First tile: <code>alpha = expf(-INFINITY - m_new) = 0</code>.</div>
+  <div class="answer">
+<pre><code>    float m_new = fmaxf(m, mt);
+    float alpha = __expf(m - m_new);      // history-repair factor (§3.4)
+    l *= alpha;
+    #pragma unroll
+    for (int k = 0; k &lt; d; k++) o[k] *= alpha;
+    for (int c = 0; c &lt; Bc; c++) {
+        float p = __expf(s[c] - m_new);   // masked entries: exp(-inf) = 0
+        l += p;
+        #pragma unroll
+        for (int k = 0; k &lt; d; k++) o[k] += p * Vs[c][k];
+    }
+    m = m_new;
+}                       // end of if (row &lt; N)
+__syncthreads();        // protect Ks/Vs from the next iteration's loads
+}                       // end of j0 loop
+</code></pre>
+<p>First tile: <code>alpha = 0</code> multiplies the empty history (\(\ell{=}0\), \(o{=}\mathbf 0\)) by zero — a no-op by construction, which is exactly why the \((-\infty, 0, \mathbf 0)\) initialization needs no special casing. The <code>p·Vs</code> loop is this kernel's hot spot: \(B_c \times d\) fused multiply-adds per tile per thread — in real FA-2 this and the score loop are the two tensor-core matmuls. (<code>__expf</code> is the fast hardware exponential; it's accurate to ~2 ulp which is plenty here.)</p>
+  </div>
+</div>
+
+<h2 id="epilogue">5.5 Step 5 — epilogue</h2>
+<p><strong>Write first:</strong> after the tile loop — the FA-2 deferred normalization, the single output write, and the log-sum-exp write.</p>
+
+<div class="quiz" data-concept="ch3.html#lse" data-concept-label="§3.5 Log-sum-exp">
+  <div class="q-text"><p>Write the epilogue. What exactly does each output row's HBM traffic total over the whole kernel, and which FA-2 improvement (of the three in §4.4) do these four lines embody?</p></div>
+  <div class="hint">Divide once. Write \(O\) once. Write one extra float per row.</div>
+  <div class="answer">
+<pre><code>if (row &lt; N) {
+    float inv = 1.f / l;
+    for (int k = 0; k &lt; d; k++) Oh[(size_t)row * d + k] = o[k] * inv;
+    Lh[row] = m + logf(l);
+}
+</code></pre>
+<p>Each output row is written to HBM exactly once (plus one float of \(L\)); it was never read back or partially written during the loop. The four lines embody improvement #1: normalization deferred to a single division (instead of per-tile renormalization), and only \(L = m + \log\ell\) stored for backward (instead of both \(m\) and \(\ell\)).</p>
+  </div>
+</div>
+
+<h2 id="full-kernel">5.6 The complete verified program</h2>
+<p>The full file — kernel, CPU reference, and test harness over four configurations including non-multiple-of-tile sizes — is at <a href="code/flash_fwd.cu"><code>code/flash_fwd.cu</code></a>. The kernel in one piece:</p>
+<pre><code>template &lt;int d, int Br, int Bc, bool causal&gt;
+__global__ void flash_fwd(const float* __restrict__ Q,
+                          const float* __restrict__ K,
+                          const float* __restrict__ V,
+                          float* __restrict__ O,
+                          float* __restrict__ L,
+                          int N, float scale) {
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x * Br + tid;          // my global query index
+
+    const size_t bh = (size_t)blockIdx.z * gridDim.y + blockIdx.y;
+    const float* Qh = Q + bh * N * d;
+    const float* Kh = K + bh * N * d;
+    const float* Vh = V + bh * N * d;
+    float*       Oh = O + bh * N * d;
+    float*       Lh = L + bh * N;
+
+    __shared__ float Ks[Bc][d];
+    __shared__ float Vs[Bc][d];
+
+    float q[d], o[d], s[Bc];
+    float m = -INFINITY, l = 0.f;
+
+    if (row &lt; N)
+        for (int k = 0; k &lt; d; k++) q[k] = Qh[(size_t)row * d + k];
+    for (int k = 0; k &lt; d; k++) o[k] = 0.f;
+
+    // Causal: tiles strictly above the diagonal are skipped entirely (§4.6).
+    const int j_end = causal ? min(N, blockIdx.x * Br + Br) : N;
+
+    for (int j0 = 0; j0 &lt; j_end; j0 += Bc) {
+        for (int idx = tid; idx &lt; Bc * d; idx += Br) {
+            int r = idx / d, c = idx % d;
+            bool in_range = (j0 + r) &lt; N;
+            Ks[r][c] = in_range ? Kh[(size_t)(j0 + r) * d + c] : 0.f;
+            Vs[r][c] = in_range ? Vh[(size_t)(j0 + r) * d + c] : 0.f;
+        }
+        __syncthreads();
+
+        if (row &lt; N) {
+            float mt = -INFINITY;
+            for (int c = 0; c &lt; Bc; c++) {
+                float dot = 0.f;
+                #pragma unroll
+                for (int k = 0; k &lt; d; k++) dot += q[k] * Ks[c][k];
+                bool masked = (j0 + c &gt;= N) || (causal &amp;&amp; j0 + c &gt; row);
+                s[c] = masked ? -INFINITY : dot * scale;
+                mt = fmaxf(mt, s[c]);
+            }
+            float m_new = fmaxf(m, mt);
+            float alpha = __expf(m - m_new);
+            l *= alpha;
+            #pragma unroll
+            for (int k = 0; k &lt; d; k++) o[k] *= alpha;
+            for (int c = 0; c &lt; Bc; c++) {
+                float p = __expf(s[c] - m_new);
+                l += p;
+                #pragma unroll
+                for (int k = 0; k &lt; d; k++) o[k] += p * Vs[c][k];
+            }
+            m = m_new;
+        }
+        __syncthreads();
+    }
+
+    if (row &lt; N) {
+        float inv = 1.f / l;
+        for (int k = 0; k &lt; d; k++) Oh[(size_t)row * d + k] = o[k] * inv;
+        Lh[row] = m + logf(l);
+    }
+}
+</code></pre>
+<p>Build and run:</p>
+<pre><code>$ nvcc -O3 -arch=native -o flash_fwd flash_fwd.cu
+$ ./flash_fwd
+non-causal   B=2 H=3 N=200    max|dO|=1.34e-07  max|dL|=9.54e-07  PASS
+non-causal   B=1 H=2 N=512    max|dO|=1.86e-07  max|dL|=1.43e-06  PASS
+causal       B=2 H=3 N=200    max|dO|=1.79e-07  max|dL|=9.54e-07  PASS
+causal       B=1 H=2 N=512    max|dO|=1.27e-07  max|dL|=9.54e-07  PASS
+</code></pre>
+
+<div class="quiz" data-concept="ch4.html#causal" data-concept-label="§4.6 Causal masking">
+  <div class="q-text"><p>The causal support is exactly two lines of this kernel. Identify both from memory, explain each, and explain why the loop-bound line alone also guarantees the \(\alpha = \mathrm{nan}\) edge case (§3, fully-masked tile) can never occur.</p></div>
+  <div class="hint">One line changes how far the KV loop runs; one line adds a mask predicate per score.</div>
+  <div class="answer"><p>(1) <code>j_end = min(N, blockIdx.x*Br + Br)</code>: the KV loop stops at the diagonal block — "skip" tiles (§4.6) are never loaded or computed, giving the ~2× causal speedup. (2) <code>causal &amp;&amp; j0 + c &gt; row</code> in the mask predicate handles the diagonal-straddling tiles per element. No-NaN guarantee: the <em>first</em> visited tile (\(j_0 = 0\)) is never masked for any row, since key 0 is in every query's past — so \(m\) becomes finite on iteration one. Any later tile that happens to be fully masked <em>for a particular row</em> (possible when \(B_c \lt B_r\)) just yields \(\tilde m = -\infty\), \(m_{\text{new}} = m\) (still finite), \(\alpha = e^0 = 1\): a clean no-op, never \(-\infty - (-\infty)\).</p></div>
+</div>
+
+<div class="quiz" data-concept="ch5.html#full-kernel" data-concept-label="§5.6 The complete kernel">
+  <div class="q-text"><p><strong>Capstone (the point of the whole course).</strong> Close every reference. Open an empty <code>flash_fwd.cu</code>. Write the entire kernel + a host <code>main()</code> that allocates random \(Q,K,V\) for \(B{=}2, H{=}3, N{=}200, d{=}64\), runs the kernel, and verifies against a CPU triple-loop attention. Compile and run. Budget ~60–90 minutes. Only then diff against <a href="code/flash_fwd.cu">the reference file</a>.</p></div>
+  <div class="hint">Order of work: CPU reference first (it's your oracle), then kernel skeleton (indexing + loads + barriers), then score row, then online update, then epilogue. Test after each stage by printing one row.</div>
+  <div class="hint">The three classic bugs: missing second <code>__syncthreads()</code>; forgetting <code>l *= alpha</code> (only rescaling <code>o</code>); putting compute <em>outside</em> <code>if (row &lt; N)</code> so ghost threads write past the tensor.</div>
+  <div class="answer"><p>Reference: <a href="code/flash_fwd.cu"><code>code/flash_fwd.cu</code></a>. You're done when all four harness configs print PASS with errors ≈1e-7. If <code>max|dO|</code> is ~1e-3, you have an algorithmic mismatch (usually a missing rescale), not float noise. If results vary run to run, you have a race (missing barrier). If only \(N{=}200\) fails but 512 passes, an edge guard is wrong.</p></div>
+</div>
+
+<h2 id="toward-real">5.7 From here to the real FlashAttention-2</h2>
+<p>What separates this ~70-line kernel from the production one (which is thousands of lines of CUTLASS/CuTe templates), in order of impact:</p>
+<ol>
+  <li><strong>Tensor cores.</strong> Our two inner matmuls (score loop, <code>p·Vs</code> loop) run on scalar FMA units. Real FA-2 issues <code>mma.sync</code> instructions on 16×8×16 fp16 fragments held in registers — ~16× more matmul throughput. This is also why it splits rows across <em>warps</em> rather than threads: a tensor-core op is a warp-cooperative instruction; the warp collectively owns a \(16\times B_c\) slice of \(S\), and the row max/sum are finished with the §2.6b shuffles across the few lanes sharing a row.</li>
+  <li><strong>Register pressure.</strong> Our <code>q[64], o[64], s[64]</code> ≈ 192+ floats/thread forces spills. The warp-cooperative layout shares these across 32 lanes (~6 floats each of \(o\), etc.), keeping everything truly register-resident.</li>
+  <li><strong>Async pipelining.</strong> <code>cp.async</code> (Ampere+) lets the block copy tile \(j{+}1\) HBM→smem <em>while</em> computing on tile \(j\) (double buffering: two smem tile buffers, alternating) — hiding essentially all load latency. On Hopper, the TMA unit and warp specialization (producer/consumer warps) push this further.</li>
+  <li><strong>Shared-memory swizzling.</strong> Tensor-core loads from smem hit bank conflicts unless the tile layout is permuted ("swizzled"); CUTLASS does this automatically. (Our kernel dodges conflicts by accident: its smem reads are broadcasts.)</li>
+  <li><strong>Bigger tiles, dynamic smem.</strong> \(B_r{=}128\) halves K/V traffic (§4.3) but needs &gt;48 KB smem → dynamic allocation + <code>cudaFuncSetAttribute</code> opt-in (§2.7), and Q itself staged in smem rather than registers.</li>
+</ol>
+
+<div class="quiz" data-concept="ch5.html#toward-real" data-concept-label="§5.7 Toward real FA-2">
+  <div class="q-text"><p>From memory, name at least four of the five techniques that separate the teaching kernel from production FA-2, and for each say in one phrase what cost it removes.</p></div>
+  <div class="hint">Think: arithmetic units, registers, latency, banks, tile size.</div>
+  <div class="answer"><p>(1) Tensor cores — removes the ~16× matmul-throughput gap of scalar FMAs; (2) warp-cooperative tiling — removes register spills by sharing row state across 32 lanes; (3) <code>cp.async</code> double buffering — removes HBM load latency from the critical path; (4) smem swizzling — removes bank conflicts on tensor-core tile loads; (5) \(B_r = 128\) with dynamic smem — removes half the K/V HBM traffic.</p></div>
+</div>
+
+<div class="box recall-pause"><div class="box-title">Before Chapter 6</div>
+The backward chapter assumes you have <em>written and run</em> the forward kernel, not just read it. The backward kernel reuses every mechanic (grid mapping, cooperative loads, barriers, per-thread accumulators) and adds three new ideas: recomputation from \(L\), a column-parallel grid, and atomics. If the capstone isn't done, do it now.
+</div>
+
+</main>
+</body>
+</html>

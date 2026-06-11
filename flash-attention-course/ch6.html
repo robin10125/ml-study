@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 6 · The Backward Pass</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 6</span> · The Backward Pass</h1>
+<p class="subtitle">Training needs \(\partial\mathcal{L}/\partial Q, K, V\) given \(dO = \partial\mathcal{L}/\partial O\) — and the forward pass deliberately threw away the \(N\times N\) matrices the chain rule seems to require. Plan: derive the gradients, find the two scalars per row that summarize everything, recompute the rest, and put it all in a verified CUDA kernel.</p>
+
+<h2 id="why-recompute">6.1 What backward needs, and the recomputation bargain</h2>
+<p>The forward pass saved: \(Q, K, V, O\) (all \(\Theta(Nd)\)) and \(L = m + \log\ell\) (\(\Theta(N)\)). It did <em>not</em> save \(S\) or \(P\). But §3.5 showed every attention weight is reconstructible in one expression:</p>
+$$ P_{ij} = e^{S_{ij} - L_i}, \qquad S_{ij} = \tau\, q_i \cdot k_j .$$
+<p>So the backward pass <strong>recomputes each tile of \(S\) and \(P\) on the fly</strong>, exactly when needed, in SRAM — paying roughly the forward pass's score-matmul again (backward totals \(\approx 10 N^2 d\) FLOPs vs forward's \(4N^2d\)) to avoid ever materializing \(N^2\) values in HBM. Chapter 1's roofline says this is the right side of the trade: FLOPs are abundant, bytes are not. Bonus subtlety: using the <em>stored</em> \(L\) (rather than re-deriving row maxes tile-by-tile) means the backward needs no online-softmax recurrence at all — any tile of \(P\) can be computed exactly, in isolation, in any order. That freedom is what lets backward parallelize differently than forward.</p>
+
+<div class="quiz" data-concept="ch6.html#why-recompute" data-concept-label="§6.1 Recomputation">
+  <div class="q-text"><p>From memory: what exactly does FA-2's forward save for backward, how is a tile of \(P\) reconstructed, and why does having \(L\) (as opposed to running \((m,\ell)\) statistics) make the backward's tiles <em>order-independent</em>?</p></div>
+  <div class="hint">\(L\) is a property of the <em>whole</em> row, already fully reduced.</div>
+  <div class="answer"><p>Saved: \(Q, K, V, O, L\) — \(\Theta(Nd + N)\) total. Reconstruction: recompute \(S_{\text{tile}} = \tau Q_i K_j^\top\), then \(P_{\text{tile}} = \exp(S_{\text{tile}} - L_i)\), exact because \(e^{s-m}/\ell = e^{s-L}\). Since \(L_i\) already encodes the full row's max and denominator, no partial state needs to flow between tiles: every \((i,j)\) tile of \(P\) is computable independently — unlike the forward, where \((m, \ell)\) had to be carried sequentially across \(j\).</p></div>
+</div>
+
+<h2 id="gradients">6.2 Deriving the gradients</h2>
+<p>Forward, per row where needed: \(S = \tau QK^\top\), \(P = \mathrm{softmax}(S)\), \(O = PV\). We use the convention \(dX := \partial\mathcal{L}/\partial X\) (same shape as \(X\)). Work backwards through the three steps.</p>
+
+<h3>Step 1: through \(O = PV\)</h3>
+<p>For a product \(C = AB\): \(dA = dC\,B^\top\) and \(dB = A^\top dC\). Applied here:</p>
+$$ dV = P^\top dO \;\in \mathbb{R}^{N\times d}, \qquad dP = dO\, V^\top \;\in \mathbb{R}^{N\times N}. $$
+
+<h3>Step 2: through the row softmax</h3>
+<p>For one row, \(p = \mathrm{softmax}(s)\): \(\partial p_j / \partial s_c = p_j(\delta_{jc} - p_c)\) (differentiate \(p_j = e^{s_j}/\sum_k e^{s_k}\) — do it once in your life). Chain rule:</p>
+$$ ds_c = \sum_j dp_j\, p_j(\delta_{jc} - p_c) = p_c\Big(dp_c - \underbrace{\textstyle\sum_j p_j\, dp_j}_{\text{call it } D}\Big), $$
+<p>i.e. in matrix form, with \(D_i = \sum_j P_{ij}\, dP_{ij}\) (a length-\(N\) vector, one scalar per row):</p>
+$$ dS = P \circ (dP - D\,\mathbf{1}^\top). $$
+
+<h3>Step 3: the \(D\) trick — and through \(S = \tau QK^\top\)</h3>
+<p>As written, \(D_i\) needs a full row of \(P\) <em>and</em> \(dP\) — an \(O(N)\) reduction per row that would couple all tiles. The rescue is a little identity. Substitute \(dP = dO V^\top\):</p>
+$$ D_i = \sum_j P_{ij} (dO\,V^\top)_{ij} = \sum_j P_{ij} \sum_k dO_{ik} V_{jk} = \sum_k dO_{ik} \underbrace{\sum_j P_{ij} V_{jk}}_{=\,O_{ik}} = \sum_k dO_{ik}\, O_{ik}. $$
+<div class="box keypoint"><div class="box-title">The D trick</div>
+\(D = \mathrm{rowsum}(dO \circ O)\): the per-row reduction over \(N\) attention weights collapses into a per-row dot product of two <em>length-\(d\)</em> vectors we already have in HBM. Computable by a trivial standalone kernel before the main backward, stored as \(N\) floats alongside \(L\). FA-2 calls this the "preprocessing" step.
+</div>
+<p>Finally, through \(S = \tau\, QK^\top\):</p>
+$$ dQ = \tau\, dS\, K, \qquad dK = \tau\, dS^\top Q. $$
+
+<div class="quiz" data-concept="ch6.html#gradients" data-concept-label="§6.2 Step 1–2 (dV, dP, dS)">
+  <div class="q-text"><p>From memory, derive: (a) \(dV\) and \(dP\) from \(O = PV\); (b) the row-softmax Jacobian \(\partial p_j/\partial s_c\), and from it the formula \(ds = p \circ (dp - D)\) with \(D = p^\top dp\). Shapes for everything.</p></div>
+  <div class="hint">(a) Memorize once: for \(C = AB\), \(dA = dC B^\top\), \(dB = A^\top dC\) — check it by matching shapes.</div>
+  <div class="hint">(b) Write \(p_j = e^{s_j}/Z\); differentiate with quotient rule, treating \(j = c\) and \(j \ne c\) cases together via \(\delta_{jc}\).</div>
+  <div class="answer"><p>(a) \(dV = P^\top dO\) (\(N\times d\)), \(dP = dO V^\top\) (\(N\times N\)). (b) \(\partial p_j/\partial s_c = p_j \delta_{jc} - p_j p_c = p_j(\delta_{jc} - p_c)\); then \(ds_c = \sum_j dp_j p_j (\delta_{jc} - p_c) = p_c dp_c - p_c \sum_j p_j dp_j = p_c(dp_c - D)\) with scalar \(D = \sum_j p_j dp_j\) per row.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch6.html#gradients" data-concept-label="§6.2 Step 3 (the D trick)">
+  <div class="q-text"><p>Prove the \(D\) trick from memory: \(\mathrm{rowsum}(P \circ dP) = \mathrm{rowsum}(dO \circ O)\). Why does this matter so much for a <em>tiled</em> backward pass?</p></div>
+  <div class="hint">Substitute \(dP = dO V^\top\) and swap the order of the two sums.</div>
+  <div class="answer"><p>\(D_i = \sum_j P_{ij}(dO V^\top)_{ij} = \sum_j P_{ij}\sum_k dO_{ik}V_{jk} = \sum_k dO_{ik}\sum_j P_{ij}V_{jk} = \sum_k dO_{ik}O_{ik}\), using \(O = PV\). It matters because without it, computing any tile of \(dS\) would require first reducing \(dP \circ P\) across <em>all</em> column tiles of the row (a sequential dependency, like forward's \(\ell\)); with it, \(D\) comes from data of size \(\Theta(Nd)\) in a cheap preprocessing kernel, and every \((i,j)\) tile of the backward becomes fully independent.</p></div>
+</div>
+
+<h2 id="bwd-algo">6.3 The FA-2 backward algorithm</h2>
+<p>Look at the four outputs and where their reductions run:</p>
+<ul>
+  <li>\(dV_j = \sum_i P_{ij}^\top dO_i\) and \(dK_j = \tau\sum_i dS_{ij}^\top Q_i\): reductions over <strong>rows</strong> \(i\) — natural if a worker owns a <em>column</em> block and loops over row blocks.</li>
+  <li>\(dQ_i = \tau\sum_j dS_{ij} K_j\): a reduction over <strong>columns</strong> \(j\) — natural for a row-block worker.</li>
+</ul>
+<p>No single loop direction makes all three local. FA-2 chooses <strong>column-parallel</strong>: one thread block per K/V block \(j\), looping over all query blocks \(i\). Then <em>two</em> of the three accumulations (\(dK_j, dV_j\)) live in fast memory and are written once, and only \(dQ\) — whose contributions arrive from every column worker — is accumulated in HBM with <code>atomicAdd</code>. (The alternative used by some implementations: a second pass, row-parallel, just for \(dQ\) — atomics-free but reads everything twice. Trade-offs, always.)</p>
+<div class="box keypoint"><div class="box-title">Algorithm: FA-2 backward</div>
+<pre style="background:transparent;color:inherit;padding:0.2rem 0 0">
+ 0:  preprocess: D = rowsum(dO ∘ O)  (N floats)        ── tiny separate kernel
+     dQ ← 0                                            ── atomicAdd target
+     worker for key/value block j (one thread block):
+ 1:  load K_j, V_j (Bc×d) into SRAM;  dK_j ← 0, dV_j ← 0
+ 2:  for i = 1 … T_r:
+ 3:      load Q_i, dO_i (Br×d), L_i, D_i (Br) into SRAM
+ 4:      S = τ Q_i K_jᵀ                    ── recompute  (matmul 1)
+ 5:      P = exp(S − L_i)                  ── exact, no statistics needed
+ 6:      dV_j += Pᵀ dO_i                                 (matmul 2)
+ 7:      dP = dO_i V_jᵀ                                  (matmul 3)
+ 8:      dS = P ∘ (dP − D_i),  scaled by τ
+ 9:      dK_j += dSᵀ Q_i                                 (matmul 4)
+10:      dQ_i += dS K_j   via atomicAdd to HBM           (matmul 5)
+11:  write dK_j, dV_j to HBM
+</pre>
+</div>
+
+<div class="quiz" data-concept="ch6.html#bwd-algo" data-concept-label="§6.3 The backward algorithm">
+  <div class="q-text"><p>Why does FA-2's backward parallelize over <em>K/V column blocks</em> when its forward parallelized over <em>query row blocks</em>? Make the argument by listing, for each of \(dQ, dK, dV\), which loop direction its reduction runs over — and conclude which choice minimizes HBM-side accumulation.</p></div>
+  <div class="hint">Count: how many of the three outputs accumulate over rows? Over columns?</div>
+  <div class="answer"><p>\(dK_j\) and \(dV_j\) sum over all query blocks \(i\) (row direction); \(dQ_i\) sums over all key blocks \(j\) (column direction). A column-parallel worker keeps two of three accumulators (\(dK_j, dV_j\)) local in registers/SRAM, leaving only \(dQ\) to be accumulated through HBM atomics; row-parallel would invert this, forcing <em>two</em> tensors (\(dK, dV\)) through atomics. Pick the direction that localizes more state: column-parallel. (Forward had no such conflict: its only output \(O_i\) reduces over columns, so row-parallel localized everything.)</p></div>
+</div>
+
+<div class="quiz" data-concept="ch6.html#bwd-algo" data-concept-label="§6.3 The backward algorithm">
+  <div class="q-text"><p>Reproduce the 11-line backward algorithm from memory, including the preprocessing step, what is recomputed at lines 4–5, all five matmuls, and which write is atomic. (Same drill as §4.2 — this is what you'll code below.)</p></div>
+  <div class="hint">Per (j, i) tile pair: recompute S, P; then the four gradient lines in dependency order dV → dP → dS → (dK, dQ).</div>
+  <div class="answer"><p>See the boxed algorithm. Checklist: \(D\) precomputed as \(\mathrm{rowsum}(dO\circ O)\); \(dQ\) zero-initialized; \(P = \exp(S - L)\) with no online statistics; \(dS = P\circ(dP - D)\cdot\tau\); \(dK_j, dV_j\) written once at the end; \(dQ\) via <code>atomicAdd</code> inside the loop.</p></div>
+</div>
+
+<h2 id="bwd-kernel">6.4 The CUDA backward, workbook-style</h2>
+<p>Full verified program: <a href="code/flash_bwd.cu"><code>code/flash_bwd.cu</code></a> (it includes the Chapter 5 forward kernel, which generates the \(O\) and \(L\) that backward consumes). Mirroring §5.0's simplifications: fp32, scalar loops, and now <strong>one thread = one key/value column</strong>, block = \(B_c\) threads, grid = \((\lceil N/B_c\rceil, H, B)\).</p>
+
+<h3>Step 1 — the preprocessing kernel</h3>
+<div class="quiz" data-concept="ch6.html#gradients" data-concept-label="§6.2 The D trick">
+  <div class="q-text"><p>Write <code>bwd_preprocess</code>: one thread per row computes \(D_i = \sum_k dO_{ik} O_{ik}\). Signature: <code>(const float* dO, const float* O, float* D, int N)</code>, layout <code>[B,H,N,d]</code>, grid \((\lceil N/256\rceil, H, B)\), block 256. </p></div>
+  <div class="hint">Same <code>bh</code> pointer-offset pattern as Chapter 5, then a d-length dot product.</div>
+  <div class="answer">
+<pre><code>template &lt;int d&gt;
+__global__ void bwd_preprocess(const float* __restrict__ dO,
+                               const float* __restrict__ O,
+                               float* __restrict__ D, int N) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row &gt;= N) return;
+    size_t bh = (size_t)blockIdx.z * gridDim.y + blockIdx.y;
+    const float* dOh = dO + bh * N * d + (size_t)row * d;
+    const float* Oh  = O  + bh * N * d + (size_t)row * d;
+    float acc = 0.f;
+    for (int k = 0; k &lt; d; k++) acc += dOh[k] * Oh[k];
+    D[bh * N + row] = acc;
+}
+</code></pre>
+  </div>
+</div>
+
+<h3>Step 2 — the main kernel's skeleton</h3>
+<p>Each thread owns column <code>col = blockIdx.x * Bc + tid</code>: it keeps that column's \(k, v\) vectors and \(dk, dv\) accumulators in registers, while the block cooperatively stages \(Q_i, dO_i\) tiles (and \(L_i, D_i\) vectors) in shared memory — the exact mirror image of Chapter 5. Causality note for the loop bound: column \(c\) is only visible to queries \(i \ge c\), so a causal worker starts its query loop at its own diagonal block: <code>i_start = (blockIdx.x * Bc / Br) * Br</code>, and skips rows with <code>qrow &lt; col</code> inside diagonal tiles.</p>
+
+<h3>Step 3 — the inner loop (write this one yourself, it's the exam)</h3>
+<div class="quiz" data-concept="ch6.html#bwd-algo" data-concept-label="§6.3 The backward algorithm">
+  <div class="q-text"><p>Thread state: <code>kvec[d], vvec[d], dk[d], dv[d]</code>; shared: <code>Qs[Br][d], dOs[Br][d], Ls[Br], Ds[Br]</code> (already loaded and barriered). Write the loop body over local rows <code>r</code>: recompute \(s\) and \(p\), update <code>dv</code>, compute <code>dp</code>, then <code>ds</code>, update <code>dk</code>, and atomically add to global <code>dQ</code>. Be precise about where <code>scale</code> (τ) appears — it enters in <em>two</em> places, and misplacing it is the classic bug.</p></div>
+  <div class="hint">τ location 1: inside the exponent (\(p = e^{\tau(q\cdot k) - L}\)) because \(S\) includes τ. Location 2: as a factor on \(ds\), because \(dQ = \tau\, dS K\) and \(dK = \tau\, dS^\top Q\) — fold it into <code>ds</code> once and both inherit it.</div>
+  <div class="hint">Per row, the five updates in dependency order: \(p\) → (\(dv\), \(dp\)) → \(ds\) → (\(dk\), atomic \(dq\)).</div>
+  <div class="answer">
+<pre><code>int r_max = min(Br, N - i0);
+for (int r = 0; r &lt; r_max; r++) {
+    int qrow = i0 + r;
+    if (causal &amp;&amp; qrow &lt; col) continue;        // this query can't see my key
+
+    float s = 0.f;
+    #pragma unroll
+    for (int x = 0; x &lt; d; x++) s += Qs[r][x] * kvec[x];
+    float p = __expf(s * scale - Ls[r]);        // P_rc, exact (τ in exponent)
+
+    float dp = 0.f;
+    #pragma unroll
+    for (int x = 0; x &lt; d; x++) {
+        dv[x] += p * dOs[r][x];                 // dV_c += P_rc · dO_r
+        dp    += dOs[r][x] * vvec[x];           // dP_rc = dO_r · v_c
+    }
+
+    float ds = p * (dp - Ds[r]) * scale;        // dS_rc, τ folded in once
+
+    #pragma unroll
+    for (int x = 0; x &lt; d; x++) {
+        dk[x] += ds * Qs[r][x];                 // dK_c += dS_rc · q_r
+        atomicAdd(&amp;dQh[(size_t)qrow * d + x], ds * kvec[x]);   // dQ_r += dS_rc · k_c
+    }
+}
+</code></pre>
+<p>Why <code>atomicAdd</code>: every column block \(j\) contributes to the <em>same</em> rows of \(dQ\), and thread blocks cannot synchronize with each other (§2.2) — concurrent read-modify-writes to <code>dQ[qrow]</code> from different blocks would race. Note the consequence you can observe: atomics make \(dQ\) bitwise nondeterministic across runs (float addition isn't associative), which is why frameworks expose "deterministic" modes that use the slower two-pass strategy instead.</p>
+  </div>
+</div>
+
+<h3>Step 4 — build, verify</h3>
+<pre><code>$ nvcc -O3 -arch=native -o flash_bwd flash_bwd.cu
+$ ./flash_bwd
+non-causal   B=2 H=2 N=200    max|ddQ|=4.84e-08  max|ddK|=2.98e-08  max|ddV|=8.94e-08  PASS
+non-causal   B=1 H=2 N=384    max|ddQ|=7.08e-08  max|ddK|=2.79e-08  max|ddV|=8.20e-08  PASS
+causal       B=2 H=2 N=200    max|ddQ|=8.94e-08  max|ddK|=2.38e-07  max|ddV|=7.15e-07  PASS
+causal       B=1 H=2 N=384    max|ddQ|=8.57e-08  max|ddK|=1.56e-07  max|ddV|=8.34e-07  PASS
+</code></pre>
+
+<div class="quiz" data-concept="ch6.html#bwd-kernel" data-concept-label="§6.4 The backward kernel">
+  <div class="q-text"><p><strong>Capstone.</strong> As in Chapter 5: from a blank file, write the preprocess kernel, the backward kernel, a CPU reference for \(dQ, dK, dV\) (materializing \(P\) is fine on the CPU), and a harness that runs forward → preprocess → backward and compares. Compile, run, PASS. Then diff against <a href="code/flash_bwd.cu"><code>code/flash_bwd.cu</code></a>.</p></div>
+  <div class="hint">CPU reference order: \(S, P\) (softmax rows) → \(O\) → \(D\) → \(dV = P^\top dO\) → \(dP = dOV^\top\) → \(dS = P\circ(dP-D)\tau\) → \(dQ = dS K\), \(dK = dS^\top Q\).</div>
+  <div class="hint">Don't forget <code>cudaMemset(dQ, 0, ...)</code> before launching — atomicAdd accumulates onto whatever is there.</div>
+  <div class="answer"><p>Reference file: <a href="code/flash_bwd.cu"><code>code/flash_bwd.cu</code></a>. Classic failure modes: forgetting to zero \(dQ\) (huge errors, only on the second run!); τ applied to \(p\)'s exponent but not \(ds\) (≈\(\sqrt d\)-scaled errors on \(dQ, dK\) only); using <code>i_start</code> but forgetting the per-row <code>qrow &lt; col</code> skip (causal-only failures); barrier bugs if a thread <code>continue</code>s across the <code>__syncthreads()</code> (keep barriers outside the per-row loop).</p></div>
+</div>
+
+<h2 id="bwd-notes">6.5 What the real implementation adds</h2>
+<p>Everything from §5.7 (tensor cores for all five matmuls, warp partitioning, async pipelining) plus two backward-specific notes: (1) real FA-2 stages \(dS\) tiles through shared memory so both \(dS^\top Q\) and \(dS\,K\) run as tensor-core matmuls — our per-scalar <code>ds</code> never exists as a tile; (2) the \(dQ\) atomics contend in L2; production kernels amortize them by accumulating a whole \(B_r \times d\) tile of \(dQ\) contributions in registers/smem per (i, j) pair and issuing one atomic add per element per <em>tile</em> rather than per row-column pair — same asymptotics, far fewer atomic operations than our teaching version.</p>
+
+<div class="box recall-pause"><div class="box-title">Before Chapter 7</div>
+Closed-book: derive \(dV, dP, dS\) (with the Jacobian), prove the \(D\) trick, explain column-parallel + atomic-\(dQ\), and recite the 11-line algorithm. The JAX chapter re-expresses exactly this algorithm where <code>lax.scan</code> plays the role of the column loop and a carry plays the role of <code>atomicAdd</code> — the mapping will only feel obvious if this chapter is solid.
+</div>
+
+</main>
+</body>
+</html>

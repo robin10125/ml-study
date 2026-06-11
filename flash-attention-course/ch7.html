@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 7 · Flash Attention in JAX</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 7</span> · Flash Attention in JAX</h1>
+<p class="subtitle">Two implementations: the FA-2 <em>algorithm</em> in pure JAX (a <code>lax.scan</code> + <code>custom_vjp</code> — runs anywhere, teaches the structure), and a real fused kernel in Pallas. Companion file <a href="code/flash_attention_jax.py"><code>code/flash_attention_jax.py</code></a> is self-testing: 15 checks against naive attention and autodiff, all verified passing (Pallas runs in <code>interpret=True</code> mode on CPU, as a real Triton kernel on GPU).</p>
+
+<h2 id="jax-model">7.1 Where kernels fit in JAX</h2>
+<p>In CUDA you control everything; in JAX you normally control nothing — you write <code>jnp</code> ops and XLA decides fusion, layout, and scheduling. XLA is good at fusing elementwise chains, but it will <em>not</em> invent flash attention from <code>softmax(q @ k.T) @ v</code>: the online-softmax restructuring is an algorithmic rewrite, not a peephole fusion. Your options, in increasing control:</p>
+<table>
+<tr><th>Level</th><th>What</th><th>When</th></tr>
+<tr><td>1</td><td><code>jax.nn.dot_product_attention(..., implementation="cudnn")</code></td><td>Production on NVIDIA GPUs: dispatches to cuDNN's fused flash attention. Use this unless you have a reason not to.</td></tr>
+<tr><td>2</td><td>Blockwise algorithm in pure <code>jnp</code> (<code>lax.scan</code>)</td><td>Algorithm research, TPUs/CPUs, custom attention variants; gets the <em>memory</em> win (no \(N^2\) materialization) but trusts XLA for speed</td></tr>
+<tr><td>3</td><td><strong>Pallas</strong>: JAX's kernel DSL (lowers to Triton on GPU, Mosaic on TPU)</td><td>You need real control of the grid/tiles — what this chapter teaches; <code>jax.experimental.pallas.ops</code> ships tuned attention kernels</td></tr>
+</table>
+
+<div class="quiz" data-concept="ch7.html#jax-model" data-concept-label="§7.1 Where kernels fit">
+  <div class="q-text"><p>Why can't XLA turn naive attention into flash attention on its own, and what specifically does the pure-JAX blockwise version (level 2) achieve versus what it leaves on the table?</p></div>
+  <div class="hint">What kind of transformation is the online softmax: local rewriting of operations, or a change to the algorithm's loop structure and intermediate values?</div>
+  <div class="answer"><p>Flash attention replaces the computation's <em>intermediates</em> (full \(S, P\)) with a sequential recurrence carrying \((m, \ell, O)\) — a global algorithmic restructuring with different numerics ordering, which an op-fusing compiler won't derive. Level 2 expresses that recurrence explicitly, so no \(N\times N\) tensor ever exists → the \(O(N)\) <em>memory</em> win and the recomputation-based backward are achieved. Left on the table: explicit SRAM placement, tile sizing, and warp mapping — XLA may still schedule the scan suboptimally; that control is exactly what Pallas (level 3) adds.</p></div>
+</div>
+
+<h2 id="reference-impl">7.2 The FA-2 loop as a <code>lax.scan</code></h2>
+<p>Chapter 4's 13 lines map almost mechanically: the per-worker state \((m, \ell, O_i)\) becomes the scan <strong>carry</strong>, the KV tiles become the scanned-over axis, and — pleasantly — all \(N\) rows are processed at once since each line was already row-parallel. <strong>Write first:</strong> the scan body, given <code>q (N,d)</code> and one tile <code>kj, vj (block_k, d)</code>.</p>
+
+<div class="quiz" data-concept="ch4.html#fa2-forward" data-concept-label="§4.2 The forward algorithm">
+  <div class="q-text"><p>Complete the body (non-causal first). Carry is <code>(m, l, acc)</code> with shapes \((N,), (N,), (N,d)\):</p>
+<pre><code>def body(carry, blk):
+    m, l, acc = carry
+    j, kj, vj = blk
+    s = (q @ kj.T) * scale          # (N, block_k)
+    # ... your four lines ...
+    return (m_new, l, acc), None</code></pre></div>
+  <div class="hint">Same four lines as §4.2 / §5.4, with <code>[:, None]</code> broadcasts where a per-row scalar meets a matrix.</div>
+  <div class="answer">
+<pre><code>    m_new = jnp.maximum(m, s.max(axis=1))
+    alpha = jnp.exp(m - m_new)
+    p = jnp.exp(s - m_new[:, None])
+    l = l * alpha + p.sum(axis=1)
+    acc = acc * alpha[:, None] + p @ vj
+</code></pre>
+<p>Driver (full version with causal masking in the companion file):</p>
+<pre><code>def flash_forward_scan(q, k, v, block_k=128, causal=False):
+    N, d = q.shape
+    scale = d ** -0.5
+    Tc = N // block_k
+    kb = k.reshape(Tc, block_k, d)
+    vb = v.reshape(Tc, block_k, d)
+    init = (jnp.full(N, -jnp.inf), jnp.zeros(N), jnp.zeros((N, d)))
+    (m, l, acc), _ = jax.lax.scan(body, init, (jnp.arange(Tc), kb, vb))
+    return acc / l[:, None], m + jnp.log(l)        # output and lse
+</code></pre>
+<p>Causal masking is three lines inside the body — build column ids from the tile index <code>j</code> and <code>where</code> in \(-\infty\): <code>col_ids = j*block_k + jnp.arange(block_k)</code>, <code>s = jnp.where(col_ids[None,:] &gt; row_ids[:,None], -jnp.inf, s)</code>. Tile 0 is never fully masked for any row (key 0 is visible to everyone), so \(m\) is finite after the first step and \(\alpha\) is never \(\mathrm{nan}\) — the same argument as §5.6.</p>
+  </div>
+</div>
+
+<h2 id="custom-vjp">7.3 Owning the backward: <code>jax.custom_vjp</code></h2>
+<p>If you let JAX differentiate <code>flash_forward_scan</code> automatically, it saves the residuals <em>of every scan iteration</em> — including each \(p\) tile, resurrecting \(O(N^2)\) memory. The fix is the same as in CUDA: declare our own backward that recomputes from \(L\). The machinery:</p>
+<pre><code>@partial(jax.custom_vjp, nondiff_argnums=(3, 4))      # block_k, causal: not differentiated
+def flash_attention(q, k, v, block_k=128, causal=False):
+    o, _ = flash_forward_scan(q, k, v, block_k, causal)
+    return o
+
+def _flash_fwd(q, k, v, block_k, causal):
+    o, lse = flash_forward_scan(q, k, v, block_k, causal)
+    return o, (q, k, v, o, lse)        # (primal output, residuals) — O(Nd + N) saved!
+
+def _flash_bwd(block_k, causal, res, do):              # nondiff args come FIRST
+    ...
+    return dq, dk, dv                  # one gradient per differentiable input
+
+flash_attention.defvjp(_flash_fwd, _flash_bwd)
+</code></pre>
+<p>And the backward body is Chapter 6's algorithm with a beautiful correspondence: the scan over KV tiles <em>is</em> the column-parallel loop, per-tile <code>dk_j, dv_j</code> are emitted as scan <em>outputs</em> (stacked — they were local to the worker), while <code>dq</code> rides in the <em>carry</em>, accumulated across all tiles — the role <code>atomicAdd</code> played in CUDA. (One honest difference: <code>scan</code> is sequential on-device, so this expresses the algorithm but gets its GPU parallelism only from <code>vmap</code> over batch/heads; the column-<em>parallel</em> version is what the Pallas/CUDA kernels do.)</p>
+
+<div class="quiz" data-concept="ch6.html#bwd-algo" data-concept-label="§6.3 The backward algorithm">
+  <div class="q-text"><p>Write <code>_flash_bwd</code>'s scan body from memory (non-causal). Available per step: <code>q (N,d)</code>, <code>do (N,d)</code>, <code>lse (N,)</code>, <code>D (N,)</code> precomputed, tile <code>kj, vj</code>; carry <code>dq</code>. Emit <code>(dk_j, dv_j)</code>. Six lines.</p></div>
+  <div class="hint">Order from Chapter 6: recompute \(s, p\) → \(dv_j\) → \(dp\) → \(ds\) (τ folded in) → \(dk_j\), and fold \(ds\,k_j\) into the carry.</div>
+  <div class="answer">
+<pre><code>D = jnp.sum(do * o, axis=1)                     # before the scan: the D trick
+
+def body(dq, blk):
+    j, kj, vj = blk
+    s = (q @ kj.T) * scale
+    p = jnp.exp(s - lse[:, None])               # exact P tile from lse
+    dv_j = p.T @ do
+    dp = do @ vj.T
+    ds = p * (dp - D[:, None]) * scale
+    dk_j = ds.T @ q
+    dq = dq + ds @ kj                           # the "atomicAdd", as a carry
+    return dq, (dk_j, dv_j)
+
+dq, (dk, dv) = jax.lax.scan(body, jnp.zeros_like(q), (jnp.arange(Tc), kb, vb))
+return dq, dk.reshape(N, d), dv.reshape(N, d)
+</code></pre>
+  </div>
+</div>
+
+<div class="quiz" data-concept="ch7.html#custom-vjp" data-concept-label="§7.3 custom_vjp anatomy">
+  <div class="q-text"><p>Closed book: (a) what does <code>_flash_fwd</code> return and what exactly goes in the residual tuple (and crucially, what must <em>not</em>)? (b) Where do <code>nondiff_argnums</code> arguments appear in the backward's signature? (c) What memory disaster does <code>custom_vjp</code> avert here if you'd used plain autodiff through the scan?</p></div>
+  <div class="hint">(c) think about what reverse-mode AD must save from each scan iteration to differentiate it later.</div>
+  <div class="answer"><p>(a) <code>(primal_output, residuals)</code> = <code>(o, (q, k, v, o, lse))</code> — all \(O(Nd)\) or smaller; no \(p\) tiles, no \(s\) tiles, nothing per-iteration. (b) First, before the residuals and cotangent: <code>def _flash_bwd(block_k, causal, res, do)</code>. (c) Autodiff of a scan saves each iteration's primals needed for its VJP — here the \((N \times block_k)\) tile \(p\) (or equivalents) for each of \(T_c\) iterations \(= O(N^2)\) total: exactly the memory blow-up flash attention exists to kill. <code>custom_vjp</code> replaces that with recomputation from <code>lse</code>.</p></div>
+</div>
+
+<h2 id="pallas-model">7.4 A real kernel: Pallas</h2>
+<p>Pallas is "CUDA-shaped JAX": you write a kernel over <em>Refs</em> (mutable views of memory) and launch it over a <em>grid</em>; on GPU it lowers via Triton. The three concepts, mapped to what you already know:</p>
+<table>
+<tr><th>Pallas</th><th>Meaning</th><th>CUDA analogue (Ch. 5)</th></tr>
+<tr><td><code>grid=(G,)</code></td><td>launch G program instances; <code>pl.program_id(0)</code> = which one I am</td><td>grid of thread blocks; <code>blockIdx.x</code></td></tr>
+<tr><td><code>BlockSpec(block_shape, index_map)</code></td><td>which tile of the array each instance sees: instance \(i\) gets the block at <em>block index</em> <code>index_map(i)</code> (units of blocks, not elements), staged into fast memory as its Ref</td><td>the cooperative HBM→SRAM tile load + pointer offsets — written for you</td></tr>
+<tr><td><code>o_ref[...] = x</code> / <code>ref[pl.dslice(a, n), :]</code></td><td>write a Ref / read a dynamic slice of a Ref on demand</td><td>stores to <code>Oh</code> / staged reads of <code>Ks/Vs</code></td></tr>
+</table>
+<p>Our launch: one program per query block (the FA-2 grid, minus batch/heads which <code>vmap</code> adds). Q and the outputs are pre-tiled by their BlockSpecs; K and V are handed over <em>whole</em> (block index 0 for every instance) and sliced tile-by-tile inside the loop — so the kernel body controls the streaming, exactly like Chapter 5's <code>j0</code> loop:</p>
+<pre><code>o, lse = pl.pallas_call(
+    kernel,
+    grid=(N // block_q,),
+    in_specs=[
+        pl.BlockSpec((block_q, d), lambda i: (i, 0)),   # my Q tile
+        pl.BlockSpec((N, d),       lambda i: (0, 0)),   # all of K, sliced inside
+        pl.BlockSpec((N, d),       lambda i: (0, 0)),   # all of V, sliced inside
+    ],
+    out_specs=[
+        pl.BlockSpec((block_q, d), lambda i: (i, 0)),   # my O tile
+        pl.BlockSpec((block_q,),   lambda i: (i,)),     # my slice of lse
+    ],
+    out_shape=[
+        jax.ShapeDtypeStruct((N, d), q.dtype),
+        jax.ShapeDtypeStruct((N,), jnp.float32),
+    ],
+    interpret=interpret,        # True = run as plain JAX anywhere (debugging/CPU)
+)(q, k, v)
+</code></pre>
+
+<div class="quiz" data-concept="ch7.html#pallas-model" data-concept-label="§7.4 Pallas concepts">
+  <div class="q-text"><p>Decode from memory: for instance \(i\) with <code>block_q=64</code>, exactly which rows of Q does <code>BlockSpec((64, d), lambda i: (i, 0))</code> deliver to <code>q_ref</code>, and why is the index map's return <em>not</em> <code>(i*64, 0)</code>? And why do the K/V specs use <code>lambda i: (0, 0)</code> with the <em>full</em> array as the block?</p></div>
+  <div class="hint">index_map speaks in units of blocks; Pallas multiplies by the block shape itself.</div>
+  <div class="answer"><p>Rows \([64i, 64i{+}64)\): the index map returns <em>block</em> coordinates, which Pallas scales by <code>block_shape</code> to get element offsets — returning <code>(i*64, 0)</code> would double-scale. K/V use block index 0 with block shape = full array so every instance can address <em>all</em> keys/values; the kernel then pulls one <code>(block_k, d)</code> tile at a time via <code>k_ref[pl.dslice(j*block_k, block_k), :]</code>, keeping the streaming under the kernel's control exactly like the CUDA <code>j0</code> loop. (Q, O, lse are genuinely per-instance tiles, so their specs do the slicing.)</p></div>
+</div>
+
+<p><strong>Write first</strong> — the kernel body. It is §7.2's scan body inside a <code>fori_loop</code>, plus the Ref reads/writes:</p>
+
+<div class="quiz" data-concept="ch7.html#pallas-model" data-concept-label="§7.4 Pallas kernel">
+  <div class="q-text"><p>Write the complete non-causal Pallas forward kernel: signature <code>(q_ref, k_ref, v_ref, o_ref, lse_ref, *, block_k, scale)</code>, a <code>fori_loop</code> over KV tiles carrying <code>(m, l, acc)</code>, final normalize + both Ref writes.</p></div>
+  <div class="hint">Carry init: <code>jnp.full((block_q,), -jnp.inf)</code>, zeros, zeros — same trinity as always. Loop bound: <code>kv_len // block_k</code>.</div>
+  <div class="hint">Tile read: <code>kj = k_ref[pl.dslice(j * block_k, block_k), :]</code>.</div>
+  <div class="answer">
+<pre><code>def _pallas_fwd_kernel(q_ref, k_ref, v_ref, o_ref, lse_ref, *, block_k, scale):
+    block_q, d = q_ref.shape
+    kv_len = k_ref.shape[0]
+    q = q_ref[...]                                   # (block_q, d)
+
+    def body(j, carry):
+        m, l, acc = carry
+        kj = k_ref[pl.dslice(j * block_k, block_k), :]
+        vj = v_ref[pl.dslice(j * block_k, block_k), :]
+        s = jnp.dot(q, kj.T) * scale                 # (block_q, block_k)
+        m_new = jnp.maximum(m, jnp.max(s, axis=1))
+        alpha = jnp.exp(m - m_new)
+        p = jnp.exp(s - m_new[:, None])
+        l = l * alpha + jnp.sum(p, axis=1)
+        acc = acc * alpha[:, None] + jnp.dot(p, vj)
+        return m_new, l, acc
+
+    init = (jnp.full((block_q,), -jnp.inf, jnp.float32),
+            jnp.zeros((block_q,), jnp.float32),
+            jnp.zeros((block_q, d), jnp.float32))
+    m, l, acc = jax.lax.fori_loop(0, kv_len // block_k, body, init)
+
+    o_ref[...] = (acc / l[:, None]).astype(o_ref.dtype)
+    lse_ref[...] = m + jnp.log(l)
+</code></pre>
+  </div>
+</div>
+
+<div class="quiz" data-concept="ch4.html#causal" data-concept-label="§4.6 Causal masking">
+  <div class="q-text"><p>Add causal support to the Pallas kernel — the same two ideas as the CUDA version (§5.6): a tighter loop bound from <code>pl.program_id(0)</code>, and an in-tile mask. Sketch both. (One wrinkle: how do you build per-element row/column indices for a 2-D tile inside a kernel?)</p></div>
+  <div class="hint">Loop bound: how many KV tiles intersect the past of query block \(i\)? Ceil-divide \((i{+}1)\,\mathrm{block_q}\) by \(\mathrm{block_k}\).</div>
+  <div class="hint">Indices: <code>jax.lax.broadcasted_iota(jnp.int32, (block_q, block_k), dim)</code> with dim 0 for rows, 1 for cols.</div>
+  <div class="answer">
+<pre><code>i = pl.program_id(0)
+num_tiles = ((i + 1) * block_q + block_k - 1) // block_k   # skip future tiles
+...
+# inside body, after computing s:
+rows = i * block_q + jax.lax.broadcasted_iota(jnp.int32, (block_q, block_k), 0)
+cols = j * block_k + jax.lax.broadcasted_iota(jnp.int32, (block_q, block_k), 1)
+s = jnp.where(cols &gt; rows, -jnp.inf, s)
+</code></pre>
+<p><code>fori_loop</code> accepts the traced bound (it lowers to a while loop). The companion file's kernel includes this under a <code>causal</code> flag and passes the causal tests.</p>
+  </div>
+</div>
+
+<h2 id="production">7.5 Running it, and production notes</h2>
+<pre><code>$ python flash_attention_jax.py        # CPU-only jax: Pallas runs interpret=True
+scan forward vs naive   [non-causal]       max err 3.28e-07  PASS
+scan lse vs logsumexp   [non-causal]       max err 4.77e-07  PASS
+custom_vjp dq vs autodiff [non-causal]     max err 5.07e-07  PASS
+custom_vjp dk vs autodiff [non-causal]     max err 3.87e-07  PASS
+custom_vjp dv vs autodiff [non-causal]     max err 3.28e-07  PASS
+pallas forward vs naive [non-causal]       max err 3.28e-07  PASS
+pallas lse vs scan      [non-causal]       max err 0.00e+00  PASS
+  ... (causal: 7 more) ...
+vmap batch x heads      [causal]           max err 5.66e-07  PASS
+ALL PASS
+</code></pre>
+<ul>
+  <li><strong>Batch and heads:</strong> all our functions take one \((N, d)\) head; <code>jax.vmap(jax.vmap(f))</code> lifts to \((B, h, N, d)\) — and under <code>jit</code>, vmapping a <code>pallas_call</code> extends the kernel grid rather than looping. (Production kernels put batch/heads in the grid explicitly, like our CUDA <code>gridDim.y/z</code>.)</li>
+  <li><strong>Use the shipped kernels when you can:</strong> <code>jax.nn.dot_product_attention(q, k, v, is_causal=True, implementation="cudnn")</code> on GPU; <code>jax.experimental.pallas.ops.gpu.attention.mha</code> (Triton FA-2, with its own <code>custom_vjp</code> backward kernel); on TPU, splash/flash attention in <code>pallas.ops.tpu</code>. What you built in this chapter is their exact structure, minus tuning.</li>
+  <li><strong>Verify like a professional:</strong> the companion file's pattern — check forward against naive, <em>lse against <code>logsumexp</code></em>, and gradients against autodiff through the naive version — is the standard harness for any custom attention you'll ever write. Autodiff-as-oracle is the JAX superpower: you never hand-derive a test gradient.</li>
+</ul>
+
+<div class="quiz" data-concept="ch7.html#production" data-concept-label="§7.5 Production notes">
+  <div class="q-text"><p>Final synthesis, closed book: you must add a new attention variant (say, a custom score modifier) to a JAX training run at \(N = 32\)k. Walk through your decision: which of the three levels (§7.1) do you try first, what do you implement at each level, and what three correctness checks gate promotion to the next level?</p></div>
+  <div class="hint">Cheapest correct thing first; only buy control when measurements demand it.</div>
+  <div class="answer"><p>First check if level 1 (cuDNN / shipped Pallas ops) supports the variant — if yes, done. If not: level 2 — blockwise scan + <code>custom_vjp</code> with the modifier in the score tile; this already avoids \(O(N^2)\) memory, which at 32k is the difference between running and OOM. Profile; only if XLA's scan scheduling is the bottleneck, write the Pallas kernel (level 3), reusing the level-2 implementation as the oracle. Gates at every level: (1) forward vs naive (small \(N\)), (2) lse vs <code>logsumexp</code>, (3) grads vs autodiff-through-naive — all with both causal and non-causal, and a non-multiple-of-block \(N\) if supported.</p></div>
+</div>
+
+<div class="box recall-pause"><div class="box-title">You're done — the exit exam</div>
+One week from now, from nothing but a blank editor: (1) write the CUDA forward kernel and get it to PASS; (2) write the JAX <code>custom_vjp</code> pair and get it to PASS; (3) on paper, write the FA-2 forward and backward algorithms and the three FA-1→FA-2 changes. If all three work, you do not "know about" flash attention — you can build it. Check the <a href="index.html#progress">dashboard</a> for any recalls left unmastered, and revisit them on a spaced schedule.
+</div>
+
+</main>
+</body>
+</html>
