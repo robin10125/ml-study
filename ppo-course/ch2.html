@@ -29,12 +29,6 @@ $$ \nabla_\theta \int p_\theta(x) f(x)\, dx = \int \nabla_\theta p_\theta(x)\, f
 </div>
 <p>Intuition: to increase \(\mathbb{E}[f]\), raise the log-probability of samples in proportion to how good they were. Good samples get pulled toward you, bad ones (if \(f\) can be negative) get pushed away. No gradient of \(f\) — and hence no gradient of the environment — is ever needed.</p>
 
-<div class="quiz" data-concept="ch2.html#trick" data-concept-label="§2.2 Log-derivative trick">
-  <div class="q-text"><p>State and prove the log-derivative trick from memory. Then answer: why is it essential that the final expression is an expectation <em>under \(p_\theta\)</em>, and which step of the proof would break if \(f\) itself depended on \(\theta\)?</p></div>
-  <div class="hint">Write \(\nabla_\theta p_\theta = p_\theta \nabla_\theta \log p_\theta\) and substitute.</div>
-  <div class="answer"><p>\(\nabla_\theta \mathbb{E}[f] = \int \nabla_\theta p_\theta f = \int p_\theta (\nabla_\theta p_\theta / p_\theta) f = \mathbb{E}_{p_\theta}[f \nabla_\theta \log p_\theta]\). Being an expectation under \(p_\theta\) means Monte-Carlo samples from the current policy estimate it unbiasedly — that is what makes it implementable. If \(f\) depended on \(\theta\), the very first step (product rule) would add a second term \(\mathbb{E}[\nabla_\theta f]\); in RL, \(R(\tau)\) is a function of the sampled trajectory only, so this term is absent.</p></div>
-</div>
-
 <h2 id="derivation">2.3 The policy gradient over trajectories</h2>
 <p>Apply the trick with \(x = \tau\), \(f = R\). We need \(\nabla_\theta \log p_\theta(\tau)\). Take the log of the trajectory factorization from §1.3:</p>
 $$ \log p_\theta(\tau) = \log \rho_0(s_0) + \sum_{t} \log \pi_\theta(a_t|s_t) + \sum_t \log P(s_{t+1}|s_t,a_t). $$
@@ -45,12 +39,6 @@ $$ \nabla_\theta J(\theta) = \mathbb{E}_{\tau\sim p_\theta}\Big[ R(\tau) \sum_{t
 </div>
 <p>This is remarkable: the gradient of expected return through an unknown, stochastic, non-differentiable world equals a weighted sum of policy log-prob gradients — all quantities we can compute. The price is paid in <strong>variance</strong>, which the rest of the course works down.</p>
 
-<div class="quiz" data-concept="ch2.html#derivation" data-concept-label="§2.3 The derivation">
-  <div class="q-text"><p>Derive the trajectory-form policy gradient from scratch: start from \(J(\theta)\), apply the log-derivative trick, expand \(\log p_\theta(\tau)\), and show exactly where and why the environment dynamics \(P\) drop out.</p></div>
-  <div class="hint">The log of a product is a sum; differentiate term by term and ask which terms contain \(\theta\).</div>
-  <div class="answer"><p>\(\nabla J = \mathbb{E}[R(\tau)\nabla\log p_\theta(\tau)]\) by the trick. \(\log p_\theta(\tau) = \log\rho_0 + \sum_t \log\pi_\theta(a_t|s_t) + \sum_t \log P(s_{t+1}|s_t,a_t)\). Under \(\nabla_\theta\), the \(\rho_0\) and \(P\) terms are constants (the environment doesn't depend on the policy parameters), leaving \(\sum_t \nabla\log\pi_\theta(a_t|s_t)\). Hence \(\nabla J = \mathbb{E}_\tau[R(\tau)\sum_t \nabla_\theta\log\pi_\theta(a_t|s_t)]\). The dynamics drop out at the differentiation step — not by assumption but by the structure of the factorization.</p></div>
-</div>
-
 <h2 id="eglp">2.4 A lemma you will use constantly: \(\mathbb{E}[\nabla\log\pi] = 0\)</h2>
 <div class="box definition"><div class="box-title">EGLP lemma (expected grad-log-prob)</div>
 <p>For any distribution \(p_\theta\): \(\;\mathbb{E}_{x \sim p_\theta}\big[ \nabla_\theta \log p_\theta(x) \big] = 0.\)</p>
@@ -58,24 +46,12 @@ $$ \nabla_\theta J(\theta) = \mathbb{E}_{\tau\sim p_\theta}\Big[ R(\tau) \sum_{t
 </div>
 <p>Consequence: you may add or subtract <em>any action-independent quantity</em> inside the policy gradient without changing its expectation — because that quantity multiplies a term whose expectation is zero. This single lemma legitimizes reward-to-go (below), baselines (§3.1), and advantage normalization's mean-shift (§7.2). It is verified to machine precision by <code>test_ppo_core.py</code> (PASS 6).</p>
 
-<div class="quiz" data-concept="ch2.html#eglp" data-concept-label="§2.4 EGLP lemma">
-  <div class="q-text"><p>State the EGLP lemma, prove it in two lines, and name the three places in this course where it justifies modifying the policy gradient.</p></div>
-  <div class="hint">Differentiate the normalization constraint \(\int p_\theta = 1\).</div>
-  <div class="answer"><p>\(\mathbb{E}_{p_\theta}[\nabla\log p_\theta]=0\): differentiating \(\int p_\theta = 1\) gives \(\int \nabla p_\theta = \int p_\theta \nabla\log p_\theta = \mathbb{E}[\nabla\log p_\theta] = 0\). It licenses (1) dropping past rewards (reward-to-go), (2) subtracting a state-dependent baseline \(b(s)\), (3) shifting advantages by their batch mean when normalizing — all without biasing the gradient.</p></div>
-</div>
-
 <h2 id="rtg">2.5 Causality: reward-to-go</h2>
 <p>In the trajectory form, the action at time \(t\) is multiplied by the <em>total</em> return \(R(\tau)\) — including rewards earned <em>before</em> \(t\). But an action cannot influence the past. The math agrees: those terms have zero expectation (each past reward is a constant with respect to the action's distribution, so EGLP kills it), and removing them strictly reduces variance:</p>
 <div class="box keypoint"><div class="box-title">Policy gradient, reward-to-go form</div>
 $$ \nabla_\theta J(\theta) = \mathbb{E}_{\tau\sim p_\theta}\Big[ \sum_{t} \nabla_\theta \log \pi_\theta(a_t|s_t)\; \hat{R}_t \Big], \qquad \hat R_t = \sum_{k \ge t} \gamma^{k-t} r_k. $$
 </div>
 <p>Sketch of why dropping the past is valid: fix \(t\) and a past reward \(r_j\), \(j \lt t\). Condition on everything up to \(s_t\); then \(r_j\) is a known constant \(c\), and \(\mathbb{E}_{a_t\sim\pi(\cdot|s_t)}[c\,\nabla\log\pi(a_t|s_t)] = c \cdot 0\) by EGLP. Summing over all past terms removes them from the expectation. What remains — the future — is genuinely correlated with \(a_t\) and must stay.</p>
-
-<div class="quiz" data-concept="ch2.html#rtg" data-concept-label="§2.5 Reward-to-go">
-  <div class="q-text"><p>Prove that replacing \(R(\tau)\) with \(\hat R_t\) in the policy gradient leaves it unbiased. Where exactly does the conditioning argument use the EGLP lemma, and why can't the same argument remove <em>future</em> rewards?</p></div>
-  <div class="hint">Condition on the trajectory prefix up to and including \(s_t\). What is \(r_j\) (for \(j \lt t\)) under that conditioning?</div>
-  <div class="answer"><p>For \(j \lt t\): \(\mathbb{E}[r_j \nabla\log\pi(a_t|s_t)] = \mathbb{E}_{\text{prefix}}\big[ r_j\, \mathbb{E}_{a_t\sim\pi(\cdot|s_t)}[\nabla\log\pi(a_t|s_t)] \big] = \mathbb{E}_{\text{prefix}}[r_j \cdot 0] = 0\): conditioned on the prefix, \(r_j\) is a constant and factors out of the inner expectation, which EGLP makes zero. Every past-reward term vanishes, leaving \(\hat R_t\). Future rewards <em>depend on</em> \(a_t\) (through the states it leads to), so they don't factor out of the inner expectation — the argument fails, as it must, or the whole gradient would be zero.</p></div>
-</div>
 
 <h2 id="reinforce">2.6 REINFORCE: the first runnable algorithm</h2>
 <div class="fig"><pre>
@@ -99,20 +75,46 @@ REINFORCE (Williams, 1992)
 <li><strong>One step per batch.</strong> After a single parameter update the data is off-policy and the estimator is biased for the new \(\theta\), so REINFORCE must discard it. Thousands of environment steps buy one gradient step. Chapters 4–6 build the machinery (importance ratios + a trust region) that lets PPO take <em>many</em> steps per batch safely.</li>
 </ul>
 
-<div class="quiz" data-concept="ch2.html#reinforce" data-concept-label="§2.6–2.7 REINFORCE">
-  <div class="q-text"><p>Write REINFORCE in pseudocode from memory (collection, estimator, update, data handling). Then name its two structural weaknesses and, for each, the chapter-3-to-6 mechanism that addresses it.</p></div>
+<h2 id="problems">Problem set</h2>
+<p>Four of these are the load-bearing derivations of the whole course — Chapter 4 re-runs exactly the same moves with importance sampling. Write each one out in full in the box; a derivation you can't write isn't one you know.</p>
+
+<div class="quiz" data-concept="ch2.html#trick" data-concept-label="§2.2 Log-derivative trick" data-min="100"
+     data-placeholder="grad_theta E[f(x)] =&#10;step 1:&#10;step 2:&#10;step 3:">
+  <div class="q-text"><p>State and prove the log-derivative trick (three steps). Then answer: why is it essential that the final expression is an expectation <em>under \(p_\theta\)</em>, and which step of the proof would break if \(f\) itself depended on \(\theta\)?</p></div>
+  <div class="hint">Write \(\nabla_\theta p_\theta = p_\theta \nabla_\theta \log p_\theta\) and substitute.</div>
+  <div class="answer"><p>\(\nabla_\theta \mathbb{E}[f] = \int \nabla_\theta p_\theta f = \int p_\theta (\nabla_\theta p_\theta / p_\theta) f = \mathbb{E}_{p_\theta}[f \nabla_\theta \log p_\theta]\). Being an expectation under \(p_\theta\) means Monte-Carlo samples from the current policy estimate it unbiasedly — that is what makes it implementable. If \(f\) depended on \(\theta\), the very first step (product rule) would add a second term \(\mathbb{E}[\nabla_\theta f]\); in RL, \(R(\tau)\) is a function of the sampled trajectory only, so this term is absent.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch2.html#derivation" data-concept-label="§2.3 The derivation" data-min="120"
+     data-placeholder="J(theta) = E[R(tau)]&#10;grad J = ...&#10;log p_theta(tau) = ...&#10;differentiate: ...">
+  <div class="q-text"><p>Derive the trajectory-form policy gradient: start from \(J(\theta)\), apply the log-derivative trick, expand \(\log p_\theta(\tau)\), and show exactly where and why the environment dynamics \(P\) drop out.</p></div>
+  <div class="hint">The log of a product is a sum; differentiate term by term and ask which terms contain \(\theta\).</div>
+  <div class="answer"><p>\(\nabla J = \mathbb{E}[R(\tau)\nabla\log p_\theta(\tau)]\) by the trick. \(\log p_\theta(\tau) = \log\rho_0 + \sum_t \log\pi_\theta(a_t|s_t) + \sum_t \log P(s_{t+1}|s_t,a_t)\). Under \(\nabla_\theta\), the \(\rho_0\) and \(P\) terms are constants (the environment doesn't depend on the policy parameters), leaving \(\sum_t \nabla\log\pi_\theta(a_t|s_t)\). Hence \(\nabla J = \mathbb{E}_\tau[R(\tau)\sum_t \nabla_\theta\log\pi_\theta(a_t|s_t)]\). The dynamics drop out at the differentiation step — not by assumption but by the structure of the factorization.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch2.html#eglp" data-concept-label="§2.4 EGLP lemma" data-min="80">
+  <div class="q-text"><p>State the EGLP lemma, prove it in two lines, and name the three places in this course where it justifies modifying the policy gradient. (PASS 6 of <code>test_ppo_core.py</code> verifies the lemma to machine precision for a categorical policy — run it after you've written the proof.)</p></div>
+  <div class="hint">Differentiate the normalization constraint \(\int p_\theta = 1\).</div>
+  <div class="answer"><p>\(\mathbb{E}_{p_\theta}[\nabla\log p_\theta]=0\): differentiating \(\int p_\theta = 1\) gives \(\int \nabla p_\theta = \int p_\theta \nabla\log p_\theta = \mathbb{E}[\nabla\log p_\theta] = 0\). It licenses (1) dropping past rewards (reward-to-go), (2) subtracting a state-dependent baseline \(b(s)\), (3) shifting advantages by their batch mean when normalizing — all without biasing the gradient.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch2.html#rtg" data-concept-label="§2.5 Reward-to-go" data-min="100">
+  <div class="q-text"><p>Prove that replacing \(R(\tau)\) with \(\hat R_t\) in the policy gradient leaves it unbiased. Point to the exact place where the conditioning argument uses the EGLP lemma — and explain why the same argument can't remove <em>future</em> rewards.</p></div>
+  <div class="hint">Condition on the trajectory prefix up to and including \(s_t\). What is \(r_j\) (for \(j \lt t\)) under that conditioning?</div>
+  <div class="answer"><p>For \(j \lt t\): \(\mathbb{E}[r_j \nabla\log\pi(a_t|s_t)] = \mathbb{E}_{\text{prefix}}\big[ r_j\, \mathbb{E}_{a_t\sim\pi(\cdot|s_t)}[\nabla\log\pi(a_t|s_t)] \big] = \mathbb{E}_{\text{prefix}}[r_j \cdot 0] = 0\): conditioned on the prefix, \(r_j\) is a constant and factors out of the inner expectation, which EGLP makes zero. Every past-reward term vanishes, leaving \(\hat R_t\). Future rewards <em>depend on</em> \(a_t\) (through the states it leads to), so they don't factor out of the inner expectation — the argument fails, as it must, or the whole gradient would be zero.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch2.html#reinforce" data-concept-label="§2.6–2.7 REINFORCE" data-min="120"
+     data-placeholder="REINFORCE&#10;loop:&#10;    collect ...&#10;    compute ...&#10;    g_hat = ...&#10;    update / data handling: ...">
+  <div class="q-text"><p>Write REINFORCE in pseudocode — collection, estimator, update, and what happens to the data afterward. Then name its two structural weaknesses and, for each, the mechanism from Chapters 3–6 that addresses it.</p></div>
   <div class="hint">What must happen to the batch after one gradient step, and why?</div>
   <div class="answer"><p>Collect trajectories under \(\pi_\theta\); compute \(\hat R_t\); \(\hat g = \frac{1}{N}\sum_\tau\sum_t \nabla\log\pi_\theta(a_t|s_t)\hat R_t\); one ascent step; discard data (it's now off-policy). Weakness 1: high variance of the Monte-Carlo return weights → fixed by baselines/advantages and GAE (Ch 3). Weakness 2: one update per batch → fixed by the importance-sampled surrogate (Ch 4) made safe by a trust region (Ch 5) or clipping (Ch 6), which allow several epochs per batch.</p></div>
 </div>
 
-<div class="quiz" data-concept="ch2.html#reinforce" data-concept-label="§2.6 The pseudo-loss">
+<div class="quiz" data-concept="ch2.html#reinforce" data-concept-label="§2.6 The pseudo-loss" data-min="80">
   <div class="q-text"><p>You implement REINFORCE with the pseudo-loss \(L = \frac{1}{N}\sum \log\pi_\theta(a_t|s_t)\hat R_t\). (a) Why must \(\hat R_t\) be detached from the autograd graph? (b) Why is the value of \(L\) useless for monitoring training? (c) What should you monitor instead?</p></div>
   <div class="hint">What is the only property of \(L\) that the theory guarantees?</div>
   <div class="answer"><p>(a) The theory says the gradient flows only through \(\log\pi_\theta\); if \(\hat R_t\) carries gradients (e.g. it contains a critic's output), autograd adds spurious terms that are not part of the policy gradient. (b) Only \(\nabla L\) at the current parameters is meaningful; \(L\)'s value is an arbitrary weighted log-likelihood, not expected return — it routinely moves opposite to performance. (c) Average episodic return (and later: explained variance, KL, clip fraction — §7.4).</p></div>
-</div>
-
-<div class="box recall-pause"><div class="box-title">Before moving on</div>
-<p>On paper, reproduce: the log-derivative trick with proof, the full trajectory-form derivation, the EGLP lemma with proof, and the reward-to-go argument. These four are the load-bearing walls — Chapter 4 will re-run the same moves with importance sampling, and you'll want them automatic.</p>
 </div>
 
 </main>

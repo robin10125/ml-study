@@ -25,12 +25,6 @@ $$ \mathbb{E}_{a_t \sim \pi(\cdot|s_t)}\big[ \nabla_\theta\log\pi_\theta(a_t|s_t
 </div>
 <p>If \(b\) depended on the action, it would <em>not</em> factor out of the inner expectation and the estimator would be biased. That's the entire fine print.</p>
 
-<div class="quiz" data-concept="ch3.html#baseline" data-concept-label="§3.1 Baselines">
-  <div class="q-text"><p>Prove from memory that subtracting a state-dependent baseline leaves the policy gradient unbiased. Point to the exact step that fails if \(b\) depends on the action, and give the intuitive reason a baseline helps when all rewards are positive.</p></div>
-  <div class="hint">Condition on \(s_t\), factor \(b(s_t)\) out of the expectation over \(a_t\), apply EGLP.</div>
-  <div class="answer"><p>\(\mathbb{E}_{a\sim\pi(\cdot|s)}[b(s)\nabla\log\pi(a|s)] = b(s)\mathbb{E}_{a\sim\pi}[\nabla\log\pi(a|s)] = 0\) since \(\mathbb{E}[\nabla\log\pi]=0\) (EGLP). Taking the outer expectation over states keeps it zero. If \(b\) depends on \(a\), it cannot be pulled out of \(\mathbb{E}_{a\sim\pi}\), and the product no longer vanishes — bias. Intuition: with all-positive rewards, raw REINFORCE pushes up <em>every</em> sampled action; subtracting "how well this state usually goes" recenters the signal so above-average actions are reinforced and below-average ones suppressed directly.</p></div>
-</div>
-
 <h2 id="advantage">3.2 The best baseline is the value function</h2>
 <p>Which \(b\) minimizes variance? The exact optimum is a slightly baroque weighted expectation, but it is well-approximated by something meaningful: \(b(s_t) = V^\pi(s_t)\), "how the policy usually does from here". With it, the weight on each log-prob gradient becomes (an estimate of) the <strong>advantage</strong>:</p>
 $$ \hat R_t - V^\pi(s_t) \;\approx\; Q^\pi(s_t,a_t) - V^\pi(s_t) = A^\pi(s_t,a_t), $$
@@ -42,7 +36,7 @@ $$ \nabla_\theta J(\theta) = \mathbb{E}\Big[\sum_t \nabla_\theta\log\pi_\theta(a
 <h2 id="td">3.3 The TD error: a one-step advantage estimate</h2>
 <div class="box definition"><div class="box-title">Definition: TD error</div>
 $$ \delta_t = r_t + \gamma V(s_{t+1}) - V(s_t). $$
-<p>"Reality minus expectation": what one step actually returned (immediate reward plus discounted value of where you landed) versus what the value function predicted. If \(V = V^\pi\) exactly, then \(\mathbb{E}[\delta_t \mid s_t, a_t] = r(s_t,a_t) + \gamma\mathbb{E}[V^\pi(s_{t+1})] - V^\pi(s_t) = A^\pi(s_t,a_t)\) — the TD error is an <strong>unbiased one-sample estimate of the advantage</strong> (compare the identity you proved in the §1.5 recall).</p>
+<p>"Reality minus expectation": what one step actually returned (immediate reward plus discounted value of where you landed) versus what the value function predicted. If \(V = V^\pi\) exactly, then \(\mathbb{E}[\delta_t \mid s_t, a_t] = r(s_t,a_t) + \gamma\mathbb{E}[V^\pi(s_{t+1})] - V^\pi(s_t) = A^\pi(s_t,a_t)\) — the TD error is an <strong>unbiased one-sample estimate of the advantage</strong> (compare the identity from §1.5, Bellman form of \(A^\pi\)).</p>
 </div>
 <p>Two extreme advantage estimators are now on the table:</p>
 <ul>
@@ -50,12 +44,6 @@ $$ \delta_t = r_t + \gamma V(s_{t+1}) - V(s_t). $$
 <li>\(\hat A_t = \hat R_t - V(s_t)\): <strong>unbiased</strong> in the Monte-Carlo part (all real rewards), but variance grows with the horizon.</li>
 </ul>
 <p>Between them sits the \(n\)-step family: \(\hat A_t^{(n)} = r_t + \gamma r_{t+1} + \cdots + \gamma^{n-1} r_{t+n-1} + \gamma^n V(s_{t+n}) - V(s_t)\) — use \(n\) real rewards, then trust the critic for the rest. Larger \(n\): more variance, less bias.</p>
-
-<div class="quiz" data-concept="ch3.html#td" data-concept-label="§3.3 TD error">
-  <div class="q-text"><p>Define \(\delta_t\) and prove that if the critic is exact (\(V=V^\pi\)), then \(\mathbb{E}[\delta_t\mid s_t,a_t] = A^\pi(s_t,a_t)\). Then state the bias/variance positions of the three estimators: \(\delta_t\), the \(n\)-step estimate, and \(\hat R_t - V(s_t)\).</p></div>
-  <div class="hint">Take the conditional expectation of \(\delta_t\) and recognize the Bellman form of \(Q^\pi\) from §1.5.</div>
-  <div class="answer"><p>\(\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)\). With \(V = V^\pi\): \(\mathbb{E}[\delta_t|s_t,a_t] = r(s_t,a_t) + \gamma\mathbb{E}_{s'}[V^\pi(s')] - V^\pi(s_t) = Q^\pi(s_t,a_t) - V^\pi(s_t) = A^\pi\). Bias/variance: \(\delta_t\) — minimal variance, bias \(O(\)critic error\()\) at one step; \(n\)-step — bias decays as \(\gamma^n\) (critic only enters once, discounted by \(\gamma^n\)), variance grows with \(n\); full MC minus baseline — unbiased (critic only in the baseline, which can't bias), maximal variance.</p></div>
-</div>
 
 <h2 id="gae">3.4 GAE: all the \(n\)-step estimators at once</h2>
 <p>Rather than pick one \(n\), Schulman et al. (2015b) average them all with exponentially decaying weights \(\propto \lambda^{n-1}\), \(\lambda \in [0,1]\). The magic is what this collapses to. First, a telescoping identity: the \(n\)-step advantage is a finite sum of TD errors,</p>
@@ -75,27 +63,8 @@ $$ \hat A_t = \delta_t + \gamma\lambda\, \hat A_{t+1}, \qquad \hat A_T = \delta_
 </ul>
 <p>Both identities, and the equivalence of the recursion to the definition, are machine-verified in <code>code/test_ppo_core.py</code> (PASS 1–3). Typical settings: \(\gamma = 0.99\), \(\lambda = 0.95\) — mostly trusting real rewards, with a gentle exponential fade into the critic.</p>
 
-<div class="quiz" data-concept="ch3.html#gae" data-concept-label="§3.4 GAE derivation">
-  <div class="q-text"><p><strong>The chapter's centerpiece — derive GAE from memory.</strong> (a) Show \(\hat A^{(n)}_t = \sum_{l=0}^{n-1}\gamma^l\delta_{t+l}\) for \(n=2\). (b) Carry out the weighted-average calculation \((1-\lambda)\sum_n \lambda^{n-1}\hat A^{(n)}_t = \sum_l (\gamma\lambda)^l \delta_{t+l}\). (c) State the backward recursion.</p></div>
-  <div class="hint">For (b): swap the order of summation; for fixed \(l\), which values of \(n\) include \(\delta_{t+l}\)?</div>
-  <div class="hint">\(\sum_{n\ge l+1}\lambda^{n-1} = \lambda^l/(1-\lambda)\) — geometric series.</div>
-  <div class="answer"><p>(a) \(\delta_t + \gamma\delta_{t+1} = [r_t + \gamma V(s_{t+1}) - V(s_t)] + \gamma[r_{t+1} + \gamma V(s_{t+2}) - V(s_{t+1})] = r_t + \gamma r_{t+1} + \gamma^2 V(s_{t+2}) - V(s_t) = \hat A^{(2)}_t\); the \(\gamma V(s_{t+1})\) terms cancel. (b) \((1-\lambda)\sum_{n}\lambda^{n-1}\sum_{l \lt n}\gamma^l\delta_{t+l} = \sum_l \gamma^l\delta_{t+l}\,(1-\lambda)\sum_{n\ge l+1}\lambda^{n-1} = \sum_l \gamma^l\delta_{t+l}\lambda^l = \sum_l(\gamma\lambda)^l\delta_{t+l}\). (c) \(\hat A_t = \delta_t + \gamma\lambda\hat A_{t+1}\), computed backward from the end of the buffer.</p></div>
-</div>
-
-<div class="quiz" data-concept="ch3.html#gae" data-concept-label="§3.4 GAE endpoints">
-  <div class="q-text"><p>Prove both endpoint identities: \(\lambda=0 \Rightarrow \hat A_t = \delta_t\), and \(\lambda=1 \Rightarrow \hat A_t = \hat R_t - V(s_t)\). For \(\lambda=1\), show the telescoping explicitly. Which knob is \(\lambda\), in one sentence?</p></div>
-  <div class="hint">For \(\lambda=1\): write \(\sum_l \gamma^l \delta_{t+l}\) out and cancel adjacent value terms, as in the \(n=2\) case but to infinity.</div>
-  <div class="answer"><p>\(\lambda=0\): only the \(l=0\) term survives, \(\hat A_t = \delta_t\). \(\lambda=1\): \(\sum_{l\ge 0}\gamma^l[r_{t+l} + \gamma V(s_{t+l+1}) - V(s_{t+l})]\) — each \(+\gamma^{l+1}V(s_{t+l+1})\) cancels the next term's \(-\gamma^{l+1}V(s_{t+l+1})\), leaving \(\sum_l \gamma^l r_{t+l} - V(s_t) = \hat R_t - V(s_t)\). \(\lambda\) is the bias–variance dial: 0 = trust the critic fully (low variance, critic's bias), 1 = trust only observed rewards (no critic bias beyond the baseline, full Monte-Carlo variance).</p></div>
-</div>
-
 <h2 id="gamma-lambda">3.5 \(\gamma\) vs \(\lambda\): two different knobs</h2>
 <p>Both look like discount factors; they are not the same kind of object. \(\gamma\) is part of the <em>problem statement</em> — it defines which objective \(J\) you are solving, and changing it changes the optimal policy. \(\lambda\) is part of the <em>estimator</em> — it trades bias against variance in estimating advantages for the \(\gamma\)-discounted objective, and at \(\lambda=1\) introduces no bias at all. In practice \(\gamma\) is set by horizon ("how far ahead should behavior look": 0.99–0.999), \(\lambda\) by noise tolerance (0.9–0.97).</p>
-
-<div class="quiz" data-concept="ch3.html#gamma-lambda" data-concept-label="§3.5 γ vs λ">
-  <div class="q-text"><p>Your agent learns well but is myopic — it sacrifices large delayed rewards for small immediate ones. A colleague suggests raising \(\lambda\) from 0.95 to 0.99. Why is that the wrong knob, and what is the right one? What does raising each parameter actually do?</p></div>
-  <div class="hint">Which of the two changes the objective being optimized?</div>
-  <div class="answer"><p>Myopia is a property of the objective: rewards \(k\) steps ahead are worth \(\gamma^k\), so the cure is raising \(\gamma\) (e.g. 0.99 → 0.999), extending the effective horizon \(1/(1-\gamma)\) from 100 to 1000 steps. Raising \(\lambda\) only makes the <em>estimate</em> of the current \(\gamma\)-discounted advantage less biased and more noisy; it cannot make the agent value the future more. (\(\gamma\): which problem; \(\lambda\): how the advantage for that problem is estimated.)</p></div>
-</div>
 
 <h2 id="practice">3.6 GAE in a finite buffer (preview of Chapter 7)</h2>
 <p>Real implementations collect a fixed window of \(T\) steps (e.g. 128) that may contain several episode boundaries and usually ends mid-episode. Two rules make the recursion exact:</p>
@@ -115,14 +84,46 @@ for t in reversed(range(T)):
 returns = adv + values        # the critic's regression targets
 </pre><div class="caption">The exact loop from <code>code/ppo.py</code>, verified against the brute-force definition in <code>test_ppo_core.py</code>. Note <code>returns = adv + values</code>: the value targets come out of GAE for free (they are TD(λ) returns).</div></div>
 
-<div class="quiz" data-concept="ch3.html#practice" data-concept-label="§3.6 GAE in a buffer">
-  <div class="q-text"><p>Write the finite-buffer GAE loop from memory (inputs, the two boundary rules, and the value-target line). Then explain: what goes wrong if you forget the <code>nonterminal</code> mask on the \(\gamma\lambda\,\hat A_{t+1}\) term but keep it in \(\delta_t\)?</p></div>
-  <div class="hint">Think about an advantage computed at the last step of episode \(k\) when the buffer continues into episode \(k{+}1\).</div>
-  <div class="answer"><p>See the loop above: backward over \(t\); \(\delta_t = r_t + \gamma v_{\text{next}}(1-d) - V(s_t)\); \(\hat A_t = \delta_t + \gamma\lambda(1-d)\hat A_{t+1}\); edge uses \(V(s_T)\)/\(\text{next\_done}\); targets are \(\hat A + V\). Forgetting the mask on the recursion term lets \(\hat A\) from the <em>next episode</em> leak backward across the boundary: the last actions of an episode get credited/blamed for how the following, causally unrelated episode happens to start — a bias that corrupts exactly the time steps where credit assignment matters most (just before terminal rewards).</p></div>
+<h2 id="problems">Problem set</h2>
+<p>The GAE algebra you write here is machine-checked: after problems 3, 4 and 6, run <code>python code/test_ppo_core.py</code> — PASS 1–3 are these exact identities. The buffer loop in problem 6 is the code you will ship in Chapter 7.</p>
+
+<div class="quiz" data-concept="ch3.html#baseline" data-concept-label="§3.1 Baselines" data-min="100">
+  <div class="q-text"><p>Prove that subtracting a state-dependent baseline leaves the policy gradient unbiased. Point to the exact step that fails if \(b\) depends on the action, and give the intuitive reason a baseline helps when all rewards are positive.</p></div>
+  <div class="hint">Condition on \(s_t\), factor \(b(s_t)\) out of the expectation over \(a_t\), apply EGLP.</div>
+  <div class="answer"><p>\(\mathbb{E}_{a\sim\pi(\cdot|s)}[b(s)\nabla\log\pi(a|s)] = b(s)\mathbb{E}_{a\sim\pi}[\nabla\log\pi(a|s)] = 0\) since \(\mathbb{E}[\nabla\log\pi]=0\) (EGLP). Taking the outer expectation over states keeps it zero. If \(b\) depends on \(a\), it cannot be pulled out of \(\mathbb{E}_{a\sim\pi}\), and the product no longer vanishes — bias. Intuition: with all-positive rewards, raw REINFORCE pushes up <em>every</em> sampled action; subtracting "how well this state usually goes" recenters the signal so above-average actions are reinforced and below-average ones suppressed directly.</p></div>
 </div>
 
-<div class="box recall-pause"><div class="box-title">Before moving on</div>
-<p>Reproduce on paper: the baseline unbiasedness proof, \(\delta_t\) and its conditional-expectation property, the full GAE derivation (weighted average → \(\sum(\gamma\lambda)^l\delta\) → recursion), both endpoints, and the buffer loop. Then run <code>python code/test_ppo_core.py</code> and confirm PASS 1–3 — the machine agrees with your algebra.</p>
+<div class="quiz" data-concept="ch3.html#td" data-concept-label="§3.3 TD error" data-min="100">
+  <div class="q-text"><p>Define \(\delta_t\) and prove that if the critic is exact (\(V=V^\pi\)), then \(\mathbb{E}[\delta_t\mid s_t,a_t] = A^\pi(s_t,a_t)\). Then place the three estimators — \(\delta_t\), the \(n\)-step estimate, and \(\hat R_t - V(s_t)\) — on the bias/variance spectrum, with one phrase of justification each.</p></div>
+  <div class="hint">Take the conditional expectation of \(\delta_t\) and recognize the Bellman form of \(Q^\pi\) from §1.5.</div>
+  <div class="answer"><p>\(\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)\). With \(V = V^\pi\): \(\mathbb{E}[\delta_t|s_t,a_t] = r(s_t,a_t) + \gamma\mathbb{E}_{s'}[V^\pi(s')] - V^\pi(s_t) = Q^\pi(s_t,a_t) - V^\pi(s_t) = A^\pi\). Bias/variance: \(\delta_t\) — minimal variance, bias \(O(\)critic error\()\) at one step; \(n\)-step — bias decays as \(\gamma^n\) (critic only enters once, discounted by \(\gamma^n\)), variance grows with \(n\); full MC minus baseline — unbiased (critic only in the baseline, which can't bias), maximal variance.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch3.html#gae" data-concept-label="§3.4 GAE derivation" data-min="150"
+     data-placeholder="(a) delta_t + gamma*delta_{t+1} = ...&#10;(b) (1-lambda) sum_n lambda^(n-1) A_hat^(n) = ...&#10;    swap sums: coefficient of gamma^l delta_{t+l} is ...&#10;(c) recursion: A_hat_t = ...">
+  <div class="q-text"><p><strong>The chapter's centerpiece — derive GAE end to end.</strong> (a) Show \(\hat A^{(2)}_t = \delta_t + \gamma\delta_{t+1}\) by expanding both TD errors and cancelling. (b) Carry out the weighted-average calculation \((1-\lambda)\sum_n \lambda^{n-1}\hat A^{(n)}_t = \sum_l (\gamma\lambda)^l \delta_{t+l}\). (c) State the backward recursion. Then verify: PASS 1 of <code>test_ppo_core.py</code> checks recursion ≡ definition to \(10^{-10}\).</p></div>
+  <div class="hint">For (b): swap the order of summation; for fixed \(l\), which values of \(n\) include \(\delta_{t+l}\)?</div>
+  <div class="hint">\(\sum_{n\ge l+1}\lambda^{n-1} = \lambda^l/(1-\lambda)\) — geometric series.</div>
+  <div class="answer"><p>(a) \(\delta_t + \gamma\delta_{t+1} = [r_t + \gamma V(s_{t+1}) - V(s_t)] + \gamma[r_{t+1} + \gamma V(s_{t+2}) - V(s_{t+1})] = r_t + \gamma r_{t+1} + \gamma^2 V(s_{t+2}) - V(s_t) = \hat A^{(2)}_t\); the \(\gamma V(s_{t+1})\) terms cancel. (b) \((1-\lambda)\sum_{n}\lambda^{n-1}\sum_{l \lt n}\gamma^l\delta_{t+l} = \sum_l \gamma^l\delta_{t+l}\,(1-\lambda)\sum_{n\ge l+1}\lambda^{n-1} = \sum_l \gamma^l\delta_{t+l}\lambda^l = \sum_l(\gamma\lambda)^l\delta_{t+l}\). (c) \(\hat A_t = \delta_t + \gamma\lambda\hat A_{t+1}\), computed backward from the end of the buffer.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch3.html#gae" data-concept-label="§3.4 GAE endpoints" data-min="100">
+  <div class="q-text"><p>Prove both endpoint identities: \(\lambda=0 \Rightarrow \hat A_t = \delta_t\), and \(\lambda=1 \Rightarrow \hat A_t = \hat R_t - V(s_t)\). For \(\lambda=1\), write the telescoping out explicitly. Finish with one sentence: which knob is \(\lambda\)? (PASS 2–3 of the test file check exactly these two identities.)</p></div>
+  <div class="hint">For \(\lambda=1\): write \(\sum_l \gamma^l \delta_{t+l}\) out and cancel adjacent value terms, as in the \(n=2\) case but to infinity.</div>
+  <div class="answer"><p>\(\lambda=0\): only the \(l=0\) term survives, \(\hat A_t = \delta_t\). \(\lambda=1\): \(\sum_{l\ge 0}\gamma^l[r_{t+l} + \gamma V(s_{t+l+1}) - V(s_{t+l})]\) — each \(+\gamma^{l+1}V(s_{t+l+1})\) cancels the next term's \(-\gamma^{l+1}V(s_{t+l+1})\), leaving \(\sum_l \gamma^l r_{t+l} - V(s_t) = \hat R_t - V(s_t)\). \(\lambda\) is the bias–variance dial: 0 = trust the critic fully (low variance, critic's bias), 1 = trust only observed rewards (no critic bias beyond the baseline, full Monte-Carlo variance).</p></div>
+</div>
+
+<div class="quiz" data-concept="ch3.html#gamma-lambda" data-concept-label="§3.5 γ vs λ" data-min="60">
+  <div class="q-text"><p>Your agent learns well but is myopic — it sacrifices large delayed rewards for small immediate ones. A colleague suggests raising \(\lambda\) from 0.95 to 0.99. Write the case for why that is the wrong knob and what the right one is, stating what raising each parameter actually does.</p></div>
+  <div class="hint">Which of the two changes the objective being optimized?</div>
+  <div class="answer"><p>Myopia is a property of the objective: rewards \(k\) steps ahead are worth \(\gamma^k\), so the cure is raising \(\gamma\) (e.g. 0.99 → 0.999), extending the effective horizon \(1/(1-\gamma)\) from 100 to 1000 steps. Raising \(\lambda\) only makes the <em>estimate</em> of the current \(\gamma\)-discounted advantage less biased and more noisy; it cannot make the agent value the future more. (\(\gamma\): which problem; \(\lambda\): how the advantage for that problem is estimated.)</p></div>
+</div>
+
+<div class="quiz" data-concept="ch3.html#practice" data-concept-label="§3.6 GAE in a buffer" data-min="180"
+     data-placeholder="# rewards, values, dones: (T,) arrays; next_value, next_done: scalars&#10;adv, last = zeros(T), 0&#10;for t in reversed(range(T)):&#10;    ...&#10;returns = ...">
+  <div class="q-text"><p>Write the finite-buffer GAE loop — inputs <code>rewards, values, dones, next_value, next_done</code>, both boundary rules, and the value-target line. Then explain: what goes wrong if you forget the <code>nonterminal</code> mask on the \(\gamma\lambda\,\hat A_{t+1}\) term but keep it in \(\delta_t\)?</p></div>
+  <div class="hint">Think about an advantage computed at the last step of episode \(k\) when the buffer continues into episode \(k{+}1\).</div>
+  <div class="answer"><p>See §3.6: backward over \(t\); \(\delta_t = r_t + \gamma v_{\text{next}}(1-d) - V(s_t)\); \(\hat A_t = \delta_t + \gamma\lambda(1-d)\hat A_{t+1}\); the buffer edge uses \(V(s_T)\)/\(\text{next\_done}\); targets are \(\hat A + V\). Forgetting the mask on the recursion term lets \(\hat A\) from the <em>next episode</em> leak backward across the boundary: the last actions of an episode get credited/blamed for how the following, causally unrelated episode happens to start — a bias that corrupts exactly the time steps where credit assignment matters most (just before terminal rewards).</p></div>
 </div>
 
 </main>

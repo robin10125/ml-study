@@ -36,12 +36,6 @@ f(jnp.ones((8, 8)))   # prints: tracing! …float32[8,8] — new shape ⇒ re-tr
 </div>
 <p>Python-level control flow still works when it depends on things known at trace time: a <code>for</code> loop over a fixed range simply <em>unrolls</em> (the loop ran in Python during tracing; the jaxpr contains the repeated body — exactly how our transformer's layer loop will compile).</p>
 
-<div class="quiz" data-concept="ch3.html#jit-tracing" data-concept-label="§3.1 Tracing">
-  <div class="q-text"><p>Closed book: describe precisely what happens on the <em>first</em> call to a jitted function and on <em>subsequent</em> calls. For the <code>f</code> above, say what is printed by each of the four calls and why. What three changes to the inputs trigger recompilation?</p></div>
-  <div class="hint">First call: Python runs with what kind of objects? What do they contain, and what gets recorded? Later calls: does your Python run at all?</div>
-  <div class="answer"><p>First call: JAX substitutes tracers (shape + dtype, no values) for the arguments, executes your Python once, records every traced operation into a jaxpr, compiles it with XLA, caches the binary. Subsequent calls with the same signature: the binary runs directly; your Python doesn't execute. The four calls: ① prints <code>tracing!</code> with a tracer (first time, (4,4) f32); ② prints nothing (cache hit); ③ prints nothing — <em>values</em> don't matter, only shape/dtype; ④ prints <code>tracing!</code> again — new shape (8,8) means re-trace + recompile. Recompilation triggers: new shape, new dtype, new value of a <em>static</em> argument (§3.2).</p></div>
-</div>
-
 <h2 id="trace-vs-data">3.2 Control flow on traced values: the one real error</h2>
 <p>Tracers have no values — so any Python construct that needs a concrete boolean <em>now</em> cannot proceed:</p>
 <pre><code>@jax.jit
@@ -64,20 +58,6 @@ def forward(params, x, training):
     ...
 </code></pre>
 
-<div class="quiz" data-concept="ch3.html#trace-vs-data" data-concept-label="§3.2 Traced control flow">
-  <div class="q-text"><p>Why exactly does <code>if x.sum() &gt; 0:</code> fail under <code>jit</code> while <code>for i in range(6):</code> works fine? Fix this function so it jits, and state when you would reach for <code>lax.cond</code> or <code>static_argnums</code> instead:</p>
-<pre><code>@jax.jit
-def clip_step(g, max_norm):
-    n = jnp.linalg.norm(g)
-    if n &gt; max_norm:
-        return g * (max_norm / n)
-    return g</code></pre></div>
-  <div class="hint">Which of the two conditions is known at trace time? For the fix: compute both outcomes, then select.</div>
-  <div class="answer"><p><code>range(6)</code> is plain Python data, known during tracing — the loop just unrolls. <code>x.sum() &gt; 0</code> is a tracer: no value exists at trace time, so Python's <code>if</code> can't pick a branch ⇒ error. Fix:</p><pre><code>def clip_step(g, max_norm):
-    n = jnp.linalg.norm(g)
-    return jnp.where(n &gt; max_norm, g * (max_norm / n), g)</code></pre><p>(Both branches are cheap elementwise math, so computing both is fine — this is also exactly global-norm gradient clipping.) Use <code>lax.cond</code> when branches are expensive enough that running both wastes real compute; use <code>static_argnums</code> when the branching value is configuration (model size, a boolean mode) that takes few distinct values — each value gets its own compiled specialization.</p></div>
-</div>
-
 <h2 id="closure-capture">3.3 Closure capture: where hidden state goes to die</h2>
 <p>Now the punchline this course has been building toward since §1.3. What happens to values your function uses but doesn't take as arguments — globals, closed-over variables, <code>self.attribute</code>? During tracing they are real Python objects with real values, so the trace <strong>bakes them in as compile-time constants</strong>.</p>
 <pre><code>class Model:
@@ -97,14 +77,6 @@ m(x)                  # …same output as before. Update silently ignored.
 <p><strong>Anything that changes between calls must be an argument.</strong> Arguments become tracers — live wires in the compiled program, fed fresh values each call. Everything else is frozen at trace time. Weights, optimizer state, RNG keys, step counters: arguments, always. (Closing over genuine <em>constants</em> — hyperparameters that never change, like <code>n_heads</code> — is fine and idiomatic.)</p>
 </div>
 
-<div class="quiz" data-concept="ch3.html#closure-capture" data-concept-label="§3.3 Closure capture">
-  <div class="q-text"><p>The <code>Model</code> class above trains "successfully" — the loss curve is computed from gradients against… what? Explain the mechanism (what tracing does to <code>self.W</code>), why no error is raised, and rewrite the class as the idiomatic JAX pattern. Which closed-over values are <em>fine</em> to capture?</p></div>
-  <div class="hint">During tracing, <code>self.W</code> is not a tracer. What does the trace record it as? Then: what's the only way to make a value "live" in compiled code?</div>
-  <div class="answer"><p><code>self.W</code> isn't an argument, so during tracing it's a concrete array — recorded as a <em>constant</em> in the jaxpr. The compiled program forever multiplies by the initial weights; later assignments to <code>self.W</code> change a Python attribute the binary never reads. No error is possible: capturing constants is legitimate, and JAX can't know you intended it to vary. Idiomatic rewrite:</p><pre><code>def init(key):  return {"W": jax.random.normal(key, (4, 4))}
-@jax.jit
-def apply(params, x):  return x @ params["W"]   # params: argument ⇒ live</code></pre><p>Fine to capture: true constants — config integers like <code>n_heads</code>, fixed hyperparameters, even fixed arrays — anything that never changes across calls.</p></div>
-</div>
-
 <h2 id="vmap">3.4 vmap: write for one, run for many</h2>
 <p><code>jax.vmap(f)</code> returns a function that runs <code>f</code> across a new leading axis — <em>as if</em> in a Python loop, but compiled into batched operations (one big matmul, not B small ones). The superpower: you write per-example logic with no batch dimension cluttering the shapes, then batch it mechanically.</p>
 <pre><code>def predict(params, x):          # x: (d_in,)  — ONE example, no batch dim
@@ -120,22 +92,6 @@ batched(params, X)               # X: (B, d_in) → (B, d_out)
 </code></pre>
 <p>Nested <code>vmap</code> handles doubly-batched data; <code>vmap</code> of attention-over-one-head gives attention-over-all-heads. In Chapter 6 we'll mostly batch with ordinary broadcasting (matmuls handle leading axes natively, and <code>@</code> batches itself), but <code>vmap</code> is the general tool when broadcasting gets contorted.</p>
 
-<div class="quiz" data-concept="ch3.html#vmap" data-concept-label="§3.4 vmap">
-  <div class="q-text"><p>Given <code>loss_one(params, x, y)</code> for a single example, write (a) the call producing the <em>vector</em> of all B per-example losses for <code>X: (B, d)</code>, <code>Y: (B,)</code>; (b) the call producing per-example gradient pytrees. Explain what <code>in_axes=(None, 0, 0)</code> means, and why per-example gradients are hard in PyTorch but trivial here.</p></div>
-  <div class="hint">params is shared across the batch — which in_axes entry encodes that? And remember vmap wraps grad just as happily as it wraps the plain function.</div>
-  <div class="answer"><p>(a) <code>losses = jax.vmap(loss_one, in_axes=(None, 0, 0))(params, X, Y)</code> → shape (B,). (b) <code>g = jax.vmap(jax.grad(loss_one), in_axes=(None, 0, 0))(params, X, Y)</code> — a pytree like <code>params</code> but with every leaf gaining a leading (B,) axis. <code>(None, 0, 0)</code>: broadcast <code>params</code> to all lanes; map <code>x</code> and <code>y</code> over their leading axes. PyTorch's <code>backward()</code> computes the gradient of a <em>summed</em> loss — per-example gradients require hooks or B separate backward passes; in JAX, gradient-of-one-example is just a function, and <code>vmap</code> batches any function.</p></div>
-</div>
-
-<div class="quiz" data-concept="ch3.html#vmap" data-concept-label="§3.4 vmap axes">
-  <div class="q-text"><p>Shape puzzle, no running: <code>f(a, b)</code> takes <code>a: (3,)</code>, <code>b: (3,)</code> and returns their elementwise product, shape (3,). What are the output shapes of:</p>
-<pre><code>g1 = jax.vmap(f, in_axes=(0, 0))        # called with a: (8, 3), b: (8, 3)
-g2 = jax.vmap(f, in_axes=(0, None))     # called with a: (8, 3), b: (3,)
-g3 = jax.vmap(f, in_axes=(0, 0), out_axes=1)   # a: (8, 3), b: (8, 3)</code></pre>
-<p>And: what error class do you expect if you call <code>g1(a, b)</code> with <code>a: (8, 3)</code>, <code>b: (5, 3)</code>?</p></div>
-  <div class="hint">vmap adds one mapped axis of size B to the per-example result (3,). out_axes chooses where that B axis is inserted.</div>
-  <div class="answer"><p><code>g1</code>: (8, 3) — both mapped over axis 0. <code>g2</code>: (8, 3) — <code>b</code> broadcast to every lane. <code>g3</code>: (3, 8) — same computation, mapped axis placed at position 1 of the output. Mismatched batch sizes (8 vs 5) fail at call time: vmap requires every mapped axis to have the same length, and raises a shape/axis error before any computation runs.</p></div>
-</div>
-
 <h2 id="jit-practice">3.5 Using jit well</h2>
 <ul>
 <li><strong>Jit the biggest sensible unit</strong> — the whole training step (forward + backward + optimizer update), not individual layers. XLA fuses across everything it sees; small jits leave fusion (and dispatch savings) on the table. One <code>@jax.jit</code> on <code>train_step</code> is the entire performance story of Chapter 7.</li>
@@ -144,10 +100,108 @@ g3 = jax.vmap(f, in_axes=(0, 0), out_axes=1)   # a: (8, 3), b: (8, 3)</code></pr
 <li><strong>Don't jit during early debugging.</strong> Un-jitted JAX runs your Python every call: real values, working <code>print</code>, normal debugger. Develop eager, then add <code>@jax.jit</code>, then verify outputs match. (<code>jax.debug.print</code> works inside jit when you need it.)</li>
 </ul>
 
-<div class="quiz" data-concept="ch3.html#jit-practice" data-concept-label="§3.5 jit practice">
-  <div class="q-text"><p>A training loop calls <code>jitted_step(params, opt_state, batch)</code> where batches come straight from a dataset whose last batch is smaller (B=17 instead of 32), and the run is mysteriously slow with two long stalls per epoch. Diagnose both stalls. Then state the four practical jit habits from this section.</p></div>
-  <div class="hint">How many distinct input signatures does the step function see per epoch?</div>
-  <div class="answer"><p>Two signatures per epoch: <code>(32, …)</code> batches and one <code>(17, …)</code> batch — the step compiles twice; the (17,…) compilation re-happens "per epoch" only if caches are evicted, but the visible stalls are the two compilations (and every-epoch stall if the loop is also re-jitting due to, e.g., a fresh closure each epoch). Fix: drop or pad the ragged batch to 32 so exactly one signature exists. Habits: ① jit the whole train step, not pieces; ② keep shapes fixed across steps; ③ benchmark only post-compilation calls, with <code>block_until_ready()</code>; ④ debug un-jitted first, add jit when correct (with <code>jax.debug.print</code> if needed inside).</p></div>
+<h2 id="problems">Problem set</h2>
+<p>Tracing problems are best learned by being burned in a controlled environment: several of these ask you to predict a surprise, then reproduce it in the REPL.</p>
+
+<div class="quiz" data-concept="ch3.html#jit-tracing" data-concept-label="§3.1 Tracing" data-min="60" data-placeholder="call 1: ...&#10;call 2: ...&#10;call 3: ...&#10;call 4: ...&#10;recompile triggers: ...">
+  <div class="q-text"><p>Predict exactly what each call prints (including what <code>x</code> looks like when printed), then run it:</p>
+<pre><code>@jax.jit
+def f(x):
+    print("tracing!", x)
+    return (x @ x.T).sum()
+
+f(jnp.ones((4, 4)))       # call 1
+f(jnp.ones((4, 4)))       # call 2
+f(2 * jnp.ones((4, 4)))   # call 3
+f(jnp.ones((8, 8)))       # call 4</code></pre>
+<p>Finish with one line listing the three things that trigger recompilation.</p></div>
+  <div class="hint">First call: your Python runs with what kind of objects? What do they contain? Later calls: does your Python run at all?</div>
+  <div class="answer"><p>Call 1: prints <code>tracing! Traced&lt;ShapedArray(float32[4,4])&gt;</code> — Python runs once with a value-less tracer. Call 2: prints <em>nothing</em> (cache hit; compiled code runs, your Python doesn't). Call 3: prints nothing — <em>values</em> don't matter to the cache, only shape/dtype. Call 4: prints <code>tracing!</code> again — new shape (8,8) ⇒ re-trace and recompile. Triggers: new shape, new dtype, new value of a static argument. Corollary: anything that isn't an operation on tracers (prints, appends, attribute writes) happens once, at trace time, and is not part of the compiled program.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch3.html#trace-vs-data" data-concept-label="§3.2 Traced control flow" data-min="80" data-placeholder="def clip_step(g, max_norm):&#10;    ...&#10;# lax.cond when: ...&#10;# static_argnums when: ...">
+  <div class="q-text"><p>This fails under <code>jit</code> with a tracer error. Fix it so it compiles (it's global-norm gradient clipping — you'll want it again in real training), and add two comments: when you'd reach for <code>lax.cond</code> instead, and when for <code>static_argnums</code>:</p>
+<pre><code>@jax.jit
+def clip_step(g, max_norm):
+    n = jnp.linalg.norm(g)
+    if n &gt; max_norm:
+        return g * (max_norm / n)
+    return g</code></pre>
+<p>Bonus, one sentence: why does <code>for i in range(6):</code> jit fine while this <code>if</code> doesn't?</p></div>
+  <div class="hint">Compute both outcomes, select with a traced condition. <code>jnp.where(cond, a, b)</code> is element-wise but broadcasts a scalar cond fine.</div>
+  <div class="answer"><pre><code>@jax.jit
+def clip_step(g, max_norm):
+    n = jnp.linalg.norm(g)
+    return jnp.where(n &gt; max_norm, g * (max_norm / n), g)
+# lax.cond: when the branches are expensive enough that computing both wastes
+#           real compute (here both are cheap elementwise math — where is fine)
+# static_argnums: when the value is CONFIGURATION (a flag, a size) taking few
+#           distinct values — each value gets its own compiled specialization</code></pre><p><code>range(6)</code> is plain Python, known during tracing — the loop unrolls. <code>n &gt; max_norm</code> is a tracer: no concrete truth value exists at trace time, so Python's <code>if</code> cannot pick a branch.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch3.html#closure-capture" data-concept-label="§3.3 Closure capture" data-min="120" data-placeholder="def init(key):&#10;    ...&#10;&#10;@jax.jit&#10;def apply(params, x):&#10;    ...&#10;# what the class version did wrong: ...">
+  <div class="q-text"><p>This class "trains" while computing gradients against frozen weights. Rewrite it as the idiomatic init/apply pair of pure functions, with a comment explaining the precise mechanism of the original bug — and noting which kinds of closed-over values <em>are</em> fine to capture:</p>
+<pre><code>class Model:
+    def __init__(self):
+        self.W = jnp.ones((4, 4))
+    @jax.jit
+    def __call__(self, x):
+        return x @ self.W
+
+m = Model()
+m(x)
+m.W = m.W * 100     # silently ignored from here on
+m(x)                # same output as before</code></pre></div>
+  <div class="hint">During tracing, <code>self.W</code> is not a tracer. What does the trace record it as? The only way to make a value "live" in compiled code is to ______.</div>
+  <div class="answer"><pre><code>def init(key):
+    return {"W": jax.random.normal(key, (4, 4))}
+
+@jax.jit
+def apply(params, x):
+    return x @ params["W"]        # argument ⇒ tracer ⇒ live in compiled code
+
+# bug mechanism: self.W wasn't an argument, so at trace time it was a
+# concrete array — recorded into the jaxpr as a CONSTANT. The compiled
+# binary never reads the attribute again; assignments to it are invisible.
+# fine to capture: true constants — n_heads, fixed hyperparameters,
+# anything that never changes between calls.</code></pre><p>The rule with its reason: anything that changes between calls must be an argument; arguments become tracers, everything else is frozen at trace time. Weights, optimizer state, keys, step counters — arguments, always.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch3.html#vmap" data-concept-label="§3.4 vmap" data-min="80" data-placeholder="losses = jax.vmap(...)&#10;per_example_grads = ...">
+  <div class="q-text"><p>Given <code>loss_one(params, x, y)</code> for a <em>single</em> example (<code>x: (d,)</code>, <code>y</code> scalar), write: (a) the call producing the vector of all B per-example losses for <code>X: (B, d)</code>, <code>Y: (B,)</code>; (b) the call producing per-example gradient pytrees. Comment on what <code>in_axes=(None, 0, 0)</code> means, and why (b) is genuinely awkward in PyTorch.</p></div>
+  <div class="hint">params is shared across the batch — which in_axes entry encodes that? And vmap wraps <code>grad(loss_one)</code> just as happily as it wraps <code>loss_one</code>.</div>
+  <div class="answer"><pre><code>losses = jax.vmap(loss_one, in_axes=(None, 0, 0))(params, X, Y)   # (B,)
+per_example_grads = jax.vmap(jax.grad(loss_one),
+                             in_axes=(None, 0, 0))(params, X, Y)
+# in_axes=(None, 0, 0): broadcast params to every lane; map x and y over
+# their leading axes. Result of (b): a pytree shaped like params with an
+# extra leading (B,) axis on every leaf.</code></pre><p>PyTorch's <code>backward()</code> differentiates a <em>summed</em> loss — per-example gradients need hooks or B separate backward passes. Here, gradient-of-one-example is just a function, and <code>vmap</code> batches any function.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch3.html#vmap" data-concept-label="§3.4 vmap axes" data-min="40" data-placeholder="g1: ...&#10;g2: ...&#10;g3: ...&#10;mismatched batch: ...">
+  <div class="q-text"><p>Shape puzzle — predict, then verify. <code>f(a, b)</code> takes <code>a: (3,)</code>, <code>b: (3,)</code>, returns their elementwise product (3,). Output shapes of:</p>
+<pre><code>g1 = jax.vmap(f, in_axes=(0, 0))      # called with a: (8, 3), b: (8, 3)
+g2 = jax.vmap(f, in_axes=(0, None))   # called with a: (8, 3), b: (3,)
+g3 = jax.vmap(f, in_axes=(0, 0), out_axes=1)   # a: (8, 3), b: (8, 3)</code></pre>
+<p>And what happens for <code>g1(a, b)</code> with <code>a: (8, 3)</code>, <code>b: (5, 3)</code>?</p></div>
+  <div class="hint">vmap adds one mapped axis of size B to the per-example result (3,). <code>out_axes</code> chooses where that B axis lands.</div>
+  <div class="answer"><p><code>g1</code>: (8, 3). <code>g2</code>: (8, 3), with <code>b</code> broadcast to every lane. <code>g3</code>: (3, 8) — same computation, mapped axis inserted at output position 1. The 8-vs-5 call fails immediately with a shape/axis error: every mapped axis must have the same length, checked before any computation runs.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch3.html#jit-practice" data-concept-label="§3.5 jit practice" data-min="80" data-placeholder="diagnosis: ...&#10;# fixed loop&#10;...">
+  <div class="q-text"><p>A training loop calls <code>jitted_step(params, opt_state, batch)</code> on batches from a dataset whose last batch is ragged (17 examples instead of 32), and the profiler shows two long compilation stalls. Write the diagnosis (one sentence) and the fixed batch handling (code), then the four practical jit habits from §3.5 as one-line comments.</p></div>
+  <div class="hint">How many distinct input signatures does the step function see?</div>
+  <div class="answer"><pre><code># diagnosis: two signatures — (32,…) and (17,…) — so the step traces and
+# compiles twice; every distinct shape pays a full compilation.
+n_full = (len(data) // B) * B
+for i in range(0, n_full, B):          # drop the ragged tail (or pad to 32)
+    batch = data[i:i+B]
+    params, opt_state, loss = jitted_step(params, opt_state, batch)
+
+# habit 1: jit the whole train step, not individual layers
+# habit 2: keep shapes fixed across steps (pad or drop ragged batches)
+# habit 3: benchmark only post-compilation calls, with block_until_ready()
+# habit 4: debug eager first; add @jax.jit once correct (jax.debug.print inside)</code></pre></div>
 </div>
 
 </main>

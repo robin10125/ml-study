@@ -30,12 +30,6 @@ jax.tree.map(f, tree_a, tree_b)   # zip two trees of IDENTICAL structure,
 </code></pre>
 <p>That second form is the whole secret of JAX optimizers: <code>params</code> and <code>grads</code> have identical structure, so "subtract lr times the gradient, everywhere" is one call (§4.3). Structure mismatch (a missing key, a list where the other has a tuple) raises immediately — a feature, since it catches wiring bugs at the boundary.</p>
 
-<div class="quiz" data-concept="ch4.html#pytree-def" data-concept-label="§4.1 Pytrees">
-  <div class="q-text"><p>Define a pytree. For <code>tree = {"a": [jnp.ones(2), jnp.ones(3)], "b": (jnp.ones(4), {"c": 5.0})}</code>: how many leaves, and what are they? What does <code>jax.tree.map(lambda x: x * 0, tree)</code> return? What condition must hold for the two-tree form <code>jax.tree.map(f, t1, t2)</code>, and why is that condition exactly what makes the params/grads pairing work?</p></div>
-  <div class="hint">Containers (dict/list/tuple) are structure; everything else — arrays AND plain scalars — is a leaf.</div>
-  <div class="answer"><p>A pytree is any nesting of registered containers (dict, list, tuple, …) whose non-container contents are leaves. The example has <strong>4 leaves</strong>: ones(2), ones(3), ones(4), and the scalar 5.0 (scalars are leaves too). <code>tree.map(x*0)</code> returns the same structure with every leaf zeroed (the scalar becomes 0.0). The two-tree form requires <em>identical structure</em> — same containers, same keys, same nesting — and that's guaranteed for params/grads because <code>jax.grad</code> constructs the gradient tree to mirror the parameter tree exactly: every parameter array is paired with its own gradient array by position in the structure.</p></div>
-</div>
-
 <h2 id="init">4.2 Initialization: pure functions of a key</h2>
 <p>With no <code>nn.Module</code> to initialize itself, <em>you</em> write the init function: it takes a key, splits it, and returns the params pytree. Two disciplines from earlier chapters meet here — key splitting (§1.4), and a new one: <strong>scale</strong>.</p>
 <pre><code>def init_mlp(key, sizes):                  # sizes = [784, 256, 256, 10]
@@ -49,13 +43,6 @@ jax.tree.map(f, tree_a, tree_b)   # zip two trees of IDENTICAL structure,
     return params                          # a list of dicts — a fine pytree
 </code></pre>
 <p>Why <code>/ jnp.sqrt(n_in)</code>? Each output unit is a dot product of \(n_{in}\) terms. If inputs and weights have unit variance, the sum of \(n_{in}\) independent products has variance \(n_{in}\) — activations would grow by \(\sqrt{n_{in}}\) at every layer, exponentially with depth. Scaling weights by \(1/\sqrt{n_{in}}\) makes each layer roughly variance-preserving, so signals (and, symmetrically, gradients) neither explode nor vanish. This is the same fan-in reasoning behind PyTorch's default Kaiming/Xavier inits — here you apply it by hand, and the transformer's <code>init_params</code> in Chapter 6 uses exactly this rule.</p>
-
-<div class="quiz" data-concept="ch4.html#init" data-concept-label="§4.2 Initialization">
-  <div class="q-text"><p>Write <code>init_mlp(key, sizes)</code> from memory (weights \(\sim \mathcal{N}(0, 1/n_{in})\), zero biases). Then justify the \(1/\sqrt{n_{in}}\) factor from the variance of a dot product, and explain what subtle bug appears if you use the <em>same</em> key for every layer instead of splitting.</p></div>
-  <div class="hint">Var of a sum of n independent zero-mean products = n × (var of one product). What scale on the weights cancels it?</div>
-  <div class="hint">Same key + same shape ⇒ same numbers (§1.4). What do layers 1 and 2 of width (256, 256) then look like?</div>
-  <div class="answer"><p>Code as in §4.2 (split per layer; <code>normal(wk, (n_in, n_out)) / sqrt(n_in)</code>; <code>zeros(n_out)</code>). Justification: \(y_j = \sum_{i=1}^{n_{in}} x_i W_{ij}\) with unit-variance independent terms has \(\mathrm{Var}(y_j) = n_{in}\sigma_W^2\); choosing \(\sigma_W = 1/\sqrt{n_{in}}\) gives unit output variance, so activation scale is depth-independent (and the backward pass inherits the same protection). Key reuse: any two layers with equal shapes get <em>bit-identical weight matrices</em> — hidden layers compute identical functions, halving effective capacity, with no error and no obvious symptom beyond a mysteriously weak model.</p></div>
-</div>
 
 <h2 id="optimizer">4.3 Optimizers are three lines of tree.map</h2>
 <p>Gradient descent over every parameter simultaneously:</p>
@@ -72,12 +59,6 @@ def sgd_momentum_update(params, grads, v, lr, mu=0.9):
 </code></pre>
 <p>The update is pure: state in as an argument, new state out as a return value. If you tried to keep <code>v</code> in a Python attribute instead, §3.3 told you the ending — it gets baked into the first trace and never updates. Full Adam (running mean <em>and</em> variance, plus bias correction) follows the identical pattern with two state trees; you'll write it in Chapter 7.</p>
 
-<div class="quiz" data-concept="ch4.html#optimizer" data-concept-label="§4.3 Optimizer state">
-  <div class="q-text"><p>Write from memory: one-line SGD, then momentum (init + update, returning <code>(params, v)</code>). Why must <code>v</code> be an explicit argument and return value rather than an attribute on an optimizer object — name the exact mechanism that would break, and the chapter section that explains it.</p></div>
-  <div class="hint">The update runs inside a jitted train step. What happens to non-argument values at trace time?</div>
-  <div class="answer"><p>SGD: <code>params = jax.tree.map(lambda p, g: p - lr*g, params, grads)</code>. Momentum: init <code>v = tree.map(zeros_like, params)</code>; update <code>v = tree.map(λv,g: mu*v+g, v, grads)</code> then <code>params = tree.map(λp,v: p-lr*v, params, v)</code>; return both. An attribute would be closure-captured at trace time (§3.3): the jitted train step would compile with the initial all-zeros velocity as a frozen constant, so momentum would silently never accumulate. Arguments are tracers — live inputs — which is precisely what state that changes every step must be.</p></div>
-</div>
-
 <h2 id="train-pattern">4.4 The canonical training step</h2>
 <p>Assemble §§4.1–4.3 and Chapter 2's <code>value_and_grad</code> and you get <em>the</em> JAX training pattern — worth memorizing as a shape, because Chapter 7's transformer step is this exact function with a bigger loss:</p>
 <pre><code>@jax.jit
@@ -93,12 +74,6 @@ for step in range(n_steps):
 </code></pre>
 <p>Read it as a checklist: every changing thing (<code>params</code>, <code>opt_state</code>, the data, keys) enters as an argument; every changing thing exits as a return value; the loop's only job is to rebind names and split keys. The whole step is one jit unit (§3.5), so XLA fuses forward, backward, and update into a single compiled program with no Python in the hot path.</p>
 
-<div class="quiz" data-concept="ch4.html#train-pattern" data-concept-label="§4.4 The training pattern">
-  <div class="q-text"><p>Closed book: write the canonical jitted <code>train_step</code> and its driving loop. Then audit it like a reviewer: list everything that must be an argument and everything that must be returned, and say what specifically goes wrong for each of these mistakes — (a) <code>lr</code> read from a global you later anneal, (b) forgetting to return <code>opt_state</code>, (c) sampling the batch <em>inside</em> the step with a closed-over key.</p></div>
-  <div class="hint">Apply two rules: §3.3 (capture freezes) and purity (changes must flow out as return values).</div>
-  <div class="answer"><p>Code as in §4.4. Arguments: params, opt_state, batch (and step/key if the step uses them). Returns: new params, new opt_state, metrics. (a) The first-trace value of <code>lr</code> is baked in; your "annealing" does nothing — pass <code>lr</code> (or step) as an argument. (b) The function computes the new optimizer state and throws it away; you keep feeding the old one — momentum/Adam statistics never accumulate, training quietly behaves like plain SGD with bias-corrected noise. (c) The closed-over key is frozen, so <em>every step trains on the identical batch</em>: loss plummets, the model has memorized one batch, generalization is zero. All three are silent — which is why the audit habit matters.</p></div>
-</div>
-
 <h2 id="scan">4.5 lax.scan: compiled loops</h2>
 <p>A Python <code>for</code> loop under <code>jit</code> unrolls: 1000 iterations means a 1000-copy program — slow to compile, sometimes slow to run. <code>jax.lax.scan</code> compiles the body <em>once</em> and loops at runtime, while also stacking per-step outputs:</p>
 <pre><code>def step(carry, x):                  # carry: loop state; x: this step's input
@@ -110,16 +85,6 @@ final, ys = jax.lax.scan(step, 0.0, jnp.arange(5.0))
 # final = 10.0 (0+1+2+3+4);  ys = [0, 1, 9, 36, 100] — stacked per-step outputs
 </code></pre>
 <p>Signature to memorize: <code>scan(f, init_carry, xs)</code> where <code>f(carry, x) → (carry, y)</code>; returns <code>(final_carry, stacked_ys)</code>. The carry must keep the same shape/dtype every iteration (it's compiled once). Uses in practice: RNNs (carry = hidden state), running whole <em>training epochs</em> inside one compiled call (carry = (params, opt_state, key), xs = batches), and stacking identical transformer layers (carry = activations, xs = per-layer params). Our 3-layer model just unrolls a Python loop — fine at this depth — but you should recognize <code>scan</code> when you see it in production JAX.</p>
-
-<div class="quiz" data-concept="ch4.html#scan" data-concept-label="§4.5 scan">
-  <div class="q-text"><p>State <code>lax.scan</code>'s signature: what must the body function take and return, and what does scan hand back? Use it to compute a discounted running sum \(c_{t} = x_t + 0.9\,c_{t-1}\) over a vector <code>xs</code>, returning all the \(c_t\). Why does scan beat a Python loop under jit, and what constraint does the carry have to satisfy?</p></div>
-  <div class="hint">Body: (carry, x) → (carry, y). For the running sum, the carry and the per-step output happen to be the same value.</div>
-  <div class="answer"><pre><code>def body(c, x):
-    c = x + 0.9 * c
-    return c, c                       # new carry, recorded output
-
-_, cs = jax.lax.scan(body, 0.0, xs)</code></pre><p><code>scan(f, init, xs)</code> with <code>f(carry, x) → (new_carry, y)</code> returns <code>(final_carry, ys)</code> where <code>ys</code> stacks the per-step <code>y</code>s along a new leading axis. Under jit, a Python loop is unrolled into N copies of the body (compile time and code size grow with N); scan compiles the body once with a runtime loop. Constraint: the carry's structure, shapes, and dtypes must be identical across iterations — the compiled body is reused, so the loop state can't change signature. (Fun fact from the PPO/GAE world: discounted sums like this one are exactly what scan is great at.)</p></div>
-</div>
 
 <h2 id="mlp-pipeline">4.6 Checkpoint: a complete pipeline, no framework</h2>
 <p>Everything you now know, in one runnable program — a two-layer MLP regressing \(y = \sin(3x)\). This is the full anatomy of every JAX project, the transformer included; only <code>forward</code> and <code>loss_fn</code> will grow.</p>
@@ -159,11 +124,122 @@ print(loss)        # ≈ 1e-4: an MLP fit by pure functions all the way down
 </code></pre>
 <p>Type this in and run it — actually run it; it finishes in seconds on CPU — then close the file and reproduce it. When you can, you know enough JAX to build the transformer.</p>
 
-<div class="quiz" data-concept="ch4.html#mlp-pipeline" data-concept-label="§4.6 Full pipeline">
-  <div class="q-text"><p>The capstone recall for Part I of the course. Closed book, on paper or in an editor: write the complete pipeline — <code>init_mlp</code>, <code>forward</code>, <code>loss_fn</code>, a jitted <code>train_step</code> with SGD, and the driving loop with correct key handling. Then label each piece with the chapter concept it embodies (purity, key discipline, pytree update, whole-step jit, …).</p></div>
-  <div class="hint">Five functions/blocks. If stuck on order: init → forward → loss → step → loop. The step takes and returns everything that changes.</div>
-  <div class="hint">Key handling appears in exactly two places: splitting inside init (per layer), and splitting in the setup (init vs data). The training loop here needs no keys — the data is fixed.</div>
-  <div class="answer"><p>Reference as in §4.6. The labels that matter: <code>forward(params, x)</code> — model as pure function, weights as data (§1.1/1.3); per-layer <code>split</code> in init — key discipline (§1.4), fan-in scale (§4.2); <code>value_and_grad</code> — loss + grads in one pass (§2.3); <code>tree.map</code> update — pytree-wide SGD (§4.3); <code>@jax.jit</code> on the whole step, fixed shapes — (§3.5); the loop only rebinds <code>params</code> — immutability (§1.2). If your version kept any state anywhere else, find it and thread it through the arguments instead.</p></div>
+<h2 id="problems">Problem set</h2>
+<p>This set ends with the Part-I capstone: the complete MLP pipeline, written in an empty editor. Everything before it is a rehearsal of one of its organs.</p>
+
+<div class="quiz" data-concept="ch4.html#pytree-def" data-concept-label="§4.1 Pytrees" data-min="50" data-placeholder="leaves: ...&#10;tree.map result: ...&#10;two-tree condition: ...">
+  <div class="q-text"><p>For <code>tree = {"a": [jnp.ones(2), jnp.ones(3)], "b": (jnp.ones(4), {"c": 5.0})}</code>: predict how many leaves <code>jax.tree.leaves(tree)</code> returns and what they are; what <code>jax.tree.map(lambda x: x * 0, tree)</code> returns; and what condition <code>jax.tree.map(f, t1, t2)</code> requires. Verify the first two in the REPL, then add one line: why is that condition exactly what makes the params/grads pairing work?</p></div>
+  <div class="hint">Containers (dict/list/tuple) are structure; everything else — arrays AND plain scalars — is a leaf.</div>
+  <div class="answer"><p><strong>4 leaves</strong>: ones(2), ones(3), ones(4), and the scalar 5.0 (scalars are leaves too). <code>tree.map(x*0)</code> returns the same structure with every leaf zeroed (5.0 → 0.0). The two-tree form requires <em>identical structure</em> — same containers, keys, nesting. That's guaranteed for params/grads because <code>jax.grad</code> builds the gradient tree to mirror the parameter tree exactly: every parameter array is paired with its own gradient array by position, which is what lets one <code>tree.map</code> update the whole model.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch4.html#init" data-concept-label="§4.2 Initialization" data-min="120" data-placeholder="def init_mlp(key, sizes):&#10;    ...&#10;# why 1/sqrt(n_in): ...&#10;# same-key bug: ...">
+  <div class="q-text"><p>Write <code>init_mlp(key, sizes)</code> — e.g. <code>sizes = [784, 256, 256, 10]</code> — weights \(\sim \mathcal{N}(0, 1/n_{in})\), zero biases, one fresh subkey per layer. Two comments: the variance argument for \(1/\sqrt{n_{in}}\) (one line), and what concretely goes wrong if every layer uses the <em>same</em> key. Run it and check <code>jax.tree.map(lambda p: p.shape, params)</code>.</p></div>
+  <div class="hint">Var of a sum of n independent zero-mean products = n × (var of one product). What weight scale cancels it?</div>
+  <div class="hint">Same key + same shape ⇒ same numbers (§1.4). What do two (256, 256) layers then compute?</div>
+  <div class="answer"><pre><code>def init_mlp(key, sizes):
+    params = []
+    for n_in, n_out in zip(sizes[:-1], sizes[1:]):
+        key, wk = jax.random.split(key)
+        params.append({"W": jax.random.normal(wk, (n_in, n_out)) / jnp.sqrt(n_in),
+                       "b": jnp.zeros(n_out)})
+    return params
+# 1/sqrt(n_in): each output is a sum of n_in unit-variance products
+# (variance n_in·σ_W²) — σ_W = 1/√n_in keeps activations unit-variance at depth
+# same-key bug: equal-shaped layers get bit-identical weight matrices —
+# they compute identical functions; capacity silently halves, nothing errors</code></pre></div>
+</div>
+
+<div class="quiz" data-concept="ch4.html#optimizer" data-concept-label="§4.3 Optimizer state" data-min="120" data-placeholder="# sgd&#10;params = ...&#10;&#10;def sgd_momentum_init(params): ...&#10;def sgd_momentum_update(params, grads, v, lr, mu=0.9): ...">
+  <div class="q-text"><p>Write (a) whole-model SGD as one <code>tree.map</code> line; (b) momentum: <code>sgd_momentum_init(params)</code> and <code>sgd_momentum_update(params, grads, v, lr, mu=0.9)</code> returning <code>(params, v)</code>. Comment: name the exact mechanism that breaks if <code>v</code> lives as an attribute on an optimizer object instead.</p></div>
+  <div class="hint">The update runs inside a jitted train step. What happens to non-argument values at trace time (§3.3)?</div>
+  <div class="answer"><pre><code>params = jax.tree.map(lambda p, g: p - lr * g, params, grads)      # SGD
+
+def sgd_momentum_init(params):
+    return jax.tree.map(jnp.zeros_like, params)
+
+def sgd_momentum_update(params, grads, v, lr, mu=0.9):
+    v = jax.tree.map(lambda v, g: mu * v + g, v, grads)
+    params = jax.tree.map(lambda p, v: p - lr * v, params, v)
+    return params, v                  # new state OUT as a return value
+# attribute version: closure capture (§3.3) — the jitted step compiles with
+# the initial all-zeros velocity as a frozen constant; momentum silently
+# never accumulates</code></pre></div>
+</div>
+
+<div class="quiz" data-concept="ch4.html#train-pattern" data-concept-label="§4.4 The training pattern" data-min="150" data-placeholder="@jax.jit&#10;def train_step(params, opt_state, batch):&#10;    ...&#10;&#10;for step in range(n_steps):&#10;    ...&#10;# (a) ...&#10;# (b) ...&#10;# (c) ...">
+  <div class="q-text"><p>Write the canonical jitted <code>train_step</code> and its driving loop (with key splitting for batch sampling). Then audit, as three comments, what specifically goes wrong with: (a) <code>lr</code> read from a global you later anneal; (b) forgetting to return <code>opt_state</code>; (c) sampling the batch inside the step with a closed-over key.</p></div>
+  <div class="hint">Two rules answer all three: capture freezes at trace time (§3.3), and changes must flow out as return values (purity).</div>
+  <div class="answer"><pre><code>@jax.jit
+def train_step(params, opt_state, batch):
+    loss, grads = jax.value_and_grad(loss_fn)(params, batch)
+    params, opt_state = optimizer_update(params, grads, opt_state)
+    return params, opt_state, loss
+
+for step in range(n_steps):
+    key, bkey = jax.random.split(key)
+    batch = sample_batch(bkey, data)
+    params, opt_state, loss = train_step(params, opt_state, batch)
+
+# (a) lr is baked in at trace time — the "annealing" does nothing;
+#     pass lr (or step) as an argument
+# (b) the new optimizer state is computed and discarded; you keep feeding
+#     the old one — Adam/momentum statistics never accumulate, silently
+# (c) the closed-over key is frozen ⇒ EVERY step trains on the identical
+#     batch: loss plummets, the model memorized one batch</code></pre><p>Read your version as a checklist: everything that changes enters as an argument and exits as a return value; the loop only rebinds names and splits keys.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch4.html#scan" data-concept-label="§4.5 scan" data-min="80" data-placeholder="def body(c, x):&#10;    ...&#10;    return ..., ...&#10;&#10;_, cs = jax.lax.scan(...)">
+  <div class="q-text"><p>Using <code>jax.lax.scan</code>, compute the discounted running sum \(c_t = x_t + 0.9\,c_{t-1}\) over a vector <code>xs</code>, returning <em>all</em> the \(c_t\). Verify against a Python loop on <code>xs = jnp.array([1., 1., 1.])</code> (expect <code>[1.0, 1.9, 2.71]</code>). Comments: why scan beats a Python loop under jit, and the constraint the carry must satisfy.</p></div>
+  <div class="hint">Body: <code>(carry, x) → (new_carry, y)</code>. Here the new carry and the recorded output are the same value.</div>
+  <div class="answer"><pre><code>def body(c, x):
+    c = x + 0.9 * c
+    return c, c                       # new carry, per-step output
+
+_, cs = jax.lax.scan(body, 0.0, xs)   # cs = [1.0, 1.9, 2.71] for ones(3)
+# vs Python loop under jit: the loop UNROLLS into N copies of the body
+# (compile time grows with N); scan compiles the body once, loops at runtime
+# constraint: the carry's structure/shapes/dtypes must be identical every
+# iteration — the compiled body is reused</code></pre><p><code>scan(f, init, xs)</code> returns <code>(final_carry, stacked_ys)</code>. File this pattern: RNNs (carry = hidden state), whole training epochs in one compiled call (carry = (params, opt_state, key)), stacked transformer layers (xs = per-layer params).</p></div>
+</div>
+
+<div class="quiz" data-concept="ch4.html#mlp-pipeline" data-concept-label="§4.6 Full pipeline" data-min="400" data-placeholder="import jax, jax.numpy as jnp&#10;&#10;def init_mlp(key, sizes):&#10;    ...&#10;&#10;def forward(params, x):&#10;    ...&#10;&#10;def loss_fn(params, x, y):&#10;    ...&#10;&#10;@jax.jit&#10;def train_step(params, x, y):&#10;    ...&#10;&#10;# setup + loop">
+  <div class="q-text"><p>The Part-I capstone. In an empty editor (then paste here): the complete pipeline — <code>init_mlp</code>, <code>forward</code> (tanh hidden layers), <code>loss_fn</code> (MSE), a jitted SGD <code>train_step</code>, and the setup + loop with correct key handling — training a [1, 64, 64, 1] MLP to fit \(y = \sin(3x)\) on 256 random points. <strong>Run it.</strong> Loss after 2000 steps should be ~1e-4. If any state in your version lives anywhere other than the arguments, find it and thread it through.</p></div>
+  <div class="hint">Five blocks: init → forward → loss → step → loop. The step takes and returns everything that changes.</div>
+  <div class="hint">Keys appear in exactly two places here: per-layer splits inside init, and the setup split (init key vs data key). The loop needs none — the data is fixed.</div>
+  <div class="answer"><pre><code>import jax, jax.numpy as jnp
+
+def init_mlp(key, sizes):
+    params = []
+    for n_in, n_out in zip(sizes[:-1], sizes[1:]):
+        key, wk = jax.random.split(key)
+        params.append({"W": jax.random.normal(wk, (n_in, n_out)) / jnp.sqrt(n_in),
+                       "b": jnp.zeros(n_out)})
+    return params
+
+def forward(params, x):
+    for layer in params[:-1]:
+        x = jnp.tanh(x @ layer["W"] + layer["b"])
+    return x @ params[-1]["W"] + params[-1]["b"]
+
+def loss_fn(params, x, y):
+    return jnp.mean((forward(params, x) - y) ** 2)
+
+@jax.jit
+def train_step(params, x, y):
+    loss, grads = jax.value_and_grad(loss_fn)(params, x, y)
+    params = jax.tree.map(lambda p, g: p - 0.05 * g, params, grads)
+    return params, loss
+
+key = jax.random.PRNGKey(0)
+key, ik, xk = jax.random.split(key, 3)
+params = init_mlp(ik, [1, 64, 64, 1])
+x = jax.random.uniform(xk, (256, 1), minval=-2.0, maxval=2.0)
+y = jnp.sin(3 * x)
+
+for step in range(2000):
+    params, loss = train_step(params, x, y)
+print(loss)          # ≈ 1e-4</code></pre><p>Label your own version: weights as data (§1.1), per-layer key splits (§1.4), <code>value_and_grad</code> (§2.3), pytree-wide update (§4.3), whole-step jit with fixed shapes (§3.5), loop that only rebinds (§1.2). This skeleton <em>is</em> the transformer's training program; only <code>forward</code> and <code>loss_fn</code> grow.</p></div>
 </div>
 
 </main>

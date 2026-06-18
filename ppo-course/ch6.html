@@ -38,13 +38,6 @@ $$ L^{\mathrm{CLIP}}(\theta) = \mathbb{E}_t\Big[ \min\big( r_t(\theta)\,\hat A_t
 </table>
 <p>Derivation of, say, row 2: for \(A \gt 0\) and \(r \gt 1+\epsilon\), the unclipped term is \(rA\), the clipped term \((1+\epsilon)A\); the min picks the smaller, \((1+\epsilon)A\), which contains no \(\theta\) — gradient zero. Work the other three the same way. Note the structure: <em>the gradient dies exactly when the update has already gone as far, in the beneficial direction, as the trust budget allows; it never dies on a sample where the current parameters make things worse than the budget allows</em> (rows 1 and 3 include the deep-violation cases \(A\gt0, r \ll 1-\epsilon\) and \(A\lt0, r \gg 1+\epsilon\) — there the unclipped term is the min, and the gradient actively pulls the ratio back). Both behaviors are machine-checked in <code>test_ppo_core.py</code> (PASS 4–5).</p>
 
-<div class="quiz" data-concept="ch6.html#cases" data-concept-label="§6.3 Case analysis">
-  <div class="q-text"><p><strong>The course's signature recall.</strong> From memory: write \(L^{\mathrm{CLIP}}\), then produce the full four-row case table — objective term, whether the gradient is alive or zero, and the one-phrase meaning of each row. Finally: in which two situations does a sample contribute exactly zero gradient, stated in plain English?</p></div>
-  <div class="hint">Split on the sign of \(A\), then on which side of the clip interval \(r\) sits. In each cell, decide which of \(rA\) and \(\mathrm{clip}(r)A\) is smaller.</div>
-  <div class="hint">Zero gradient ⟺ the min selects the clipped (constant) branch.</div>
-  <div class="answer"><p>\(L^{\mathrm{CLIP}} = \mathbb{E}[\min(r\hat A, \mathrm{clip}(r,1\!-\!\epsilon,1\!+\!\epsilon)\hat A)]\). Table: see §6.3 — \(A\gt0\): gradient alive while \(r \le 1+\epsilon\) (push up), zero beyond; \(A\lt0\): alive while \(r \ge 1-\epsilon\) (push down), zero below. Zero-gradient situations: a <em>good</em> action whose probability has already been raised by factor \(\ge 1+\epsilon\), and a <em>bad</em> action whose probability has already been cut by factor \(\le 1-\epsilon\) — in both, the sample has spent its trust budget in the profitable direction and goes silent until the next rollout.</p></div>
-</div>
-
 <h2 id="min">6.4 Why the <em>min</em>, not just the clip</h2>
 <p>A common misreading is that PPO's objective is \(\mathrm{clip}(r)\hat A\) alone. Compare the two on a sample with \(A \gt 0\) and \(r = 0.3\) (the optimizer has, while improving other samples, collaterally crushed this good action):</p>
 <ul>
@@ -54,23 +47,11 @@ $$ L^{\mathrm{CLIP}}(\theta) = \mathbb{E}_t\Big[ \min\big( r_t(\theta)\,\hat A_t
 <div class="box keypoint"><div class="box-title">What the min does</div>
 <p>\(\min\) makes \(L^{\mathrm{CLIP}}\) a <strong>pessimistic (lower) bound</strong> on the true surrogate: \(L^{\mathrm{CLIP}} \le \hat L\), with equality at \(\theta = \theta_\text{old}\) (where \(r\equiv1\): both branches equal \(\hat A_t\), and \(\mathbb{E}\) recovers \(\hat L = 0\); the gradients also coincide there, by the §4.4 argument — PPO's first step on fresh data is an exact policy-gradient step). Clipping is applied <em>one-sidedly</em>: only where it makes the objective smaller. Improvements are capped; deteriorations never are. This is the same lower-bound philosophy as TRPO's §5.1 minorant — optimize a pessimistic model of the true objective — implemented with a <code>min</code> instead of a theorem.</p></div>
 
-<div class="quiz" data-concept="ch6.html#min" data-concept-label="§6.4 Why the min">
-  <div class="q-text"><p>Show with a concrete numerical sample (pick \(A\), \(r\), \(\epsilon\)) that clip-without-min and the full PPO objective behave differently, and state precisely what property the min restores. In what two senses (value and gradient) does \(L^{\mathrm{CLIP}}\) coincide with the true surrogate at \(\theta_\text{old}\)?</p></div>
-  <div class="hint">Choose a sample where the ratio has been pushed in the harmful direction: \(A\gt0\) with small \(r\), or \(A\lt0\) with large \(r\).</div>
-  <div class="answer"><p>Example \(A=1, r=0.3, \epsilon=0.2\): clip-only gives constant \(0.8\) (no gradient — a wrongly-suppressed good action stays suppressed); with min, \(\min(0.3, 0.8) = 0.3\), the live branch, so the gradient raises \(r\). The min ensures clipping only ever <em>lowers</em> the objective, making \(L^{\mathrm{CLIP}}\) a pessimistic bound \(\le \hat L\): caps on improvement, none on penalty. At \(\theta_\text{old}\), \(r\equiv1\) lies strictly inside the interval, both branches equal \(\hat A_t\), so values match (\(L^{\mathrm{CLIP}}=\hat L=0\)) and the gradient is \(\mathbb{E}[\nabla\log\pi\,\hat A]\) — the exact advantage policy gradient.</p></div>
-</div>
-
 <h2 id="epochs">6.5 What clipping buys: epochs</h2>
 <p>The payoff for all this: PPO runs <strong>multiple epochs of minibatch SGD on the same rollout</strong> — typically 3–10 passes, shuffled minibatches, plain Adam. REINFORCE got one gradient step per batch (§2.7); PPO gets dozens. As the epochs proceed, ratios drift away from 1; samples whose ratios reach the clip boundary in the profitable direction fall silent one by one, and the update self-limits. The optimizer can run greedily because the objective has the pessimism built in — exactly the role TRPO's constraint-plus-line-search played, at the price of a <code>clamp</code> and a <code>min</code>.</p>
 <p>Honesty requires the fine print:</p>
 <div class="box warning"><div class="box-title">The clip is not a KL guarantee</div>
 <p>Clipping removes the <em>incentive</em> for ratios to leave \([1-\epsilon,1+\epsilon]\); it does not make it impossible. A sample's ratio can blow past the boundary as a side effect of updates driven by other samples sharing the network — once past, with \(A\gt0\), its gradient is zero and nothing pulls it back (only the \(A\lt0\) overshoots get pulled back). There is no theorem bounding \(\bar D_{\mathrm{KL}}(\pi_{\theta_\text{old}}\|\pi_\theta)\) for PPO; the monotonic-improvement guarantee of §5.1 is genuinely surrendered. In practice the drift is monitored (approximate KL, clip fraction — §7.4), and many implementations <strong>early-stop</strong> the epoch loop when approx-KL exceeds a target (~0.01–0.05): an empirical trust region rebuilt on top of the clip.</p>
-</div>
-
-<div class="quiz" data-concept="ch6.html#epochs" data-concept-label="§6.5 Epochs & the honest fine print">
-  <div class="q-text"><p>(a) Why can PPO take many optimization passes over one rollout when REINFORCE could take only one — what specifically licenses the reuse, and what limits it (two mechanisms from this chapter)? (b) State precisely what clipping does <em>not</em> guarantee, the mechanism by which ratios still escape, and the standard practical safeguard.</p></div>
-  <div class="hint">(a) One mechanism corrects for stale data; the other caps how much correction is trusted. (b) Parameters are shared across samples.</div>
-  <div class="answer"><p>(a) The importance ratio \(r_t(\theta)\) keeps the surrogate a valid (first-order-correct) estimate as \(\theta\) moves off the data-collecting policy — that licenses reuse (§4.3–4.4); the clip+min silences each sample once its ratio has moved \(\epsilon\)-far in the profitable direction, so successive epochs self-limit instead of diverging — that bounds the reuse. (b) No bound on actual KL: a ratio can be pushed across the boundary by gradients from <em>other</em> samples updating the shared parameters, and for \(A\gt0\) overshoots the gradient is zero on the far side, so nothing restores it. Safeguard: track approx-KL each epoch and early-stop the update loop past a target (plus monitor clip fraction).</p></div>
 </div>
 
 <h2 id="variants">6.6 The other PPO: adaptive KL penalty</h2>
@@ -81,12 +62,6 @@ $$ L^{\mathrm{CLIP}}(\theta) = \mathbb{E}_t\Big[ \min\big( r_t(\theta)\,\hat A_t
 <div class="box keypoint"><div class="box-title">The full PPO loss (descent form)</div>
 $$ \mathcal{L}(\theta) = \underbrace{-L^{\mathrm{CLIP}}(\theta)}_{\text{policy}} \;+\; c_1 \underbrace{\mathbb{E}_t\big[(V_\theta(s_t) - \hat R^{\mathrm{targ}}_t)^2\big]}_{\text{value regression}} \;-\; c_2 \underbrace{\mathbb{E}_t\big[\mathcal{H}[\pi_\theta(\cdot|s_t)]\big]}_{\text{entropy bonus}}, $$
 <p>typically \(c_1 = 0.5\), \(c_2 \approx 0.0\)–\(0.01\). Value targets \(\hat R^{\mathrm{targ}}_t = \hat A_t + V_{\text{old}}(s_t)\) (the TD(λ) returns from §3.6). The entropy term pays the policy to stay stochastic, postponing premature commitment to a single action; it is the lineal descendant of "exploration bonus". Signs are the eternal bug farm: maximize \(L^{\mathrm{CLIP}}\), minimize value error, maximize entropy — check each term's sign against that sentence whenever you touch the code.</p></div>
-
-<div class="quiz" data-concept="ch6.html#loss" data-concept-label="§6.7 The full loss">
-  <div class="q-text"><p>Write the complete PPO loss from memory in descent form: all three terms with correct signs, typical coefficients, what the value targets are and where they come from, and the purpose of the entropy term.</p></div>
-  <div class="hint">Descent form: things to maximize enter with minus signs. Two of the three terms get minus signs.</div>
-  <div class="answer"><p>\(\mathcal{L} = -L^{\mathrm{CLIP}} + c_1\,\mathbb{E}[(V_\theta(s_t)-\hat R^{\text{targ}}_t)^2] - c_2\,\mathbb{E}[\mathcal H[\pi_\theta(\cdot|s_t)]]\), \(c_1=0.5\), \(c_2 \le 0.01\). Targets: \(\hat R^{\text{targ}}_t = \hat A^{\mathrm{GAE}}_t + V_{\text{old}}(s_t)\), produced as a by-product of the GAE pass (§3.6). Entropy is maximized (hence the minus) to keep the action distribution from collapsing early — sustained exploration while advantages are still noisy.</p></div>
-</div>
 
 <h2 id="vs">6.8 PPO vs TRPO, condensed</h2>
 <table>
@@ -100,14 +75,41 @@ $$ \mathcal{L}(\theta) = \underbrace{-L^{\mathrm{CLIP}}(\theta)}_{\text{policy}}
 <tr><td>Implementation</td><td>~hundreds of lines, delicate</td><td>~20-line core, but detail-sensitive (Ch 7)</td></tr>
 </table>
 
-<div class="quiz" data-concept="ch6.html#vs" data-concept-label="§6.8 PPO vs TRPO">
-  <div class="q-text"><p>An interviewer asks: "PPO and TRPO solve the same problem — what exactly did PPO trade away, and what did it gain?" Answer in four crisp sentences from memory, then name the one scenario per algorithm where it's clearly the better choice.</p></div>
-  <div class="hint">Trade: a guarantee for a property of the loss function. Gain: think optimizer machinery and update counts.</div>
-  <div class="answer"><p>Both maximize the importance-sampled surrogate while keeping the new policy near the data-collecting one. TRPO enforces nearness as an explicit average-KL constraint solved with natural-gradient/CG machinery and a verifying line search, earning an approximate monotonic-improvement guarantee at the cost of one expensive second-order update per rollout. PPO bakes pessimism into the objective itself (clip + min), surrendering the guarantee but enabling plain Adam, minibatches, and many epochs per rollout — more, cheaper, gradient steps and a 20-line core. PPO wins almost everywhere modern: huge shared-parameter networks, distributed collection, LLM fine-tuning. TRPO-style updates still appeal when updates must be provably conservative and per-update compute is cheap relative to data (e.g. small policies where each rollout is precious or safety-critical).</p></div>
+<h2 id="problems">Problem set</h2>
+<p>Problem 1 is the course's signature exercise — the case analysis should eventually be reflex. Problems 1 and 2 are machine-checked: PASS 4–5 of <code>test_ppo_core.py</code> are the clip's hand-computed values and zero-gradient regions.</p>
+
+<div class="quiz" data-concept="ch6.html#cases" data-concept-label="§6.3 Case analysis" data-min="150"
+     data-placeholder="L_CLIP =&#10;A>0, r <= 1+eps:   term ...      grad ...     meaning ...&#10;A>0, r >  1+eps:   ...&#10;A<0, r >= 1-eps:   ...&#10;A<0, r <  1-eps:   ...&#10;zero-gradient situations, in plain English:">
+  <div class="q-text"><p><strong>The signature problem.</strong> Write \(L^{\mathrm{CLIP}}\), then produce the full four-row case table — objective term, whether the gradient is alive or zero, and the one-phrase meaning of each row. Finish in plain English: in which two situations does a sample contribute exactly zero gradient? Spot-check your table with numbers (\(\epsilon=0.2\)): \(A=1, r=1.5\) should give a constant \(1.2\); \(A=-1, r=1.5\) should give a live \(-1.5\).</p></div>
+  <div class="hint">Split on the sign of \(A\), then on which side of the clip interval \(r\) sits. In each cell, decide which of \(rA\) and \(\mathrm{clip}(r)A\) is smaller.</div>
+  <div class="hint">Zero gradient ⟺ the min selects the clipped (constant) branch.</div>
+  <div class="answer"><p>\(L^{\mathrm{CLIP}} = \mathbb{E}[\min(r\hat A, \mathrm{clip}(r,1\!-\!\epsilon,1\!+\!\epsilon)\hat A)]\). Table: \(A\gt0\): gradient alive while \(r \le 1+\epsilon\) (push up), zero beyond — the term freezes at \((1+\epsilon)A\); \(A\lt0\): alive while \(r \ge 1-\epsilon\) (push down), zero below — frozen at \((1-\epsilon)A\). Checks: \(A=1, r=1.5\): \(\min(1.5, 1.2) = 1.2\), the clipped constant, gradient zero; \(A=-1, r=1.5\): \(\min(-1.5, -1.2) = -1.5\), the unclipped branch, gradient alive and pulling \(r\) down. Zero-gradient situations: a <em>good</em> action whose probability has already been raised by factor \(\ge 1+\epsilon\), and a <em>bad</em> action whose probability has already been cut by factor \(\le 1-\epsilon\) — in both, the sample has spent its trust budget in the profitable direction and goes silent until the next rollout.</p></div>
 </div>
 
-<div class="box recall-pause"><div class="box-title">Before moving on</div>
-<p>Three rehearsals, closed-book: (1) \(L^{\mathrm{CLIP}}\) plus the four-case table; (2) the \(A\gt0, r=0.3\) story for why the min matters; (3) the full three-term loss with signs. Then say aloud what is monitored in lieu of a guarantee (approx-KL, clip fraction) and why. Chapter 7 turns all of it into working code — and into <em>your</em> code.</p>
+<div class="quiz" data-concept="ch6.html#min" data-concept-label="§6.4 Why the min" data-min="100"
+     data-placeholder="sample: A = ..., r = ..., eps = ...&#10;clip-only term: ...        gradient: ...&#10;with min:      ...        gradient: ...&#10;property the min restores:&#10;at theta_old: value ...,  gradient ...">
+  <div class="q-text"><p>Pick a concrete sample (your own \(A\), \(r\), \(\epsilon\)) and show numerically that clip-without-min and the full PPO objective behave differently on it. State precisely what property the min restores, and the two senses (value and gradient) in which \(L^{\mathrm{CLIP}}\) coincides with the true surrogate at \(\theta_\text{old}\).</p></div>
+  <div class="hint">Choose a sample where the ratio has been pushed in the harmful direction: \(A\gt0\) with small \(r\), or \(A\lt0\) with large \(r\).</div>
+  <div class="answer"><p>Example \(A=1, r=0.3, \epsilon=0.2\): clip-only gives constant \(0.8\) (no gradient — a wrongly-suppressed good action stays suppressed); with min, \(\min(0.3, 0.8) = 0.3\), the live branch, so the gradient raises \(r\). The min ensures clipping only ever <em>lowers</em> the objective, making \(L^{\mathrm{CLIP}}\) a pessimistic bound \(\le \hat L\): caps on improvement, none on penalty. At \(\theta_\text{old}\), \(r\equiv1\) lies strictly inside the interval, both branches equal \(\hat A_t\), so values match (\(L^{\mathrm{CLIP}}=\hat L=0\)) and the gradient is \(\mathbb{E}[\nabla\log\pi\,\hat A]\) — the exact advantage policy gradient.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch6.html#epochs" data-concept-label="§6.5 Epochs & the honest fine print" data-min="100">
+  <div class="q-text"><p>(a) Why can PPO take many optimization passes over one rollout when REINFORCE could take only one — what specifically licenses the reuse, and what limits it (two mechanisms from this chapter)? (b) State precisely what clipping does <em>not</em> guarantee, the mechanism by which ratios still escape, and the standard practical safeguard.</p></div>
+  <div class="hint">(a) One mechanism corrects for stale data; the other caps how much correction is trusted. (b) Parameters are shared across samples.</div>
+  <div class="answer"><p>(a) The importance ratio \(r_t(\theta)\) keeps the surrogate a valid (first-order-correct) estimate as \(\theta\) moves off the data-collecting policy — that licenses reuse (§4.3–4.4); the clip+min silences each sample once its ratio has moved \(\epsilon\)-far in the profitable direction, so successive epochs self-limit instead of diverging — that bounds the reuse. (b) No bound on actual KL: a ratio can be pushed across the boundary by gradients from <em>other</em> samples updating the shared parameters, and for \(A\gt0\) overshoots the gradient is zero on the far side, so nothing restores it. Safeguard: track approx-KL each epoch and early-stop the update loop past a target (plus monitor clip fraction).</p></div>
+</div>
+
+<div class="quiz" data-concept="ch6.html#loss" data-concept-label="§6.7 The full loss" data-min="100"
+     data-placeholder="L(theta) = ...&#10;coefficients: c1 = ..., c2 = ...&#10;value targets: R_targ = ...   (from ...)&#10;entropy term's purpose:">
+  <div class="q-text"><p>Write the complete PPO loss in descent form: all three terms with correct signs, typical coefficients, the value targets and where they come from, and the purpose of the entropy term.</p></div>
+  <div class="hint">Descent form: things to maximize enter with minus signs. Two of the three terms get minus signs.</div>
+  <div class="answer"><p>\(\mathcal{L} = -L^{\mathrm{CLIP}} + c_1\,\mathbb{E}[(V_\theta(s_t)-\hat R^{\text{targ}}_t)^2] - c_2\,\mathbb{E}[\mathcal H[\pi_\theta(\cdot|s_t)]]\), \(c_1=0.5\), \(c_2 \le 0.01\). Targets: \(\hat R^{\text{targ}}_t = \hat A^{\mathrm{GAE}}_t + V_{\text{old}}(s_t)\), produced as a by-product of the GAE pass (§3.6). Entropy is maximized (hence the minus) to keep the action distribution from collapsing early — sustained exploration while advantages are still noisy.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch6.html#vs" data-concept-label="§6.8 PPO vs TRPO" data-min="120">
+  <div class="q-text"><p>An interviewer asks: "PPO and TRPO solve the same problem — what exactly did PPO trade away, and what did it gain?" Write your answer in four crisp sentences, then name the one scenario per algorithm where it's clearly the better choice.</p></div>
+  <div class="hint">Trade: a guarantee for a property of the loss function. Gain: think optimizer machinery and update counts.</div>
+  <div class="answer"><p>Both maximize the importance-sampled surrogate while keeping the new policy near the data-collecting one. TRPO enforces nearness as an explicit average-KL constraint solved with natural-gradient/CG machinery and a verifying line search, earning an approximate monotonic-improvement guarantee at the cost of one expensive second-order update per rollout. PPO bakes pessimism into the objective itself (clip + min), surrendering the guarantee but enabling plain Adam, minibatches, and many epochs per rollout — more, cheaper, gradient steps and a 20-line core. PPO wins almost everywhere modern: huge shared-parameter networks, distributed collection, LLM fine-tuning. TRPO-style updates still appeal when updates must be provably conservative and per-update compute is cheap relative to data (e.g. small policies where each rollout is precious or safety-critical).</p></div>
 </div>
 
 </main>

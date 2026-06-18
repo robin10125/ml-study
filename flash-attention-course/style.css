@@ -259,6 +259,35 @@ pre code { background: none; color: inherit; padding: 0; font-size: inherit; }
 .dash-row .dash-fill { background: var(--accent); height: 100%; border-radius: 999px; }
 .dash-row .dash-count { width: 70px; text-align: right; color: var(--ink-soft); font-size: 0.85rem; }
 
+/* ---------- problem workspace (code/text box) ---------- */
+.quiz .workspace textarea {
+  width: 100%;
+  min-height: 9.5rem;
+  resize: vertical;
+  border: 1px solid #d8d2c8;
+  border-radius: 8px;
+  background: #fffdf8;
+  color: var(--ink);
+  padding: 0.85rem 0.95rem;
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  font-size: 0.88rem;
+  line-height: 1.5;
+  outline: none;
+}
+.quiz .workspace textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(232, 89, 12, 0.14);
+}
+.quiz button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.quiz .gate-note {
+  color: var(--ink-soft);
+  font-size: 0.82rem;
+  margin-top: 0.5rem;
+}
+
 /* ---------- misc ---------- */
 .fig {
   background: var(--card);

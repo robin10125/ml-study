@@ -271,3 +271,34 @@ pre code { background: none; color: inherit; padding: 0; font-size: inherit; }
 .fig .caption { font-size: 0.85rem; color: var(--ink-soft); margin-top: 0.4rem; }
 .katex { font-size: 1.05em; }
 .katex-display { overflow-x: auto; overflow-y: hidden; padding: 0.2rem 0; }
+
+/* ---------- problem workspace (code box) ---------- */
+.quiz .workspace textarea {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 150px;
+  resize: vertical;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.84rem;
+  line-height: 1.55;
+  tab-size: 4;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.65rem 0.85rem;
+  background: #fcfcf7;
+  color: var(--ink);
+  margin: 0.5rem 0 0.1rem;
+}
+.quiz .workspace textarea:focus {
+  outline: 2px solid var(--accent-soft);
+  border-color: var(--accent);
+}
+.quiz button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.quiz .gate-note {
+  font-size: 0.78rem;
+  color: var(--ink-soft);
+  margin-top: 0.35rem;
+}

@@ -100,6 +100,39 @@ Forgetting barrier #2 gives wrong answers <em>sometimes</em> (a race); forgettin
 </div>
 <p><em>One level deeper (optional now, revisited in §5.9):</em> shared memory is divided into 32 <strong>banks</strong> (4-byte wide, addresses interleaved). If multiple threads of a warp hit different addresses in the <em>same</em> bank simultaneously, the accesses serialize ("bank conflict"). All threads reading the <em>same</em> address is fine — it broadcasts.</p>
 
+<h2 id="thread-sync">2.5b Thread synchronization: what barriers do and do not guarantee</h2>
+<p>CUDA synchronization is deliberately local. A normal kernel gives you three useful scopes:</p>
+<table>
+<tr><th>Primitive</th><th>Scope</th><th>What it guarantees</th><th>What it does not guarantee</th></tr>
+<tr><td><code>__syncwarp(mask)</code></td><td>lanes in one warp</td><td>Named lanes reach the same point; their prior memory operations are visible to those lanes</td><td>No ordering with other warps in the block</td></tr>
+<tr><td><code>__syncthreads()</code></td><td>all threads in one block</td><td>Every block thread reaches the barrier; shared/global writes before it are visible to block threads after it</td><td>No synchronization with other blocks</td></tr>
+<tr><td>kernel boundary</td><td>whole launched grid</td><td>All blocks of kernel A finish before kernel B starts, if launched sequentially in the same stream</td><td>It costs a launch and forces intermediate data through global memory</td></tr>
+</table>
+<p>The missing primitive is the most important one: <strong>there is no ordinary grid-wide barrier inside a kernel.</strong> Blocks are scheduled independently; some may not even start until others finish. If an algorithm needs every block to finish phase 1 before any block starts phase 2, the simple CUDA answer is two kernels. Deep-learning kernels avoid that split when possible because kernel boundaries destroy fusion: any intermediate that crosses the boundary must be written to and read from HBM.</p>
+
+<div class="box warning"><div class="box-title">Barrier rules that prevent deadlocks and races</div>
+<ul>
+  <li><strong>Every thread in the block must reach every <code>__syncthreads()</code>.</strong> Do not put it inside <code>if (row &lt; N)</code> unless every thread takes that branch. Instead, let out-of-range threads participate in loads/barriers and guard only the arithmetic or final store.</li>
+  <li><strong>A barrier is not an atomic operation.</strong> If two threads write the same address before a barrier, the result is still a race. Use one writer, a reduction pattern, or an atomic.</li>
+  <li><strong>A memory fence is not a barrier.</strong> Fences order one thread's memory operations; they do not wait for other threads. For this course, think "shared tile reuse requires <code>__syncthreads()</code>."</li>
+  <li><strong>Warp-synchronous code is only safe at warp scope.</strong> If data moves between warps through shared memory, use <code>__syncthreads()</code>, not just a shuffle or an assumption about scheduling.</li>
+</ul>
+</div>
+
+<p>Atomics are the other synchronization tool you will meet in deep-learning CUDA. An operation like <code>atomicAdd(&amp;dQ[idx], val)</code> makes a read-modify-write to one address indivisible, so concurrent updates are not lost. Atomics are correct but can serialize badly when many threads hit the same address. Flash Attention backward uses atomics only for the tensor whose accumulation direction cannot be kept local (§6.3); avoiding unnecessary atomics is part of the algorithm design.</p>
+
+<div class="quiz" data-concept="ch2.html#thread-sync" data-concept-label="§2.5b Thread synchronization">
+  <div class="q-text"><p>You are writing a tiled kernel where threads with <code>row &gt;= N</code> have no output element. The tile loop contains two <code>__syncthreads()</code>. Should those out-of-range threads skip the loop? Explain the deadlock risk, the correct structure, and which statements should still be guarded.</p></div>
+  <div class="hint">A barrier waits for every thread in the block, not just every useful thread.</div>
+  <div class="answer"><p>They must <em>not</em> skip the loop if any path inside it reaches <code>__syncthreads()</code>. If useful threads enter the barrier while out-of-range threads returned early or took a different branch, the block can deadlock forever. Correct structure: all block threads execute the cooperative loads and both barriers; out-of-range threads load neutral values where needed and skip only row-specific arithmetic and final stores. In Chapter 5, ghost rows still help load \(K,V\) tiles and still synchronize, but they never write \(O\) or \(L\).</p></div>
+</div>
+
+<div class="quiz" data-concept="ch2.html#thread-sync" data-concept-label="§2.5b Atomics and kernel boundaries">
+  <div class="q-text"><p>For each situation, choose the synchronization mechanism and justify it: (a) all threads in a block cooperatively filled a shared-memory tile; (b) two blocks both need to add into the same global gradient element; (c) every block must finish computing an intermediate before any block consumes it.</p></div>
+  <div class="hint">There is no normal in-kernel grid barrier. Blocks communicate safely only through global memory plus kernel ordering, or through atomics for individual addresses.</div>
+  <div class="answer"><p>(a) <code>__syncthreads()</code>, because the producer and consumer threads are in the same block and the data is a shared tile. (b) An atomic add or a different work partitioning that gives one block ownership of that gradient element; without an atomic, one update can overwrite the other. (c) Split into two kernels in the same stream, unless using specialized cooperative-grid launches; the kernel boundary is the normal grid-wide synchronization point, but it forces the intermediate through HBM.</p></div>
+</div>
+
 <h2 id="tiled-matmul">2.6 Worked example: tiled matrix multiplication</h2>
 <p>Compute \(C = AB\), all \(N\times N\), one thread per output element. The naive kernel:</p>
 <pre><code>__global__ void matmul_naive(const float* A, const float* B, float* C, int N) {
@@ -195,8 +228,56 @@ __device__ float warp_sum(float v) {
   <div class="answer"><p>(a) Each array is 16 KB → 32 KB per block. (b) Yes, 32 KB ≤ 48 KB static limit. (c) Shared memory allows ⌊64/32⌋ = 2 blocks; registers need 64·180 ≈ 11.5K per block, allowing 5 — so <strong>shared memory binds at 2 resident blocks</strong> (128 threads = 4 warps resident: low occupancy, acceptable only because each thread does a lot of independent work). These are precisely the numbers of the Chapter 5 kernel.</p></div>
 </div>
 
+<h2 id="deep-learning-performance">2.8 Performance fundamentals for deep-learning CUDA</h2>
+<p>Most deep-learning kernels are dense linear algebra plus reductions plus pointwise operations. A useful first pass is to classify the kernel by its <strong>limiting resource</strong>:</p>
+<ul>
+  <li><strong>Memory-bound:</strong> low arithmetic intensity; runtime mostly tracks bytes moved. Examples: layer norm, softmax, dropout, many optimizer updates. Optimize by fusing kernels, coalescing loads/stores, vectorizing memory operations, and avoiding extra reads/writes.</li>
+  <li><strong>Compute-bound:</strong> high arithmetic intensity; runtime mostly tracks math throughput. Examples: large GEMMs and convolutions. Optimize by using tensor cores, keeping operands reused on chip, and avoiding scalar side work in the inner loop.</li>
+  <li><strong>Synchronization-bound or atomic-bound:</strong> enough math exists, but barriers, reductions, or atomics serialize progress. Optimize by changing the work partitioning so each warp/block owns independent output regions.</li>
+</ul>
+
+<p>For deep learning specifically, these ideas show up constantly:</p>
+<table>
+<tr><th>Idea</th><th>Rule of thumb</th><th>Why it matters</th></tr>
+<tr><td>Layouts</td><td>Make the dimension touched by neighboring lanes contiguous</td><td>Coalesced HBM access is often the difference between a real kernel and a demo</td></tr>
+<tr><td>Fusion</td><td>Combine cheap pointwise/reduction work with nearby expensive work</td><td>A separate kernel launch usually means writing and rereading an intermediate from HBM</td></tr>
+<tr><td>Vectorized loads</td><td>Load <code>float4</code>, <code>half2</code>, or aligned wider chunks when safe</td><td>Fewer instructions and better memory-pipeline utilization</td></tr>
+<tr><td>Mixed precision</td><td>Store/compute inputs in fp16/bf16 when appropriate; accumulate sensitive sums in fp32</td><td>Tensor cores are fast, but reductions and softmax statistics need numerical headroom</td></tr>
+<tr><td>Register pressure</td><td>Keep hot scalars in registers, but watch spills and occupancy</td><td>Spilled "local" memory is slow global memory with a friendly name</td></tr>
+<tr><td>Bank conflicts</td><td>Pad or swizzle shared-memory layouts when lanes hit the same bank</td><td>A shared-memory tile can become serialized even though it is on chip</td></tr>
+<tr><td>Launch overhead</td><td>Do enough work per launch, or fuse tiny kernels</td><td>Micro-kernels are often latency-bound before they reach GPU throughput</td></tr>
+</table>
+
+<p>Flash Attention is a case study in this table. Standard attention is memory-bound because it writes \(S\) and \(P\) to HBM. Flash Attention fuses score computation, softmax, and value accumulation into one tiled kernel; keeps \(K,V,O,m,\ell\) on chip; accepts extra recompute in backward; and designs the block/warp ownership so the expensive accumulators are mostly local rather than atomic.</p>
+
+<div class="quiz" data-concept="ch2.html#deep-learning-performance" data-concept-label="§2.8 Deep-learning CUDA performance">
+  <div class="q-text"><p>Classify each kernel as primarily memory-bound, compute-bound, or synchronization/atomic-bound, and name the first optimization you would try: (a) <code>y = gelu(x)</code> on a huge vector; (b) a large \(4096\times4096\) GEMM; (c) many blocks accumulating into the same gradient vector with <code>atomicAdd</code>; (d) softmax over long rows implemented as three separate kernels: max, sum, normalize.</p></div>
+  <div class="hint">Ask what each output element does per byte loaded, and whether independent workers fight over the same address.</div>
+  <div class="answer"><p>(a) Memory-bound: a few FLOPs per loaded/stored element; fuse it with a neighboring op or vectorize/coalesce the pass. (b) Compute-bound if implemented well: use cuBLAS/tensor cores or a tensor-core tiled kernel. (c) Synchronization/atomic-bound: change ownership/reduction strategy so fewer blocks contend, or reduce locally before atomics. (d) Memory-bound and launch-bound: fuse the passes, or compute online statistics so the row is streamed once through on-chip state.</p></div>
+</div>
+
+<h2 id="profiling-debugging">2.9 Correctness, profiling, and the CUDA development loop</h2>
+<p>The fastest way to write a wrong CUDA kernel is to optimize before you can catch mistakes. The development loop for deep-learning CUDA should be boring:</p>
+<ol>
+  <li><strong>Start with a CPU or framework oracle.</strong> For Flash Attention, compare against naive attention on small \(N\).</li>
+  <li><strong>Test hostile shapes.</strong> Non-multiples of tile sizes, tiny \(N\), causal and non-causal paths, odd head dimensions, and batches/heads greater than one.</li>
+  <li><strong>Check errors with the right tolerance.</strong> fp32 accumulation should be tight; fp16/bf16 tensor-core paths need looser tolerances. Compare max error and relative error, not just "looks close."</li>
+  <li><strong>Synchronize when timing.</strong> Kernel launches are asynchronous; time with CUDA events or call <code>cudaDeviceSynchronize()</code> around the region under test.</li>
+  <li><strong>Profile after correctness.</strong> Use Nsight Compute or similar tools to inspect achieved bandwidth, occupancy, register spills, shared-memory bank conflicts, tensor-core utilization, and warp stalls.</li>
+</ol>
+
+<div class="box keypoint"><div class="box-title">Use libraries until the operation is special</div>
+For ordinary GEMM, convolution, reductions, and layer norm variants, production deep-learning code usually calls cuBLAS, cuDNN, CUTLASS, Triton, or a vendor kernel. You write custom CUDA when the operation has a special dataflow the library cannot express — exactly the situation for Flash Attention, where avoiding \(N^2\) HBM traffic requires fusing the whole attention pipeline around online softmax.
+</div>
+
+<div class="quiz" data-concept="ch2.html#profiling-debugging" data-concept-label="§2.9 CUDA development loop">
+  <div class="q-text"><p>You wrote a custom attention kernel. It passes for \(N=512\) but fails for \(N=500\); timing says it takes 4 microseconds, but the output copy after it takes much longer. Name the likely correctness bug, the timing bug, and the profiling counters you would inspect next after fixing correctness.</p></div>
+  <div class="hint">A power-of-two or tile-multiple case hides boundary bugs. Kernel launches return before the GPU finishes.</div>
+  <div class="answer"><p>The correctness bug is probably an edge guard: out-of-range loads/stores or masked scores are wrong for the partial final tile. The timing bug is asynchronous launch timing: the kernel time measured only enqueue overhead, while the later copy or synchronization paid for the unfinished kernel; use CUDA events or synchronize around the timed region. After correctness: inspect achieved memory bandwidth, occupancy, register spills/local memory, shared-memory bank conflicts, warp stall reasons, and tensor-core/FMA utilization depending on the kernel design.</p></div>
+</div>
+
 <div class="box recall-pause"><div class="box-title">Before moving on — closed-book check</div>
-Say out loud: warp size and what lockstep implies; the four memory levels with rough sizes/bandwidths; the coalescing rule; the load–sync–compute–sync rhythm and what each barrier prevents; why tiling reduces traffic by the tile size; the 48 KB static shared-memory rule. Then — most importantly — make sure you actually wrote the tiled matmul. It is the single best predictor of success in Chapter 5.
+Say out loud: warp size and what lockstep implies; the four memory levels with rough sizes/bandwidths; the coalescing rule; the load–sync–compute–sync rhythm and what each barrier prevents; why <code>__syncthreads()</code> must be reached by all block threads; when atomics or kernel boundaries are needed; why tiling reduces traffic by the tile size; the 48 KB static shared-memory rule; and how to classify a deep-learning kernel as memory-bound, compute-bound, or synchronization-bound. Then — most importantly — make sure you actually wrote the tiled matmul. It is the single best predictor of success in Chapter 5.
 </div>
 
 </main>

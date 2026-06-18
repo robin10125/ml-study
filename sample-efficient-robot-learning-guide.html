@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sample-Efficient Robot Policy Learning Without Human Demonstrations — A Technical Guide</title>
+<style>
+  :root{
+    --bg:#f7f8fa;
+    --panel:#ffffff;
+    --panel-2:#eef1f5;
+    --ink:#171c26;
+    --ink-soft:#3c4452;
+    --muted:#6b7480;
+    --line:#e3e7ee;
+    --accent:#0d8275;
+    --accent-2:#2563eb;
+    --accent-3:#c2710c;
+    --warn:#a86400;
+    --good:#1a8a55;
+    --radius:14px;
+    --maxw:980px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;
+    background:linear-gradient(180deg,#ffffff 0%,#f7f8fa 240px) fixed;
+    color:var(--ink);
+    font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,"Noto Sans",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:var(--accent-2);text-decoration:none;border-bottom:1px solid rgba(37,99,235,.25)}
+  a:hover{color:#1d4ed8;border-bottom-color:var(--accent-2)}
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 22px 120px}
+
+  /* Header */
+  header.hero{
+    max-width:var(--maxw);margin:0 auto;padding:64px 22px 30px;
+  }
+  .eyebrow{
+    display:inline-block;letter-spacing:.18em;text-transform:uppercase;
+    font-size:12px;font-weight:700;color:var(--accent);
+    border:1px solid var(--line);border-radius:999px;padding:5px 13px;background:var(--panel);
+  }
+  h1{
+    font-size:clamp(28px,4.6vw,46px);line-height:1.1;margin:18px 0 10px;
+    letter-spacing:-.02em;font-weight:800;
+    background:linear-gradient(92deg,#101726,#0d8275 55%,#2563eb);
+    -webkit-background-clip:text;background-clip:text;color:transparent;
+  }
+  .subtitle{color:var(--ink-soft);font-size:18px;max-width:780px}
+  .meta{color:var(--muted);font-size:13.5px;margin-top:14px}
+
+  /* TOC */
+  nav.toc{
+    background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    padding:20px 24px;margin:28px 0 10px;
+  }
+  nav.toc h2{font-size:13px;text-transform:uppercase;letter-spacing:.14em;color:var(--muted);margin:0 0 12px}
+  nav.toc ol{margin:0;padding-left:20px;columns:2;column-gap:34px}
+  nav.toc li{margin:4px 0;break-inside:avoid}
+  nav.toc a{border:none;color:var(--ink-soft)}
+  nav.toc a:hover{color:var(--accent)}
+
+  /* Sections */
+  section{margin-top:46px;scroll-margin-top:20px}
+  h2.sec{
+    font-size:clamp(22px,3vw,30px);font-weight:800;letter-spacing:-.01em;margin:0 0 6px;
+    padding-bottom:10px;border-bottom:1px solid var(--line);
+  }
+  h2.sec .num{color:var(--accent);font-variant-numeric:tabular-nums;margin-right:10px}
+  h3{font-size:19px;font-weight:700;margin:30px 0 8px;color:var(--ink)}
+  h4{font-size:16px;font-weight:700;margin:22px 0 6px;color:var(--accent)}
+  p{margin:12px 0;color:var(--ink-soft)}
+  strong{color:var(--ink);font-weight:680}
+  em{color:#11161f}
+  ul,ol{color:var(--ink-soft)}
+  li{margin:7px 0}
+  code{
+    font-family:"SF Mono",SFMono-Regular,ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+    font-size:13.5px;background:var(--panel-2);border:1px solid var(--line);
+    padding:1.5px 6px;border-radius:6px;color:#1f6f63;
+  }
+  pre{
+    background:#12161f;border:1px solid #12161f;border-radius:12px;
+    padding:18px 20px;overflow-x:auto;font-size:13px;line-height:1.55;
+    font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;color:#cdd6df;
+  }
+  pre b{color:#5ad4c2;font-weight:700}
+
+  /* Tables */
+  .tbl{overflow-x:auto;margin:18px 0;border:1px solid var(--line);border-radius:12px}
+  table{border-collapse:collapse;width:100%;font-size:14px;min-width:560px}
+  thead th{
+    background:var(--panel-2);text-align:left;padding:11px 14px;
+    color:var(--ink);font-weight:700;border-bottom:1px solid var(--line);white-space:nowrap;
+  }
+  td{padding:10px 14px;border-bottom:1px solid var(--line);color:var(--ink-soft);vertical-align:top}
+  tbody tr:nth-child(even){background:rgba(17,22,30,.028)}
+  tbody tr:last-child td{border-bottom:none}
+
+  /* Callouts */
+  .callout{
+    border:1px solid var(--line);border-left-width:4px;border-radius:10px;
+    padding:14px 18px;margin:20px 0;background:var(--panel);
+  }
+  .callout .label{
+    font-size:11.5px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;
+    display:block;margin-bottom:6px;
+  }
+  .callout p{margin:4px 0}
+  .callout.key{border-left-color:var(--accent);background:linear-gradient(100deg,rgba(13,130,117,.09),transparent)}
+  .callout.key .label{color:var(--accent)}
+  .callout.warn{border-left-color:var(--warn);background:linear-gradient(100deg,rgba(168,100,0,.08),transparent)}
+  .callout.warn .label{color:var(--warn)}
+  .callout.read{border-left-color:var(--accent-2);background:linear-gradient(100deg,rgba(37,99,235,.07),transparent)}
+  .callout.read .label{color:var(--accent-2)}
+  .callout.read ul{margin:6px 0 0;padding-left:18px}
+  .callout.read li{margin:5px 0;font-size:14.5px}
+
+  .lede{font-size:18px;color:var(--ink);border-left:3px solid var(--accent);padding-left:16px}
+
+  /* pillars chips */
+  .chip{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.04em;
+    padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--accent);background:var(--panel-2);
+    vertical-align:middle;margin-left:6px}
+
+  hr{border:none;border-top:1px solid var(--line);margin:40px 0}
+  .totop{font-size:12.5px;color:var(--muted);border:none}
+  footer{color:var(--muted);font-size:13px;border-top:1px solid var(--line);margin-top:60px;padding-top:24px}
+  ::selection{background:rgba(13,130,117,.20)}
+  @media(max-width:680px){nav.toc ol{columns:1}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <span class="eyebrow">Technical Guide</span>
+  <h1>Sample-Efficient Robot Policy Learning<br>Without Human Demonstrations</h1>
+  <p class="subtitle">State-of-the-art approaches for acquiring robot skills — manipulation, locomotion, dexterity — with the fewest possible <em>real-world</em> interactions and <em>no</em> teleoperation or kinesthetic demos.</p>
+  <p class="meta">Compiled June 2026 · Hyperlinks point to the primary source (arXiv / project page) on first mention; “Further reading” boxes collect surveys, courses, and tooling.</p>
+</header>
+
+<div class="wrap">
+
+<nav class="toc" id="top">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#s1">How to think about the problem</a></li>
+    <li><a href="#s2">The central obstacle: the reward problem</a></li>
+    <li><a href="#s3">Pillar A — Simulation-first (sim-to-real)</a></li>
+    <li><a href="#s4">Pillar B — Automated supervision</a></li>
+    <li><a href="#s5">Pillar C — Sample-efficient RL algorithms</a></li>
+    <li><a href="#s6">Pillar D — Real-world autonomous RL</a></li>
+    <li><a href="#s7">Pillar E — Unsupervised pretraining &amp; skill discovery</a></li>
+    <li><a href="#s8">Representation priors that cut sample cost</a></li>
+    <li><a href="#s9">Putting it together: recipes &amp; decision tree</a></li>
+    <li><a href="#s10">Pitfalls and practical engineering</a></li>
+    <li><a href="#s11">Quick-reference tables</a></li>
+    <li><a href="#s12">Further reading, tooling &amp; references</a></li>
+  </ol>
+</nav>
+
+<!-- ============================ 1 ============================ -->
+<section id="s1">
+  <h2 class="sec"><span class="num">01</span>How to think about the problem</h2>
+  <p>“Sample efficient” is ambiguous. Pin down <strong>which budget you are minimizing</strong>, because the best technique differs for each:</p>
+
+  <div class="tbl"><table>
+    <thead><tr><th>Budget</th><th>What's scarce</th><th>Dominant strategy</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Real robot steps / wall-clock</strong></td><td>Hours on hardware, wear, resets, safety, human supervision</td><td>Push learning into simulation; offline-to-online; high update-to-data ratio</td></tr>
+      <tr><td><strong>Simulator steps</strong></td><td>GPU-hours (cheap, ~10⁶–10⁷ steps/s)</td><td>Almost never the binding constraint today — parallelize</td></tr>
+      <tr><td><strong>Supervision</strong></td><td>Reward functions, task specs, labels</td><td>Foundation-model-generated rewards/tasks; self-supervised goals</td></tr>
+      <tr><td><strong>Human time</strong></td><td>Demos, tuning, reward engineering</td><td>LLM reward design, automatic DR, generative simulation</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="callout key">
+    <span class="label">The one insight that matters most</span>
+    <p><strong>Real-world samples are ~5–7 orders of magnitude more expensive than simulated ones.</strong> A GPU simulator produces millions of steps per second; a real robot produces a few per second and needs supervision, resets, and safety. So the highest-leverage sample-efficiency decision is usually <em>not</em> “which RL algorithm” but <strong>“how few real samples can I get away with, and can I move the rest into sim or into priors?”</strong></p>
+  </div>
+
+  <p>This yields five complementary pillars. Most SOTA systems combine several:</p>
+  <ul>
+    <li><strong>A. Simulation-first</strong> — learn in massively parallel sim, transfer zero-/few-shot. <em>Default when a usable simulator exists.</em></li>
+    <li><strong>B. Automated supervision</strong> — foundation models generate the rewards, tasks, scenes, and curricula a human would otherwise provide.</li>
+    <li><strong>C. Sample-efficient RL algorithms</strong> — world models, high-UTD model-free, offline-to-online; maximum learning per transition.</li>
+    <li><strong>D. Real-world autonomous RL</strong> — when you must learn on hardware, make it reset-free, safe, and bootstrap-able.</li>
+    <li><strong>E. Unsupervised pretraining</strong> — exploration, intrinsic motivation, and skill discovery acquire reusable behavior with <em>no</em> task reward at all.</li>
+  </ul>
+  <p>Plus a cross-cutting accelerator: <strong>representation priors</strong> (pretrained visual encoders, learned world models, offline data) that reduce the samples any downstream method needs.</p>
+
+  <p>A useful mental model of the cost hierarchy (cheapest → most expensive source of a learning signal):</p>
+  <pre>
+<b>free priors</b>   &lt;   <b>sim steps</b>   &lt;   <b>autonomous real steps</b>   &lt;   <b>supervised real steps</b>   &lt;   <b>human demos</b>
+(pretrained      (parallel      (reset-free, self-         (reward needs a human       (the thing
+ encoders,        GPU sim)       scored rewards)            to score / reset)           we're avoiding)
+ world models)
+</pre>
+  <p>The whole game is to satisfy a skill requirement using sources as far to the <strong>left</strong> as possible.</p>
+</section>
+
+<!-- ============================ 2 ============================ -->
+<section id="s2">
+  <h2 class="sec"><span class="num">02</span>The central obstacle: the reward problem</h2>
+  <p>Human demonstrations conveniently bundle three things: <strong>(1) what to do</strong> (task spec), <strong>(2) a dense learning signal</strong> (the trajectory itself), and <strong>(3) exploration guidance</strong> (states worth visiting). Remove demos and you must reconstruct all three. In practice the hardest is <strong>(2) the reward/learning signal</strong>. Everything below is, at some level, a different answer to “where does the supervision come from if not a human?”</p>
+
+  <p>The five demo-free sources of supervision:</p>
+  <ol>
+    <li><strong>Engineered reward</strong> — hand-written objective. Cheap, ubiquitous in locomotion (track a velocity command, stay upright, minimize energy). Brittle for manipulation; prone to reward hacking.</li>
+    <li><strong>Foundation-model reward</strong> — an LLM writes the reward <em>code</em> (Eureka), or a VLM scores progress toward a goal image / gives preferences (RL-VLM-F, VLM-RM). Removes most reward engineering. → <a href="#s4">Pillar B</a>.</li>
+    <li><strong>Self-supervised / goal-conditioned reward</strong> — the agent sets its own goals and is rewarded for reaching them (Hindsight Experience Replay, contrastive RL). Needs only a goal representation, no human labels.</li>
+    <li><strong>Success-classifier reward</strong> — learn a classifier of “goal achieved” from a handful of <em>goal example states</em> (not full trajectories): VICE, RCE. Far cheaper than demos.</li>
+    <li><strong>Intrinsic reward</strong> — curiosity / novelty / skill-diversity, requiring no task signal at all. → <a href="#s7">Pillar E</a>.</li>
+  </ol>
+
+  <div class="callout key">
+    <span class="label">Keep this taxonomy in mind</span>
+    <p>Every method in this guide slots into <strong>one of these five supervision sources</strong> plus <strong>one of the five pillars</strong>. When you read a new paper, locate it on both axes — it clarifies what the method is really buying you.</p>
+  </div>
+</section>
+
+<!-- ============================ 3 ============================ -->
+<section id="s3">
+  <h2 class="sec"><span class="num">03</span>Pillar A — Simulation-first learning (sim-to-real)<span class="chip">default choice</span></h2>
+  <p><strong>When to use:</strong> a simulator (even a rough one) exists for your robot and task. This is the dominant SOTA paradigm for locomotion and increasingly for manipulation, because it reduces <em>real</em> sample cost to near zero — you pay only GPU time.</p>
+
+  <h3>3.1 Massively parallel GPU simulation — the foundation</h3>
+  <p>The 2022 result that reshaped the field: train a quadruped to walk in <strong>~20 minutes on a single GPU</strong> by running thousands of environments in parallel (<a href="https://arxiv.org/abs/2109.11978">Rudin et al., “Learning to Walk in Minutes”</a>). PPO is the workhorse here — <em>not</em> because it is sample-efficient per step (it isn't), but because in sim the binding constraint is throughput, and PPO parallelizes trivially across 4,096–65,536 envs.</p>
+
+  <div class="tbl"><table>
+    <thead><tr><th>Tool</th><th>Backend</th><th>Strengths</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><a href="https://arxiv.org/abs/2511.04831">Isaac Lab</a> (NVIDIA, succeeds <a href="https://arxiv.org/abs/2108.10470">Isaac Gym</a>)</td><td>PhysX / Warp, GPU</td><td>Photoreal rendering, huge robot zoo, industry standard</td><td>Pairs with <a href="https://arxiv.org/abs/2509.10771">RSL-RL</a> / rl_games / skrl PPO libs; 11+ morphologies (A1, Go1/2, ANYmal, G1, H1, Spot, Digit…)</td></tr>
+      <tr><td><a href="https://playground.mujoco.org/">MuJoCo Playground</a> + MuJoCo MJX (DeepMind, RSS 2025)</td><td>JAX / Warp, GPU/TPU</td><td><code>pip install</code>, train in minutes, excellent contact physics, zero-shot transfer from state <em>and</em> pixels</td><td>MJX hits ~2.7M steps/s on TPU; best-in-class for contact-rich tasks</td></tr>
+      <tr><td><a href="https://github.com/Genesis-Embodied-AI/Genesis">Genesis</a></td><td>GPU</td><td>Very high throughput (~430K env-steps/s claimed), generative-friendly</td><td>Newer, fast-moving</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/2106.13281">Brax</a> (Google)</td><td>JAX</td><td>Differentiable, fast, simple</td><td>Good for algorithms research</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/2410.00425">ManiSkill3</a> / RoboSuite</td><td>GPU</td><td>Manipulation task suites</td><td>Benchmarks + assets</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="callout key">
+    <span class="label">Practical takeaway</span>
+    <p>The throughput problem is largely solved. With any of these you can spend billions of sim steps cheaply, so your engineering effort should go into <strong>the sim-to-real gap</strong>, not into squeezing sim-sample-efficiency.</p>
+  </div>
+
+  <h3>3.2 Closing the sim-to-real gap</h3>
+  <p>Four families, often stacked:</p>
+
+  <h4>(a) Domain Randomization (DR)</h4>
+  <p>Randomize physics (mass, friction, motor gains, latency, terrain) and visuals (textures, lighting) so the real world looks like just another sample from training. The original recipe (<a href="https://arxiv.org/abs/1703.06907">Tobin et al. 2017</a>). Cheap and effective; the art is choosing <em>ranges</em> — too narrow fails to transfer, too wide makes the task unlearnable.</p>
+
+  <h4>(b) Automatic Domain Randomization (ADR)</h4>
+  <p>Start narrow and <strong>automatically widen</strong> each range as the policy masters the current distribution — an automatic curriculum over difficulty. This is how OpenAI solved Rubik's-cube manipulation on a real Shadow Hand (<a href="https://arxiv.org/abs/1910.07113">OpenAI 2019</a>). Removes manual range-tuning and yields robustness fixed DR can't.</p>
+
+  <h4>(c) Teacher–student / privileged learning</h4>
+  <p>Train a <strong>teacher</strong> with <em>privileged</em> simulator info (true friction, contact forces, terrain heightmap, object pose) — easy and sample-cheap because the state is fully observed. Then <strong>distill</strong> into a <strong>student</strong> that only sees deployable sensors, forcing it to infer the privileged variables implicitly. This is behind most agile-locomotion results:</p>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2107.04034">RMA — Rapid Motor Adaptation</a> (Kumar et al. 2021): the student learns an <em>adaptation module</em> that estimates a latent environment-vector online from a short history, adapting to new terrain/payload in fractions of a second. The canonical demo-free legged-RL recipe.</li>
+    <li><a href="https://www.science.org/doi/10.1126/scirobotics.adi7566">ANYmal Parkour</a> (<em>Science Robotics</em> 2024) and <a href="https://arxiv.org/abs/2309.14341">Extreme Parkour</a> — teacher on simplified terrain, distill to a depth-image visuomotor student, optionally RL-finetune.</li>
+    <li><a href="https://arxiv.org/abs/2405.10830">Concurrent Teacher-Student (CTS)</a> and Regularized Online Adaptation — train teacher and student jointly to avoid the distillation gap.</li>
+  </ul>
+
+  <h4>(d) Real2Sim2Real / system identification</h4>
+  <p>Make the <em>simulator</em> match <em>your</em> robot, then randomize around it:</p>
+  <ul>
+    <li><strong>System ID</strong> — fit physics parameters (mass, friction, motor model, latency) to real logs; tightens DR ranges around reality.</li>
+    <li><strong>Differentiable simulation</strong> — backprop through physics to identify parameters from few real rollouts (very sample-efficient ID), e.g. <a href="https://arxiv.org/abs/2603.01151">D-REX</a> for dexterous grasping.</li>
+    <li><strong>Real-to-sim reconstruction</strong> — build interactive sim scenes from real images/video (Gaussian-splat or mesh → physics), e.g. <a href="https://arxiv.org/abs/2505.09601">Real2Render2Real</a>. Generate sim training data matched to a specific real scene without a robot.</li>
+    <li><strong>VLM-guided system ID</strong> — <a href="https://arxiv.org/abs/2605.05241">DexSim2Real</a> uses a VLM to propose/refine sim parameters and randomization.</li>
+  </ul>
+
+  <h3>3.3 DrEureka — automating the <em>entire</em> sim-to-real loop</h3>
+  <p><a href="https://eureka-research.github.io/dr-eureka/">DrEureka</a> (<a href="https://arxiv.org/abs/2406.01967">Ma et al., RSS 2024</a>) is the current high-water mark for <em>human-free</em> sim-to-real. Given only the environment source and a task description, an LLM (1) writes the <strong>reward function</strong> (extending Eureka, with safety-aware instructions) and (2) uses a <strong>Reward-Aware Physics Prior (RAPP)</strong> to set sensible <strong>domain-randomization ranges</strong> automatically. It matched human-designed configs on quadruped locomotion and dexterous manipulation, and solved novel tasks (a quadruped <em>balancing and walking on a yoga ball</em>) with no iterative manual design and no demonstrations. The template to emulate: <em>LLM picks the reward and the DR ranges; massively parallel sim does the rest.</em></p>
+
+  <div class="callout read">
+    <span class="label">Further reading — sim-to-real</span>
+    <ul>
+      <li><a href="https://lilianweng.github.io/posts/2019-05-05-domain-randomization/">Lilian Weng — “Domain Randomization for Sim2Real Transfer”</a> (the canonical primer).</li>
+      <li><a href="https://isaac-sim.github.io/IsaacLab/">Isaac Lab documentation</a> &amp; <a href="https://playground.mujoco.org/">MuJoCo Playground</a> tutorials — runnable parallel-sim training recipes.</li>
+      <li><a href="https://eureka-research.github.io/dr-eureka/">DrEureka project page</a> — code, videos, and the RAPP method.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ============================ 4 ============================ -->
+<section id="s4">
+  <h2 class="sec"><span class="num">04</span>Pillar B — Automated supervision (replacing the human)</h2>
+  <p>If demos are off the table, foundation models are the most powerful substitute for the human's role in specifying <em>what to do</em> and <em>how to score it</em>.</p>
+
+  <h3>4.1 LLM-generated reward functions</h3>
+  <p><a href="https://eureka-research.github.io/">Eureka</a> (<a href="https://arxiv.org/abs/2310.12931">Ma et al., ICLR 2024</a>) is the landmark. GPT-4, given environment source code + a task description, writes <strong>executable reward-function code</strong>, then runs an <strong>evolutionary loop</strong>: train a short RL run, feed back <strong>“reward reflection”</strong> (per-component statistics and success metrics), and mutate the reward. On 29 IsaacGym tasks it <strong>beat expert human-written rewards on 83%</strong>, +52% average normalized improvement — discovering behaviors like pen-spinning. Because reward search runs against the <em>fast</em> simulator, it costs LLM calls and GPU time, not real samples.</p>
+  <p>Related: <a href="https://arxiv.org/abs/2309.11489">Text2Reward</a> (interpretable dense reward code), <a href="https://arxiv.org/abs/2306.08647">Language to Rewards</a> (LLM emits reward <em>parameters</em> consumed by an MPC controller, Google DeepMind), and DrEureka (Eureka + automatic DR, §3.3).</p>
+
+  <div class="callout warn">
+    <span class="label">Caveat — reward hacking</span>
+    <p>LLM rewards can be gamed by the policy (high reward, wrong behavior). The evolutionary reflection loop and explicit success-metric tracking mitigate this; always validate against a held-out success criterion you trust.</p>
+  </div>
+
+  <h3>4.2 VLM / foundation-model rewards (no code, perceptual goals)</h3>
+  <p>When the objective is perceptual (“the cube is in the bin”), a vision-language model can <em>score</em> it:</p>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2402.03681">RL-VLM-F</a> — a VLM gives <strong>preference feedback</strong> over image pairs (“which frame better achieves the goal?”); learn a reward model from preferences (RLHF-style, but the VLM is the labeler). No human in the loop.</li>
+    <li><a href="https://arxiv.org/abs/2310.12921">VLM-RM</a> — reward = CLIP similarity between the current observation and a natural-language goal; trained a MuJoCo humanoid to kneel / do the splits from a single text prompt.</li>
+    <li><a href="https://arxiv.org/abs/2310.07899">RoboCLIP</a> — reward from a single video or language description via video-language embedding similarity.</li>
+    <li><a href="https://arxiv.org/abs/2210.00030">VIP</a> / <a href="https://arxiv.org/abs/2306.00958">LIV</a> — value-implicit pretraining yields a representation whose embedding distance <em>is</em> a goal-conditioned reward/value.</li>
+  </ul>
+  <p>These convert “I can describe or show the goal” into a dense reward with no trajectory demos.</p>
+
+  <h3>4.3 Generative simulation — automating tasks, scenes, <em>and</em> rewards</h3>
+  <p>Instead of generating one reward, generate the <strong>entire training environment</strong> at scale:</p>
+  <ul>
+    <li><a href="https://robogen-ai.github.io/">RoboGen</a> (<a href="https://arxiv.org/abs/2311.01455">Wang et al., ICML 2024</a>): an LLM proposes tasks → generates scenes (retrieved/generated assets, plausible layouts) → decomposes into subtasks → writes rewards → learns skills. A self-driving “infinite data” pipeline with minimal human input.</li>
+    <li><a href="https://arxiv.org/abs/2310.18308">Gen2Sim</a> — image-to-3D asset generation + LLM task/reward generation, enabling long-horizon tasks via temporal decomposition.</li>
+    <li><a href="https://arxiv.org/abs/2310.01361">GenSim</a> — LLM generates manipulation <em>task code</em> to expand a task library 10× for multitask pretraining.</li>
+  </ul>
+  <p>The most ambitious form of demo-free learning: the human specifies <em>a domain</em>, and the system manufactures tasks, supervision, and data indefinitely. Trade-off: generated tasks vary in quality/realism — pair with sim-to-real (Pillar A) for deployment.</p>
+
+  <h3>4.4 Zero-shot composition (skills with <em>no</em> training at all)</h3>
+  <p>For some manipulation tasks you can skip policy learning entirely: <a href="https://arxiv.org/abs/2209.07753">Code as Policies</a> (LLM writes the control program from language + perception APIs) and <a href="https://arxiv.org/abs/2307.05973">VoxPoser</a> (LLM + VLM compose 3D affordance/constraint value-maps an optimizer turns into trajectories; zero-shot, training-free). The most sample-efficient possible answer (zero samples) when the task decomposes into known primitives — and a strong way to <strong>bootstrap</strong> data for the learning methods elsewhere in this guide.</p>
+
+  <div class="callout read">
+    <span class="label">Further reading — foundation models for supervision</span>
+    <ul>
+      <li><a href="https://eureka-research.github.io/">Eureka project page</a> and <a href="https://language-to-reward.github.io/">Language-to-Rewards project page</a> — code + qualitative reward-generation demos.</li>
+      <li><a href="https://arxiv.org/abs/2511.02097">“A Step Toward World Models: A Survey on Robotic Manipulation” (2025)</a> — situates generative-simulation and foundation-model methods in context.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ============================ 5 ============================ -->
+<section id="s5">
+  <h2 class="sec"><span class="num">05</span>Pillar C — Sample-efficient RL algorithms</h2>
+  <p>This pillar extracts maximum learning <strong>per transition</strong> — decisive when transitions are real-robot samples, and helpful even in sim. Two big levers: <strong>model-based imagination</strong> and <strong>high update-to-data (UTD) off-policy learning</strong>.</p>
+
+  <h3>5.1 Model-based RL / world models <span class="chip">usually the most sample-efficient</span></h3>
+  <p>A learned <strong>world model</strong> lets the agent generate vast amounts of <em>imagined</em> experience from few real transitions — the core reason model-based methods dominate sample-efficiency benchmarks.</p>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2301.04104">DreamerV3</a> (Hafner et al.; <a href="https://www.nature.com/articles/s41586-025-08744-2">Nature 2025</a>): learns a latent Recurrent State-Space Model from pixels, trains an actor-critic purely in <strong>imagined</strong> latent rollouts. Robustness tricks (symlog, KL balancing, return normalization) let <strong>one fixed hyperparameter set</strong> work across 150+ tasks — it even mined a Minecraft diamond from scratch. Excellent default for pixel-based, partially observed problems.</li>
+    <li><a href="https://arxiv.org/abs/2310.16828">TD-MPC2</a> (Hansen et al., ICLR 2024): combines a learned latent <strong>implicit world model</strong> with short-horizon <strong>MPC planning</strong> plus TD-learned value and policy priors. Building on <a href="https://arxiv.org/abs/2203.04955">TD-MPC</a>, on <strong>104 continuous-control tasks</strong> it <strong>beats SAC and DreamerV3 in both data-efficiency and final performance</strong>, one config; a single 317M-param agent does 80 tasks. <strong>Current SOTA for state-based continuous control sample-efficiency.</strong></li>
+    <li><a href="https://arxiv.org/abs/2411.04983">DINO-WM</a> (2024): builds the world model on <em>frozen pretrained DINOv2 features</em> → <strong>zero-shot planning</strong> for new goals. A bridge between Pillars C and §8.</li>
+    <li><a href="https://arxiv.org/abs/1906.08253">MBPO</a>, <a href="https://arxiv.org/abs/1805.12114">PETS</a>, and <a href="https://arxiv.org/abs/2005.05960">Plan2Explore</a> — Dyna-style and ensemble/planning predecessors; Plan2Explore also gives task-free exploration (§7).</li>
+  </ul>
+
+  <div class="callout key">
+    <span class="label">Rule of thumb</span>
+    <p>For the <strong>fewest real samples</strong>, start with a world-model method: <strong>TD-MPC2</strong> for state-based control, <strong>DreamerV3</strong> for pixels.</p>
+  </div>
+
+  <h3>5.2 High-UTD model-free off-policy RL</h3>
+  <p>You can approach model-based efficiency with model-free methods by doing <strong>many gradient updates per environment step</strong> (high <strong>UTD ratio</strong>) — but naive high UTD causes value overestimation and collapse. The fix is regularization/ensembling:</p>
+
+  <div class="tbl"><table>
+    <thead><tr><th>Method</th><th>Key idea</th><th>Why it helps sample efficiency</th></tr></thead>
+    <tbody>
+      <tr><td><a href="https://arxiv.org/abs/1801.01290">SAC</a></td><td>Off-policy, entropy-regularized actor-critic</td><td>The robust workhorse baseline</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/1802.09477">TD3</a></td><td>Twin critics, delayed policy updates</td><td>Tames overestimation</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/2101.05982">REDQ</a></td><td>Ensemble of ~10 Q-nets, random subset for target, <strong>UTD≈20</strong></td><td>Matches model-based efficiency, model-free</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/2110.02034">DroQ</a></td><td>Dropout + LayerNorm critics, small ensemble, high UTD</td><td>REDQ-level efficiency at far lower compute</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/1902.05605">CrossQ</a></td><td>BatchNorm in critics, <strong>no target networks</strong>, UTD≈1</td><td>REDQ-level efficiency, lower compute, simpler</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/2005.04269">TQC</a></td><td>Truncated quantile (distributional) critics</td><td>Fine-grained overestimation control</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="callout key">
+    <span class="label">Practical guidance</span>
+    <p>On real hardware, <strong>DroQ or CrossQ with UTD 10–20</strong> is a strong, compute-reasonable default. <strong>LayerNorm in the critic</strong> is one of the highest-value single tricks for stabilizing high-UTD off-policy learning.</p>
+  </div>
+
+  <h3>5.3 Offline-to-online: bootstrap with autonomously collected data</h3>
+  <p>If you have <em>any</em> prior dataset — crucially, this can be <strong>autonomously collected</strong> (scripted, sim-generated, random, prior policies), <strong>not human demos</strong> — you can pretrain offline then finetune online with very few real samples:</p>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2302.02948">RLPD</a> (Ball et al. 2023): no offline pretraining phase — just <strong>symmetrically sample</strong> 50/50 from the offline and online buffers during off-policy learning, with LayerNorm + high UTD + ensembles. Extremely sample-efficient and robust to <em>suboptimal</em> offline data. The backbone of several real-world systems below.</li>
+    <li><a href="https://arxiv.org/abs/2303.05479">Cal-QL</a> — calibrated offline pretraining that finetunes online without the usual unlearning dip; also <a href="https://arxiv.org/abs/2110.06169">IQL</a> / <a href="https://arxiv.org/abs/2006.09359">AWAC</a> for warm-starting.</li>
+    <li><a href="https://arxiv.org/abs/2507.04452">SimLauncher</a> (2025): use a <strong>sim-pretrained policy</strong> to both explore and generate rollouts that bootstrap the critic for real-world RL — sim providing the “prior data” with no human demos.</li>
+  </ul>
+
+  <div class="callout key">
+    <span class="label">Key reframe</span>
+    <p>“Offline RL needs a dataset” does <strong>not</strong> mean “needs human demos.” Sim rollouts, scripted controllers, prior policies, and autonomous play all qualify — and offline-to-online is among the most reliable ways to cut real-world sample cost.</p>
+  </div>
+
+  <h3>5.4 Pixel-based efficiency: augmentation &amp; auxiliary objectives</h3>
+  <p>Learning policies directly from images is sample-hungry unless you add: <a href="https://arxiv.org/abs/2107.09645">DrQ-v2</a> / <a href="https://arxiv.org/abs/2004.13649">DrQ</a> (random-shift <strong>image augmentation</strong> on critic targets — the biggest, cheapest win for pixel RL), <a href="https://arxiv.org/abs/2004.14990">RAD</a> (broader augmentation), and <a href="https://arxiv.org/abs/2004.04136">CURL</a> (contrastive auxiliary loss). Best modern practice: <strong>augmentation + a pretrained visual encoder</strong> (§8) rather than learning vision from scratch.</p>
+
+  <div class="callout read">
+    <span class="label">Further reading — RL algorithms &amp; implementations</span>
+    <ul>
+      <li><a href="https://spinningup.openai.com/">OpenAI Spinning Up in Deep RL</a> — the best from-scratch grounding in SAC/TD3/policy-gradient methods.</li>
+      <li><a href="https://rail.eecs.berkeley.edu/deeprlcourse/">Berkeley CS285 (Sergey Levine)</a> — graduate Deep RL course; lectures on model-based RL, offline RL, exploration.</li>
+      <li><a href="https://github.com/vwxyzjn/cleanrl">CleanRL</a> — single-file, readable reference implementations; and <a href="https://github.com/DLR-RM/stable-baselines3">Stable-Baselines3 / SBX</a> for SAC, TD3, TQC, DroQ, CrossQ.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ============================ 6 ============================ -->
+<section id="s6">
+  <h2 class="sec"><span class="num">06</span>Pillar D — Real-world autonomous RL</h2>
+  <p>Sometimes the sim gap is too large (deformables, fluids, fine contact) and you must learn on hardware. The goal: make real-world RL <strong>autonomous</strong> (no babysitting), <strong>safe</strong>, and <strong>bootstrapped</strong> so the real-sample budget is hours, not weeks.</p>
+
+  <h3>6.1 Reset-free / autonomous learning</h3>
+  <p>The hidden cost of real-world RL is <strong>resets</strong> — a human re-arranging the scene between episodes. Reset-free RL learns a <strong>reset (backward) policy</strong> alongside the <strong>forward (task) policy</strong>, so the robot returns itself to a start state:</p>
+  <ul>
+    <li><a href="https://arxiv.org/abs/1711.06782">Leave No Trace</a> (Eysenbach et al.) — joint forward + reset policies; the reset policy also acts as a safety/reversibility signal.</li>
+    <li><a href="https://arxiv.org/abs/2107.12931">VaPRL</a> (value-accelerated persistent RL via subgoal curricula) and <a href="https://arxiv.org/abs/2205.05212">MEDAL</a> (state-distribution matching for non-episodic RL) — perpetual training with ~1000× less human intervention; benchmarked in <a href="https://arxiv.org/abs/2112.09605">EARL</a> (Environments for Autonomous RL).</li>
+    <li><a href="https://arxiv.org/abs/2408.09807">Reset-free RL with world models</a> (2025) — combine §5.1 imagination with autonomy.</li>
+  </ul>
+
+  <h3>6.2 SERL — a practical real-world RL stack</h3>
+  <p><a href="https://serl-robot.github.io/">SERL</a> (Luo et al. 2024) packages RLPD + reward classifiers + careful engineering into a software suite that learns real-world manipulation (PCB insertion, cable routing, assembly) in <strong>~1–2 hours</strong> of real time.</p>
+  <div class="callout warn">
+    <span class="label">Demo-free configuration note</span>
+    <p>Headline SERL / <a href="https://arxiv.org/abs/2410.21845">HIL-SERL</a> results often use a <em>handful of demos or human interventions</em> (HIL = human-in-the-loop). To stay demo-free, replace those with: a <strong>learned success classifier from goal images</strong> (VICE/RCE-style, §2), <strong>scripted/sim-bootstrapped</strong> prior data for RLPD, and <strong>reset-free</strong> automation. The algorithmic core (RLPD + classifier reward) is fully compatible with zero demos.</p>
+  </div>
+
+  <h3>6.3 RL <em>on top of</em> generalist policies (latent-space RL)</h3>
+  <p>A powerful 2025 pattern: don't learn from scratch — take a base policy and <strong>steer it with a small amount of real RL</strong>:</p>
+  <ul>
+    <li><a href="https://diffusion-steering.github.io/">DSRL — Diffusion Steering via RL</a> (<a href="https://arxiv.org/abs/2506.15799">Wagenmaker et al., CoRL 2025</a>): freeze a base diffusion/flow policy and run RL <strong>only over its latent-noise input</strong> — training a tiny MLP to pick the noise that yields better actions. Needs only <strong>black-box</strong> access (no weights, no backprop through the base), is highly sample-efficient, and enables real-world autonomous improvement. <strong>Demo-free caveat:</strong> the base diffusion policy is usually BC-trained on demos; to stay demo-free, source the base from a <em>sim-trained</em> or <em>generative-simulation</em> policy (Pillars A/B), then let DSRL adapt it to reality.</li>
+    <li><a href="https://arxiv.org/abs/2510.14830">RL-100</a> (2025) follows the same “RL-refines-a-base-policy” philosophy for high-reliability manipulation.</li>
+  </ul>
+  <p>This “policy prior + thin RL adaptation layer” is, in 2025–2026, often the most real-sample-efficient route for contact-rich manipulation.</p>
+
+  <div class="callout read">
+    <span class="label">Further reading — real-world &amp; reset-free RL</span>
+    <ul>
+      <li><a href="https://serl-robot.github.io/">SERL</a> and <a href="https://hil-serl.github.io/">HIL-SERL</a> project pages — open-source code, hardware setup, and reward-classifier tooling.</li>
+      <li><a href="https://architsharma97.github.io/earl_benchmark/">EARL benchmark</a> — formalism + environments for autonomous (reset-minimizing) RL.</li>
+      <li><a href="https://diffusion-steering.github.io/">DSRL project page</a> — latent-space RL fine-tuning of diffusion/flow policies.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ============================ 7 ============================ -->
+<section id="s7">
+  <h2 class="sec"><span class="num">07</span>Pillar E — Unsupervised pretraining, exploration &amp; skill discovery</h2>
+  <p>These methods acquire useful behavior with <strong>no task reward</strong> — the purest form of demo-free learning. Use them to <strong>pretrain</strong> a policy/representation that a downstream task then finetunes with very few samples.</p>
+
+  <h3>7.1 Intrinsic motivation / exploration</h3>
+  <p>When rewards are sparse or absent, an <strong>intrinsic reward</strong> drives the agent to gather informative experience:</p>
+  <ul>
+    <li><a href="https://arxiv.org/abs/1705.05363">ICM</a> (curiosity) — reward = prediction error of a learned forward dynamics model in a feature space.</li>
+    <li><a href="https://arxiv.org/abs/1810.12894">RND</a> — reward = error predicting a fixed random network's output (novelty bonus). Simple, robust, widely used.</li>
+    <li><a href="https://arxiv.org/abs/2005.05960">Plan2Explore</a> — model-based, task-agnostic: explore to maximize <em>model disagreement</em>, building a world model that enables <strong>zero-shot</strong> adaptation to new rewards. Bridges Pillars C and E.</li>
+  </ul>
+
+  <h3>7.2 Unsupervised skill discovery</h3>
+  <p>Learn a <strong>repertoire of distinguishable skills</strong> (a skill-conditioned policy π(a|s,z)) by maximizing the mutual information between skills z and the states they visit — <em>no reward needed</em>. Downstream tasks then plan/RL over the small skill space → a big sample-efficiency win.</p>
+  <ul>
+    <li><a href="https://arxiv.org/abs/1802.06070">DIAYN</a> (“Diversity is All You Need”) — the seminal MI-maximization method.</li>
+    <li><a href="https://arxiv.org/abs/1907.01657">DADS</a> — dynamics-aware skills, directly usable for model-based planning.</li>
+    <li><a href="https://arxiv.org/abs/2202.00161">CIC</a> — contrastive intrinsic control; scales skill count.</li>
+    <li><a href="https://arxiv.org/abs/2310.13021">METRA</a> (Park et al., ICLR 2024) — <em>metric-aware</em> discovery using a temporal-distance (Lipschitz) objective; the most <strong>scalable</strong> approach, covering state space far better than MI methods. The current go-to for unsupervised skill pretraining. Builds on <a href="https://arxiv.org/abs/2202.00914">LSD</a>.</li>
+    <li><a href="https://arxiv.org/abs/2410.11251">DUSDi</a> (Disentangled USD, NeurIPS 2024) — disentangled skills for efficient hierarchical RL.</li>
+    <li><a href="https://arxiv.org/abs/2004.12974">Emergent Real-World Skills via Unsupervised Off-Policy RL</a> — DIAYN-style discovery run directly on a real robot.</li>
+  </ul>
+
+  <h3>7.3 Goal-conditioned &amp; self-supervised RL</h3>
+  <p>Turn <em>reaching self-proposed goals</em> into the learning signal: <a href="https://arxiv.org/abs/1707.01495">HER — Hindsight Experience Replay</a> relabels failed trajectories with the goal that <em>was</em> achieved, so every rollout yields positive signal — making sparse-reward goal-reaching sample-efficient with no reward shaping. Contrastive RL and automatic-goal-generation (asymmetric self-play) extend this with self-curricula.</p>
+
+  <h3>7.4 The unsupervised → task pipeline</h3>
+  <p>The intended usage: <strong>(1)</strong> unsupervised exploration/skill-discovery pretraining (free, no reward) → <strong>(2)</strong> few-sample finetuning on the actual task. The <a href="https://arxiv.org/abs/2110.15191">URLB</a> (Unsupervised RL Benchmark) formalizes this and shows large downstream sample savings. Pair §7.2 skills with §5.1 world models for the strongest task-time efficiency.</p>
+
+  <div class="callout read">
+    <span class="label">Further reading — exploration &amp; skill discovery</span>
+    <ul>
+      <li><a href="https://lilianweng.github.io/posts/2020-06-07-exploration-drl/">Lilian Weng — “Exploration Strategies in Deep RL”</a> (curiosity, novelty, information-gain methods, well organized).</li>
+      <li><a href="https://arxiv.org/abs/2110.15191">URLB</a> — benchmark + open-source baselines for eight unsupervised RL methods.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ============================ 8 ============================ -->
+<section id="s8">
+  <h2 class="sec"><span class="num">08</span>Representation priors that cut sample cost</h2>
+  <p>Orthogonal to <em>which</em> RL method you use: starting from <strong>pretrained representations</strong> reduces the samples any method needs, because the agent no longer learns vision/dynamics from scratch.</p>
+
+  <h4>Pretrained visual encoders (freeze and build on top)</h4>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2203.12601">R3M</a> — time-contrastive + video-language pretraining on Ego4D human video; +20% task success vs. from-scratch, and a strong frozen encoder for RL.</li>
+    <li><a href="https://arxiv.org/abs/2303.18240">VC-1</a> — masked-autoencoder on 4,000+ hrs egocentric video + ImageNet; general embodied-AI backbone (CortexBench).</li>
+    <li><a href="https://arxiv.org/abs/2203.06173">MVP</a> — masked visual pretraining for motor control.</li>
+    <li><a href="https://arxiv.org/abs/2407.20179">Theia</a> — distills <em>multiple</em> vision foundation models into one rich encoder; strong robot-learning performance at smaller size / less data.</li>
+    <li><a href="https://arxiv.org/abs/2304.07193">DINOv2</a> — general self-supervised features that underpin DINO-WM and many recent policies.</li>
+  </ul>
+
+  <h4>Learned world models &amp; offline data as priors</h4>
+  <p>DINO-WM (§5.1) builds the dynamics model on frozen DINOv2 features, enabling zero-shot planning. Generally, <em>don't relearn perception inside the RL loop</em> if a pretrained encoder will do. And any autonomously gathered dataset warm-starts offline-to-online RL (§5.3).</p>
+
+  <div class="callout key">
+    <span class="label">Practical default</span>
+    <p>Freeze a pretrained encoder (<strong>Theia / VC-1 / DINOv2</strong>), run RL on top with image augmentation (§5.4). This combination alone often halves sample requirements for pixel-based tasks.</p>
+  </div>
+</section>
+
+<!-- ============================ 9 ============================ -->
+<section id="s9">
+  <h2 class="sec"><span class="num">09</span>Putting it together: recipes &amp; decision tree</h2>
+
+  <h3>9.1 Decision tree</h3>
+  <pre>
+Does a usable simulator exist for the task?
+├── <b>YES → SIM-FIRST</b> (Pillar A). Default; real-sample cost ≈ 0.
+│         • Reward known/engineerable? → write it, or use Eureka / DrEureka (B).
+│         • Massively parallel PPO in Isaac Lab / MuJoCo Playground.
+│         • Locomotion / partial observability → teacher–student + RMA-style adaptation.
+│         • Deploy with DR / ADR; tighten with system-ID / real2sim if the gap is large.
+│         • Residual reality gap? → thin real-world RL adaptation (DSRL / RLPD finetune) (C/D).
+│
+└── <b>NO</b> (or sim gap is fundamental: deformables, fluids, fine contact)
+          → <b>REAL-WORLD AUTONOMOUS RL</b> (Pillars C + D)
+          • Get a base policy cheaply: scripted, VoxPoser / Code-as-Policies, or rough sim.
+          • Bootstrap with autonomous/sim data via RLPD (offline-to-online, no demos).
+          • Reward without demos: VLM/CLIP reward (B) or a success classifier from goal images.
+          • Make it reset-free; high-UTD off-policy (DroQ/CrossQ) or a world model (TD-MPC2/Dreamer).
+          • Steer a base diffusion/flow policy with DSRL for the fewest real samples.
+
+<b>Across both branches, ALWAYS stack the free accelerators:</b>
+  • Pretrained visual encoder (Theia / VC-1 / DINOv2), frozen, + image augmentation.
+  • Unsupervised skill/exploration pretraining (METRA / Plan2Explore) when reward is sparse.
+  • A learned world model to multiply each real transition into many imagined ones.
+</pre>
+
+  <h3>9.2 Worked recipe — legged locomotion <span class="chip">zero demos, ~zero real samples</span></h3>
+  <ol>
+    <li><strong>Sim:</strong> Isaac Lab or MuJoCo Playground, thousands of parallel envs.</li>
+    <li><strong>Reward:</strong> engineer (velocity tracking + upright + energy/smoothness), <em>or</em> let DrEureka write it.</li>
+    <li><strong>Privilege:</strong> train a teacher with privileged terrain/dynamics state (PPO).</li>
+    <li><strong>Distill:</strong> student on proprioception (+ depth for parkour) via RMA-style online adaptation.</li>
+    <li><strong>Robustness:</strong> ADR over mass, friction, motor gains, latency, terrain.</li>
+    <li><strong>Deploy:</strong> zero-shot. Optional thin real-world finetune for residual gap.</li>
+  </ol>
+  <p><em>Outcome class:</em> the standard pipeline behind ANYmal / Go2 / G1 / H1 walking and parkour — no demonstrations, deployment-ready from sim.</p>
+
+  <h3>9.3 Worked recipe — contact-rich manipulation (insertion, assembly)</h3>
+  <ul>
+    <li><strong>If sim is faithful enough:</strong> sim-first with an Eureka reward + ADR, then DSRL / RLPD adaptation on hardware for the contact residual.</li>
+    <li><strong>If the sim gap is fundamental:</strong> real-world RLPD (offline-to-online) seeded with scripted/sim “prior data”; <strong>reward = VLM preference (RL-VLM-F) or a success classifier from a few goal images</strong> (no demos); reset-free; DroQ/CrossQ critic with LayerNorm + augmentation + frozen pretrained encoder. Budget: hours of real time.</li>
+  </ul>
+
+  <h3>9.4 Worked recipe — dexterous in-hand manipulation</h3>
+  <p>OpenAI-style: massively parallel sim + <strong>ADR</strong> + teacher–student with online adaptation, reward via Eureka. This produced real-hand Rubik's-cube and pen-spinning skills with no human demonstrations. Add real2sim system-ID if your hand's dynamics are idiosyncratic.</p>
+</section>
+
+<!-- ============================ 10 ============================ -->
+<section id="s10">
+  <h2 class="sec"><span class="num">10</span>Pitfalls and practical engineering</h2>
+  <ul>
+    <li><strong>Reward hacking</strong> — the dominant failure of demo-free RL. The policy maximizes the letter, not the intent, of an engineered/LLM reward. Mitigate: hold out an independent success metric; use Eureka's reflection loop; prefer success classifiers + sparse terminal reward over heavily shaped dense reward where possible.</li>
+    <li><strong>Sim-to-real gap sources</strong> — actuator dynamics &amp; latency, contact/friction modeling, sensor noise, unmodeled compliance. Latency and motor models dominate in locomotion; contact in manipulation. Randomize <em>these</em> aggressively (and identify them via system-ID).</li>
+    <li><strong>High-UTD instability</strong> — without LayerNorm/ensembles/regularization, many updates per step diverge via Q-overestimation. Use REDQ/DroQ/CrossQ recipes; don't crank UTD on a vanilla SAC.</li>
+    <li><strong>DR-range Goldilocks problem</strong> — too narrow → no transfer; too wide → unlearnable. Prefer ADR (auto-curriculum) or RAPP (DrEureka) over hand-picked ranges.</li>
+    <li><strong>“Demo-free” leaks</strong> — audit for hidden human supervision: BC base policies (diffusion policies), demo-seeded buffers, human-labeled rewards, manual resets. Each has a demo-free substitute above (sim base policy, autonomous/sim prior data, VLM/classifier reward, reset-free).</li>
+    <li><strong>Generative-sim quality variance</strong> — LLM-proposed tasks/scenes/rewards range from excellent to nonsensical; filter with execution feedback and success checks before trusting them.</li>
+    <li><strong>Evaluation honesty</strong> — report <em>real-world</em> samples and wall-clock separately from sim steps; success rates on held-out object/terrain configs, not the training distribution.</li>
+    <li><strong>Safety on hardware</strong> — torque/velocity limits, reversibility (reset-policy as safety signal), and a human e-stop are prerequisites for autonomous real-world RL.</li>
+  </ul>
+</section>
+
+<!-- ============================ 11 ============================ -->
+<section id="s11">
+  <h2 class="sec"><span class="num">11</span>Quick-reference tables</h2>
+
+  <h3>11.1 Sample-efficiency toolbox</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Technique</th><th>Pillar</th><th>Mechanism</th><th>Cuts which budget</th></tr></thead>
+    <tbody>
+      <tr><td>Massively parallel sim (Isaac Lab, MJX)</td><td>A</td><td>Throughput</td><td>Real steps → ~0</td></tr>
+      <tr><td>Domain randomization / ADR</td><td>A</td><td>Robust transfer</td><td>Real steps</td></tr>
+      <tr><td>Teacher–student / RMA</td><td>A</td><td>Privileged distillation + online adaptation</td><td>Real &amp; sim steps</td></tr>
+      <tr><td>Real2sim / system-ID / diff-sim</td><td>A</td><td>Match sim to reality</td><td>Real steps</td></tr>
+      <tr><td>Eureka / DrEureka</td><td>B</td><td>LLM writes reward (+ DR)</td><td>Human time, supervision</td></tr>
+      <tr><td>VLM / CLIP / preference rewards</td><td>B</td><td>Foundation model scores goals</td><td>Supervision (no demos)</td></tr>
+      <tr><td>RoboGen / Gen2Sim</td><td>B</td><td>Generate tasks+scenes+rewards</td><td>Human time, data</td></tr>
+      <tr><td>TD-MPC2 / DreamerV3</td><td>C</td><td>World-model imagination</td><td>Real &amp; sim steps</td></tr>
+      <tr><td>REDQ / DroQ / CrossQ (high UTD)</td><td>C</td><td>Many updates per sample</td><td>Real &amp; sim steps</td></tr>
+      <tr><td>RLPD / Cal-QL (offline→online)</td><td>C</td><td>Reuse autonomous prior data</td><td>Real steps</td></tr>
+      <tr><td>DrQ-v2 augmentation</td><td>C</td><td>Image regularization</td><td>Pixel-RL samples</td></tr>
+      <tr><td>Reset-free RL (EARL, MEDAL)</td><td>D</td><td>Self-reset</td><td>Human time (resets)</td></tr>
+      <tr><td>SERL / RLPD on hardware</td><td>D</td><td>Engineered efficient stack</td><td>Real steps</td></tr>
+      <tr><td>DSRL (latent-space steering)</td><td>D</td><td>Thin RL over a base policy</td><td>Real steps</td></tr>
+      <tr><td>Plan2Explore / RND / ICM</td><td>E</td><td>Intrinsic exploration</td><td>Supervision (no reward)</td></tr>
+      <tr><td>METRA / DIAYN / DADS</td><td>E</td><td>Reward-free skill repertoire</td><td>Downstream task samples</td></tr>
+      <tr><td>HER / goal-conditioned RL</td><td>E</td><td>Hindsight relabeling</td><td>Sparse-reward samples</td></tr>
+      <tr><td>R3M / VC-1 / Theia / DINOv2</td><td>§8</td><td>Frozen pretrained perception</td><td>Pixel-RL samples</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>11.2 Where supervision comes from (demo-free)</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Source</th><th>Methods</th><th>Best for</th></tr></thead>
+    <tbody>
+      <tr><td>Engineered reward</td><td>classic shaping</td><td>locomotion, well-understood objectives</td></tr>
+      <tr><td>LLM-written reward</td><td>Eureka, DrEureka, Text2Reward</td><td>any sim task; removes reward engineering</td></tr>
+      <tr><td>VLM / foundation reward</td><td>RL-VLM-F, VLM-RM, RoboCLIP, VIP</td><td>perceptual goals describable in language/image</td></tr>
+      <tr><td>Success classifier</td><td>VICE, RCE</td><td>manipulation with a few goal-state examples</td></tr>
+      <tr><td>Self-supervised goals</td><td>HER, contrastive RL</td><td>goal-reaching, reset-free</td></tr>
+      <tr><td>Intrinsic only</td><td>RND, ICM, Plan2Explore, METRA, DIAYN</td><td>pretraining, sparse/no reward</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="callout key">
+    <span class="label">Executive summary (one paragraph)</span>
+    <p>To make robot skill learning maximally sample-efficient without human demonstrations: <strong>default to simulation</strong> — train in a massively parallel GPU simulator where real-sample cost is ~zero, let an <strong>LLM write the reward and domain-randomization ranges</strong> (Eureka/DrEureka), and transfer with <strong>domain randomization + teacher–student/RMA adaptation</strong>. When the sim gap is fundamental and you must touch hardware, minimize real samples with a <strong>world-model or high-UTD off-policy learner</strong> (TD-MPC2/DreamerV3 or DroQ/CrossQ), <strong>bootstrap from autonomously collected prior data</strong> (RLPD, not demos), make learning <strong>reset-free</strong>, source rewards from a <strong>VLM or a success classifier</strong> rather than demos, and prefer <strong>steering a sim/generated base policy with thin latent-space RL</strong> (DSRL). Throughout, stack the free accelerators — <strong>frozen pretrained visual encoders, image augmentation, and unsupervised exploration/skill-discovery pretraining</strong> (METRA/Plan2Explore).</p>
+  </div>
+</section>
+
+<!-- ============================ 12 ============================ -->
+<section id="s12">
+  <h2 class="sec"><span class="num">12</span>Further reading, tooling &amp; references</h2>
+
+  <h3>Surveys, courses &amp; living resources</h3>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2511.02097">A Step Toward World Models: A Survey on Robotic Manipulation (2025)</a> — broad, current survey tying together world models, sim, and foundation-model supervision.</li>
+    <li><a href="https://spinningup.openai.com/">OpenAI Spinning Up in Deep RL</a> — the standard from-scratch RL tutorial + clean algorithm implementations.</li>
+    <li><a href="https://rail.eecs.berkeley.edu/deeprlcourse/">Berkeley CS285 — Deep Reinforcement Learning (Sergey Levine)</a> — full lecture series covering model-based RL, offline RL, exploration, and inverse RL.</li>
+    <li><a href="https://lilianweng.github.io/posts/2019-05-05-domain-randomization/">Lilian Weng — Domain Randomization for Sim2Real</a> and <a href="https://lilianweng.github.io/posts/2020-06-07-exploration-drl/">Exploration Strategies in Deep RL</a> — exceptionally clear topic primers.</li>
+    <li><a href="https://github.com/YanjieZe/Paper-List">YanjieZe / Paper-List</a> — continuously updated reading list for robot learning, RL, and vision.</li>
+  </ul>
+
+  <h3>Tooling for sample-efficient RL</h3>
+  <ul>
+    <li><a href="https://github.com/vwxyzjn/cleanrl">CleanRL</a> — single-file reference implementations (SAC, TD3, PPO, RND…).</li>
+    <li><a href="https://github.com/DLR-RM/stable-baselines3">Stable-Baselines3 / SBX</a> — production SAC, TD3, TQC, DroQ, CrossQ.</li>
+    <li><a href="https://github.com/takuseno/d3rlpy">d3rlpy</a> — offline + offline-to-online RL (IQL, CQL, Cal-QL-style).</li>
+    <li><a href="https://playground.mujoco.org/">MuJoCo Playground</a> &amp; <a href="https://isaac-sim.github.io/IsaacLab/">Isaac Lab</a> — massively parallel sim with sim-to-real recipes.</li>
+  </ul>
+
+  <h3>Primary references by section</h3>
+
+  <h4>Foundational sim-to-real &amp; parallel sim</h4>
+  <ul>
+    <li>Tobin et al. 2017 — Domain Randomization · <a href="https://arxiv.org/abs/1703.06907">arXiv:1703.06907</a></li>
+    <li>OpenAI 2019 — Automatic Domain Randomization (Rubik's Cube) · <a href="https://arxiv.org/abs/1910.07113">arXiv:1910.07113</a></li>
+    <li>Kumar et al. 2021 — RMA · <a href="https://arxiv.org/abs/2107.04034">arXiv:2107.04034</a></li>
+    <li>Rudin et al. 2022 — Learning to Walk in Minutes · <a href="https://arxiv.org/abs/2109.11978">arXiv:2109.11978</a></li>
+    <li>Cheng et al. 2023 — Extreme Parkour · <a href="https://arxiv.org/abs/2309.14341">arXiv:2309.14341</a> · Hoeller et al. 2024 — ANYmal Parkour (<a href="https://www.science.org/doi/10.1126/scirobotics.adi7566">Science Robotics</a>)</li>
+    <li>Isaac Lab 2025 · <a href="https://arxiv.org/abs/2511.04831">arXiv:2511.04831</a> · Makoviychuk et al. — Isaac Gym · <a href="https://arxiv.org/abs/2108.10470">arXiv:2108.10470</a> · MuJoCo Playground (RSS 2025) · <a href="https://playground.mujoco.org/">playground.mujoco.org</a></li>
+  </ul>
+
+  <h4>Foundation-model supervision</h4>
+  <ul>
+    <li>Ma et al. 2024 — Eureka (ICLR) · <a href="https://arxiv.org/abs/2310.12931">arXiv:2310.12931</a></li>
+    <li>Ma et al. 2024 — DrEureka (RSS) · <a href="https://arxiv.org/abs/2406.01967">arXiv:2406.01967</a></li>
+    <li>Xie et al. 2024 — Text2Reward · <a href="https://arxiv.org/abs/2309.11489">arXiv:2309.11489</a> · Yu et al. 2023 — Language to Rewards · <a href="https://arxiv.org/abs/2306.08647">arXiv:2306.08647</a></li>
+    <li>Wang et al. 2024 — RoboGen (ICML) · <a href="https://arxiv.org/abs/2311.01455">arXiv:2311.01455</a> · Katara et al. — Gen2Sim · <a href="https://arxiv.org/abs/2310.18308">arXiv:2310.18308</a> · Wang et al. — GenSim · <a href="https://arxiv.org/abs/2310.01361">arXiv:2310.01361</a></li>
+    <li>Wang et al. 2024 — RL-VLM-F · <a href="https://arxiv.org/abs/2402.03681">arXiv:2402.03681</a> · Rocamonde et al. — VLM-RM · <a href="https://arxiv.org/abs/2310.12921">arXiv:2310.12921</a> · Sontakke et al. — RoboCLIP · <a href="https://arxiv.org/abs/2310.07899">arXiv:2310.07899</a></li>
+    <li>Liang et al. — Code as Policies · <a href="https://arxiv.org/abs/2209.07753">arXiv:2209.07753</a> · Huang et al. — VoxPoser · <a href="https://arxiv.org/abs/2307.05973">arXiv:2307.05973</a></li>
+  </ul>
+
+  <h4>Sample-efficient RL algorithms</h4>
+  <ul>
+    <li>Hansen et al. 2024 — TD-MPC2 · <a href="https://arxiv.org/abs/2310.16828">arXiv:2310.16828</a> (orig. TD-MPC · <a href="https://arxiv.org/abs/2203.04955">arXiv:2203.04955</a>) · Hafner et al. 2025 — DreamerV3 · <a href="https://arxiv.org/abs/2301.04104">arXiv:2301.04104</a></li>
+    <li>Zhou et al. 2024 — DINO-WM · <a href="https://arxiv.org/abs/2411.04983">arXiv:2411.04983</a> · Sekar et al. — Plan2Explore · <a href="https://arxiv.org/abs/2005.05960">arXiv:2005.05960</a></li>
+    <li>Chen et al. — REDQ · <a href="https://arxiv.org/abs/2101.05982">arXiv:2101.05982</a> · Hiraoka et al. — DroQ · <a href="https://arxiv.org/abs/2110.02034">arXiv:2110.02034</a> · Bhatt et al. — CrossQ · <a href="https://arxiv.org/abs/1902.05605">arXiv:1902.05605</a> · Kuznetsov et al. — TQC · <a href="https://arxiv.org/abs/2005.04269">arXiv:2005.04269</a></li>
+    <li>Haarnoja et al. — SAC · <a href="https://arxiv.org/abs/1801.01290">arXiv:1801.01290</a> · Fujimoto et al. — TD3 · <a href="https://arxiv.org/abs/1802.09477">arXiv:1802.09477</a></li>
+    <li>Ball et al. 2023 — RLPD · <a href="https://arxiv.org/abs/2302.02948">arXiv:2302.02948</a> · Nakamoto et al. — Cal-QL · <a href="https://arxiv.org/abs/2303.05479">arXiv:2303.05479</a> · Kostrikov et al. — IQL · <a href="https://arxiv.org/abs/2110.06169">arXiv:2110.06169</a></li>
+    <li>Yarats et al. — DrQ-v2 · <a href="https://arxiv.org/abs/2107.09645">arXiv:2107.09645</a> · Laskin et al. — RAD · <a href="https://arxiv.org/abs/2004.14990">arXiv:2004.14990</a> · CURL · <a href="https://arxiv.org/abs/2004.04136">arXiv:2004.04136</a></li>
+  </ul>
+
+  <h4>Real-world autonomous RL</h4>
+  <ul>
+    <li>Luo et al. 2024 — SERL · <a href="https://arxiv.org/abs/2401.16013">arXiv:2401.16013</a> · HIL-SERL · <a href="https://arxiv.org/abs/2410.21845">arXiv:2410.21845</a></li>
+    <li>Wagenmaker et al. 2025 — DSRL (CoRL) · <a href="https://arxiv.org/abs/2506.15799">arXiv:2506.15799</a> · RL-100 · <a href="https://arxiv.org/abs/2510.14830">arXiv:2510.14830</a> · SimLauncher · <a href="https://arxiv.org/abs/2507.04452">arXiv:2507.04452</a></li>
+    <li>Eysenbach et al. — Leave No Trace · <a href="https://arxiv.org/abs/1711.06782">arXiv:1711.06782</a> · Sharma et al. — VaPRL · <a href="https://arxiv.org/abs/2107.12931">arXiv:2107.12931</a> · MEDAL · <a href="https://arxiv.org/abs/2205.05212">arXiv:2205.05212</a> · EARL · <a href="https://arxiv.org/abs/2112.09605">arXiv:2112.09605</a></li>
+  </ul>
+
+  <h4>Unsupervised pretraining / skill discovery</h4>
+  <ul>
+    <li>Eysenbach et al. — DIAYN · <a href="https://arxiv.org/abs/1802.06070">arXiv:1802.06070</a> · Sharma et al. — DADS · <a href="https://arxiv.org/abs/1907.01657">arXiv:1907.01657</a> · Laskin et al. — CIC · <a href="https://arxiv.org/abs/2202.00161">arXiv:2202.00161</a></li>
+    <li>Park et al. 2024 — METRA · <a href="https://arxiv.org/abs/2310.13021">arXiv:2310.13021</a> · Park et al. — LSD · <a href="https://arxiv.org/abs/2202.00914">arXiv:2202.00914</a> · DUSDi (NeurIPS 2024) · <a href="https://arxiv.org/abs/2410.11251">arXiv:2410.11251</a></li>
+    <li>Pathak et al. — ICM · <a href="https://arxiv.org/abs/1705.05363">arXiv:1705.05363</a> · Burda et al. — RND · <a href="https://arxiv.org/abs/1810.12894">arXiv:1810.12894</a> · Andrychowicz et al. — HER · <a href="https://arxiv.org/abs/1707.01495">arXiv:1707.01495</a> · Laskin et al. — URLB · <a href="https://arxiv.org/abs/2110.15191">arXiv:2110.15191</a></li>
+  </ul>
+
+  <h4>Representation priors</h4>
+  <ul>
+    <li>Nair et al. 2022 — R3M · <a href="https://arxiv.org/abs/2203.12601">arXiv:2203.12601</a> · Majumdar et al. — VC-1 · <a href="https://arxiv.org/abs/2303.18240">arXiv:2303.18240</a> · Xiao et al. — MVP · <a href="https://arxiv.org/abs/2203.06173">arXiv:2203.06173</a></li>
+    <li>Shang et al. 2024 — Theia · <a href="https://arxiv.org/abs/2407.20179">arXiv:2407.20179</a> · Oquab et al. — DINOv2 · <a href="https://arxiv.org/abs/2304.07193">arXiv:2304.07193</a> · Ma et al. — VIP · <a href="https://arxiv.org/abs/2210.00030">arXiv:2210.00030</a> · LIV · <a href="https://arxiv.org/abs/2306.00958">arXiv:2306.00958</a></li>
+  </ul>
+</section>
+
+<footer>
+  <p>Sample-Efficient Robot Policy Learning Without Human Demonstrations · compiled June 2026. Links open the primary source for each method. arXiv IDs were verified at compile time; field is fast-moving — re-check for newer SOTA before committing to a stack.</p>
+  <p><a class="totop" href="#top">↑ Back to top</a></p>
+</footer>
+
+</div>
+</body>
+</html>

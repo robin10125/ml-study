@@ -33,13 +33,6 @@
 </table>
 <p>Nothing is lost — every capability survives — but everything hidden becomes visible. A full training loop is: <code>params, opt_state, key</code> go in; new <code>params, opt_state, key</code> come out. By Chapter 7 you will have written exactly that for a transformer.</p>
 
-<div class="quiz" data-concept="ch1.html#what-jax-is" data-concept-label="§1.1 What JAX is">
-  <div class="q-text"><p>From memory: what are JAX's two halves, and what is the central design inversion relative to PyTorch? For each of these four PyTorch facts, state the JAX counterpart: a model is an object; <code>backward()</code> fills <code>.grad</code> fields; the optimizer mutates parameters; the RNG is a hidden global.</p></div>
-  <div class="hint">The slogan: in PyTorch, state lives inside objects; in JAX, state is ______ that you ______ explicitly.</div>
-  <div class="hint">For each item ask: where does that state now live, and how does it move? (Hint: arguments in, return values out.)</div>
-  <div class="answer"><p>JAX = a NumPy clone (<code>jax.numpy</code>) + composable function transformations (<code>grad</code>, <code>jit</code>, <code>vmap</code>) that require pure functions. The inversion: state lives in <em>data you pass explicitly</em>, not inside objects. Counterparts: a model is a pure function <code>forward(params, x)</code> with parameters as an argument; gradients are the <em>return value</em> of <code>jax.grad(loss_fn)(params, …)</code>; an update returns a <em>new</em> params dict (nothing mutated); randomness comes from explicit <code>key</code> arguments. Everything hidden becomes an explicit input/output.</p></div>
-</div>
-
 <h2 id="immutability">1.2 Arrays are immutable</h2>
 <p>The first habit to break: in-place assignment. JAX arrays cannot be written to:</p>
 <pre><code>x = jnp.zeros(5)
@@ -57,12 +50,6 @@ buf[i] = obs                        buf = buf.at[i].set(obs)
 <p><strong>Why this restriction?</strong> Because transformations reason about your function as a mathematical object. If <code>f</code> could silently modify its inputs, then <code>grad(f)</code> and <code>jit(f)</code> could not safely reorder, cache, or re-execute pieces of it. Immutability is what makes the transformations <em>sound</em>.</p>
 <p><strong>Isn't copying the whole array absurdly slow?</strong> In eager (un-compiled) code, yes, each <code>.at[].set</code> really copies. Inside <code>jit</code>-compiled code — which is where all real JAX programs run — the compiler proves the old value is never used again and turns the copy into an in-place write. You write functional code; XLA emits mutating code. You get the safety without paying for it.</p>
 
-<div class="quiz" data-concept="ch1.html#immutability" data-concept-label="§1.2 Immutability">
-  <div class="q-text"><p>Convert to JAX: (a) <code>x[3] = 7</code>, (b) <code>x[x &lt; 0] *= 0.1</code>, (c) <code>row[i] += g</code>. Then answer: what does <code>.at[].set</code> return, what happens to the original array, and why is the apparent copy usually free in practice?</p></div>
-  <div class="hint">Every conversion has the same shape: <code>x = x.at[…].something(…)</code> — you must rebind the name, because nothing was modified.</div>
-  <div class="answer"><p>(a) <code>x = x.at[3].set(7)</code>; (b) <code>x = x.at[x &lt; 0].mul(0.1)</code> (or <code>x = jnp.where(x &lt; 0, x * 0.1, x)</code>); (c) <code>row = row.at[i].add(g)</code>. <code>.at[].set</code> returns a <em>new</em> array; the original is unchanged (forgetting to rebind is the classic silent bug). Under <code>jit</code>, XLA sees the old buffer is dead and compiles the operation into an in-place update, so the functional style costs nothing in compiled code.</p></div>
-</div>
-
 <h2 id="purity">1.3 Pure functions: the contract</h2>
 <p>A function is <strong>pure</strong> if (1) its output depends only on its explicit arguments, and (2) it has no side effects — it doesn't mutate anything, write files, print as part of its contract, read globals that change, or consult a hidden RNG. JAX's transformations <em>assume</em> purity. They do not <em>check</em> it.</p>
 <div class="box warning"><div class="box-title">Impure code usually doesn't crash — it silently lies</div>
@@ -75,12 +62,6 @@ buf[i] = obs                        buf = buf.at[i].set(obs)
 <li>Out-of-place math only — which immutability (§1.2) already enforces for arrays.</li>
 </ul>
 <p>You can still organize code with Python classes and closures — JAX is a library, not a language — but anything that <em>changes over time</em> must flow through arguments and return values, never through attributes. This is exactly why frameworks like Flax exist (they generate the pure functions for you); we build raw so that nothing is magic.</p>
-
-<div class="quiz" data-concept="ch1.html#purity" data-concept-label="§1.3 Purity">
-  <div class="q-text"><p>State the two conditions of purity. Then classify each as safe or unsafe to <code>jit</code>, with the failure mode: (a) <code>def f(x): return x @ W</code> where <code>W</code> is a module-level array that your training loop reassigns each step; (b) <code>def g(x): print(x.mean()); return 2*x</code> used for per-step logging; (c) <code>def h(params, x): return forward(params, x)</code>.</p></div>
-  <div class="hint">JAX won't error on (a) or (b). Ask what each one does on call #2, after compilation.</div>
-  <div class="answer"><p>Pure = output depends only on explicit arguments, and no side effects. (a) <strong>Unsafe</strong>: <code>W</code> is captured at trace time as a constant; reassigning the global later does nothing — the compiled <code>f</code> uses the original <code>W</code> forever. Fix: pass <code>W</code> as an argument. (b) <strong>Unsafe as logging</strong>: <code>print</code> executes only during the one tracing call (printing an abstract tracer, not numbers), then never again. The math is fine; the logging silently vanishes. Return the value instead, or use <code>jax.debug.print</code>. (c) <strong>Safe</strong> — everything that varies is an argument; this is the canonical shape of JAX model code.</p></div>
-</div>
 
 <h2 id="prng">1.4 Randomness without a hidden RNG</h2>
 <p>A stateful RNG is impure by definition: two calls to <code>torch.randn(3)</code> return different values, so the output doesn't depend only on the arguments. JAX's solution is to make the RNG state an explicit value — a <strong>key</strong> — that you pass in:</p>
@@ -105,28 +86,6 @@ keys = jax.random.split(key, 8)          # or: split into many at once
 </div>
 <p>Why go to this trouble instead of a global seed? Reproducibility (the whole program is a deterministic function of one integer), and parallelism: <code>vmap</code>/multi-device code can hand every lane its own key with no contention over shared RNG state and no dependence on execution order — something global RNGs fundamentally cannot do.</p>
 
-<div class="quiz" data-concept="ch1.html#prng" data-concept-label="§1.4 PRNG keys">
-  <div class="q-text"><p>Write the code that draws two <em>independent</em> \(4\times4\) Gaussian matrices starting from <code>jax.random.PRNGKey(42)</code>. Then: what would be wrong with passing the same key to both calls, why doesn't JAX raise an error for it, and what two properties motivate explicit keys over a global seed?</p></div>
-  <div class="hint">The pattern is three lines repeated: split, draw with the child, carry the parent. (Or split once into two children.)</div>
-  <div class="answer"><pre><code>key = jax.random.PRNGKey(42)
-k1, k2 = jax.random.split(key)
-a = jax.random.normal(k1, (4, 4))
-b = jax.random.normal(k2, (4, 4))</code></pre><p>Same key to both calls ⇒ <code>a</code> and <code>b</code> are bit-for-bit identical — <code>jax.random.normal</code> is a deterministic function of (key, shape). No error is possible because reuse is indistinguishable from intentional replay; correctness is your job (the discipline: never reuse). Motivations: total reproducibility (program = deterministic function of the seed) and parallelism (each batch element / device gets its own key with no shared mutable RNG state, independent of execution order).</p></div>
-</div>
-
-<div class="quiz" data-concept="ch1.html#prng" data-concept-label="§1.4 PRNG keys">
-  <div class="q-text"><p>Predict the output relationships (identical or independent) without running:</p>
-<pre><code>key = jax.random.PRNGKey(0)
-a = jax.random.normal(key, (2,))
-key2, sub = jax.random.split(key)
-b = jax.random.normal(key, (2,))
-c = jax.random.normal(sub, (2,))
-d = jax.random.normal(jax.random.PRNGKey(0), (2,))</code></pre>
-<p>Which of <code>a</code>, <code>b</code>, <code>c</code>, <code>d</code> are equal to each other?</p></div>
-  <div class="hint">Splitting does not consume or modify the parent key — keys are immutable values like everything else. What is <code>key</code> on line 4?</div>
-  <div class="answer"><p><code>a = b = d</code>; <code>c</code> is independent of all of them. <code>a</code> and <code>b</code> use the very same key value — <code>split</code> returned <em>new</em> keys but didn't (couldn't) mutate <code>key</code>, so reusing the name reuses the numbers. <code>d</code> rebuilds the same key from the same seed ⇒ same draw. <code>c</code> uses a fresh child key ⇒ independent stream. Moral: rebind the parent (<code>key, sub = split(key)</code>) or you will reuse it by accident.</p></div>
-</div>
-
 <h2 id="practicalities">1.5 Small practicalities that save an afternoon</h2>
 <ul>
 <li><strong>float32 by default.</strong> JAX defaults to 32-bit (like deep-learning practice, unlike NumPy's float64). 64-bit needs an explicit config flag.</li>
@@ -135,24 +94,98 @@ d = jax.random.normal(jax.random.PRNGKey(0), (2,))</code></pre>
 <li><strong>NumPy interop.</strong> <code>np.array(x)</code> pulls a JAX array to host; JAX functions accept NumPy arrays and Python scalars and convert them.</li>
 </ul>
 
-<div class="quiz" data-concept="ch1.html#practicalities" data-concept-label="§1.5 Practicalities">
-  <div class="q-text"><p>A colleague benchmarks a jitted matmul like this and concludes JAX is 1000× faster than PyTorch:</p>
-<pre><code>t0 = time.time()
-y = fast_matmul(a, b)
-print(time.time() - t0)   # 0.00002 s !!</code></pre>
-<p>What did they actually measure, and what is the fix? Also: their loss prints as <code>dtype=float32</code> but their NumPy reference is float64 — why?</p></div>
-  <div class="hint">JAX returns before the device finishes. What does the returned array represent until then?</div>
-  <div class="answer"><p>They measured <em>dispatch</em> — JAX queues the computation asynchronously and returns a placeholder immediately; the multiply hadn't run yet. Fix: <code>y = fast_matmul(a, b); y.block_until_ready()</code> inside the timed region (and time the <em>second</em> call, so compilation isn't included either). The dtype differs because JAX defaults to float32 (deep-learning convention), NumPy to float64.</p></div>
+<h2 id="problems">Problem set</h2>
+<p>Work these in order, in the box (it saves automatically) and in a live Python session — <code>import jax, jax.numpy as jnp</code> and actually run what you write. The reference unlocks once you've made a real attempt; the 📖 link jumps back to the section a problem draws on.</p>
+
+<div class="quiz" data-concept="ch1.html#what-jax-is" data-concept-label="§1.1 What JAX is" data-min="80" data-placeholder="model: ...&#10;gradients: ...&#10;optimizer state: ...&#10;randomness: ...">
+  <div class="q-text"><p>Write the JAX counterpart of each PyTorch fact, one line each: (a) a model is an object holding its weights; (b) <code>loss.backward()</code> fills <code>.grad</code> fields; (c) the optimizer mutates parameters in place; (d) the RNG is a hidden global behind <code>torch.manual_seed</code>.</p></div>
+  <div class="hint">The slogan: in PyTorch, state lives inside objects; in JAX, state is data you pass explicitly. For each item ask: where does that state now live, and how does it move?</div>
+  <div class="answer"><p>(a) A model is a pure function <code>forward(params, x)</code>; the weights enter as the <code>params</code> argument. (b) Gradients are a <em>return value</em>: <code>grads = jax.grad(loss_fn)(params, batch)</code>. (c) An update <em>returns a new</em> params dict — nothing is mutated, you rebind the name. (d) Randomness comes from explicit <code>key</code> values passed into every random call. One inversion covers all four: everything hidden becomes an explicit input or output.</p></div>
 </div>
 
-<div class="quiz" data-concept="ch1.html#what-jax-is" data-concept-label="§1.1–1.4 Synthesis">
-  <div class="q-text"><p>Closed book — translate this PyTorch fragment into idiomatic JAX (eager is fine; no <code>jit</code> needed yet):</p>
+<div class="quiz" data-concept="ch1.html#immutability" data-concept-label="§1.2 Immutability" data-min="60" data-placeholder="x = ...&#10;x = ...&#10;row = ...&#10;# why the copy is usually free: ...">
+  <div class="q-text"><p>Rewrite these three in-place NumPy/PyTorch operations as correct JAX, then add a one-line comment answering: why is the apparent copy usually free in compiled code?</p>
+<pre><code>x[3] = 7
+x[x &lt; 0] *= 0.1
+row[i] += g</code></pre></div>
+  <div class="hint">Every conversion has the same shape: <code>x = x.at[…].something(…)</code> — and you must rebind the name, because nothing was modified.</div>
+  <div class="answer"><pre><code>x = x.at[3].set(7)
+x = x.at[x &lt; 0].mul(0.1)        # or: x = jnp.where(x &lt; 0, x * 0.1, x)
+row = row.at[i].add(g)
+# under jit, XLA sees the old buffer is never used again and
+# compiles the "copy" into an in-place update — safety for free</code></pre><p>Forgetting to rebind (<code>x.at[3].set(7)</code> on its own line) is the classic silent bug: the new array is built and discarded, <code>x</code> is unchanged, nothing errors. Verify in your REPL that the original array really is untouched after <code>y = x.at[0].set(99)</code>.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch1.html#purity" data-concept-label="§1.3 Purity" data-min="100" data-placeholder="# (a) fixed:&#10;...&#10;# what failed silently: ...&#10;# (b) fixed:&#10;...">
+  <div class="q-text"><p>Both of these jit fine and silently misbehave. Write fixed, pure versions, each with a comment naming exactly what the original did at trace time:</p>
+<pre><code># (a) W is a module-level array your training loop reassigns each step
+def f(x):
+    return x @ W
+
+# (b) per-step logging
+def g(x):
+    print(x.mean())
+    return 2 * x</code></pre></div>
+  <div class="hint">JAX won't error on either. Ask what each does on call #2, after compilation: which values are frozen, which lines never run again?</div>
+  <div class="answer"><pre><code># (a): W was captured at trace time as a constant — reassigning the
+# global later did nothing; the compiled f used the original W forever.
+def f(x, W):                      # everything that varies is an argument
+    return x @ W
+
+# (b): print ran once during tracing (printing a tracer, not numbers),
+# then never again — the logging silently vanished from compiled code.
+def g(x):
+    return 2 * x, x.mean()        # return the metric instead
+# (or keep the print but use jax.debug.print, which is trace-aware)</code></pre><p>Purity contract: output depends only on explicit arguments; no side effects. JAX <em>assumes</em> it and never checks — impure code lies instead of crashing.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch1.html#prng" data-concept-label="§1.4 PRNG keys" data-min="100" data-placeholder="def init_two(key):&#10;    ...&#10;    return {'a': ..., 'b': ...}">
+  <div class="q-text"><p>Write <code>init_two(key)</code> returning a dict of two <em>independent</em> \(4\times4\) Gaussian matrices <code>a</code> and <code>b</code>, with correct key handling. Add a comment: what exactly would <code>a</code> and <code>b</code> be if you passed the same key to both <code>normal</code> calls, and why can't JAX raise an error for that? Run it: check <code>init_two(jax.random.PRNGKey(42))</code> twice returns identical dicts, and that <code>a != b</code> within one.</p></div>
+  <div class="hint">The pattern: <code>k1, k2 = jax.random.split(key)</code>, draw with each child once.</div>
+  <div class="answer"><pre><code>def init_two(key):
+    k1, k2 = jax.random.split(key)
+    return {"a": jax.random.normal(k1, (4, 4)),
+            "b": jax.random.normal(k2, (4, 4))}
+# same key for both: a and b bit-for-bit IDENTICAL — normal() is a
+# deterministic function of (key, shape). No error is possible because
+# replaying a key is indistinguishable from intentional replay.</code></pre><p>Both checks should pass: same input key ⇒ same dict (reproducibility by construction); split children ⇒ independent draws. The discipline: never use one key for two draws; split, use the child, carry the parent.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch1.html#prng" data-concept-label="§1.4 PRNG keys" data-min="40" data-placeholder="a vs b: ...&#10;c: ...&#10;d: ...&#10;reason: ...">
+  <div class="q-text"><p>Predict before running: which of <code>a</code>, <code>b</code>, <code>c</code>, <code>d</code> are equal?</p>
+<pre><code>key = jax.random.PRNGKey(0)
+a = jax.random.normal(key, (2,))
+key2, sub = jax.random.split(key)
+b = jax.random.normal(key, (2,))
+c = jax.random.normal(sub, (2,))
+d = jax.random.normal(jax.random.PRNGKey(0), (2,))</code></pre>
+<p>Write your prediction with the reason, then verify in the REPL.</p></div>
+  <div class="hint">Splitting does not consume or modify the parent key — keys are immutable values like everything else. What is <code>key</code> on line 4?</div>
+  <div class="answer"><p><code>a = b = d</code>; <code>c</code> is independent. Line 4 reuses the very same <code>key</code> value — <code>split</code> returned new keys but didn't (couldn't) mutate the old one, so <code>b</code> replays <code>a</code>'s draw. <code>d</code> rebuilds the same key from the same seed ⇒ same numbers. <code>c</code> uses a fresh child ⇒ independent. Moral: rebind the parent (<code>key, sub = jax.random.split(key)</code>) or you'll reuse it by accident.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch1.html#practicalities" data-concept-label="§1.5 Practicalities" data-min="80" data-placeholder="# corrected benchmark&#10;...">
+  <div class="q-text"><p>This benchmark concludes a jitted matmul takes 20 µs. Write the corrected version (there are <em>two</em> bugs: one about async dispatch, one about compilation), with a comment for each:</p>
+<pre><code>t0 = time.time()
+y = fast_matmul(a, b)
+print(time.time() - t0)</code></pre></div>
+  <div class="hint">JAX returns before the device finishes — what does <code>y</code> represent until then? And what does the <em>first</em> call to a jitted function include that later calls don't?</div>
+  <div class="answer"><pre><code>y = fast_matmul(a, b)             # warm-up: first call traces + compiles,
+y.block_until_ready()             # so never time it
+
+t0 = time.time()
+y = fast_matmul(a, b)
+y.block_until_ready()             # async dispatch: without this you time
+print(time.time() - t0)           # the enqueue, not the matmul</code></pre><p>Two fixes: exclude the compiling first call, and block on the result so the device work is actually finished inside the timed region.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch1.html#what-jax-is" data-concept-label="§1.1–1.4 Synthesis" data-min="140" data-placeholder="key = ...&#10;W = ...&#10;&#10;def predict(...):&#10;    ...&#10;&#10;W = ...">
+  <div class="q-text"><p>Chapter capstone. Translate this PyTorch fragment into idiomatic JAX, respecting all three habits — explicit keys, weights as data, no mutation:</p>
 <pre><code>torch.manual_seed(0)
 W = torch.randn(3, 2) * 0.1        # "the model"
 def predict(x):
     return torch.relu(x @ W)
-W += 0.01                           # nudge the weights in place</code></pre>
-<p>Your version must respect all three habits: explicit keys, weights as data, no mutation.</p></div>
+W += 0.01                           # nudge the weights in place</code></pre></div>
   <div class="hint">Three changes: the seed becomes a key passed to the init; <code>W</code> becomes an argument of <code>predict</code>; the in-place nudge becomes a rebinding.</div>
   <div class="answer"><pre><code>key = jax.random.PRNGKey(0)
 W = jax.random.normal(key, (3, 2)) * 0.1
@@ -160,7 +193,7 @@ W = jax.random.normal(key, (3, 2)) * 0.1
 def predict(W, x):                  # weights enter as an argument
     return jax.nn.relu(x @ W)
 
-W = W + 0.01                        # new array, rebound — nothing mutated</code></pre><p>Every piece of state is now visible: the RNG state is <code>key</code>, the model state is <code>W</code>, and "updating the model" means computing a new <code>W</code> and rebinding. Scale this dict-of-arrays pattern up and you have exactly how the transformer will work: <code>forward(params, tokens)</code>, with <code>params</code> threaded through a functional training loop.</p></div>
+W = W + 0.01                        # new array, rebound — nothing mutated</code></pre><p>Every piece of state is now visible: RNG state is <code>key</code>, model state is <code>W</code>, and "updating the model" means computing a new <code>W</code> and rebinding. Scale this up to a dict of arrays and you have exactly how the transformer will work: <code>forward(params, tokens)</code>, with <code>params</code> threaded through a functional training loop.</p></div>
 </div>
 
 </main>

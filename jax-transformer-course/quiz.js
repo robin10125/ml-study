@@ -1,4 +1,4 @@
-/* JAX transformer course — navigation, active-recall quiz engine, progress tracking */
+/* JAX transformer course — navigation, problem-set engine, progress tracking */
 
 const CHAPTERS = [
   { file: "index.html", title: "Course Home", short: "Home" },
@@ -18,6 +18,7 @@ function pageName() {
 
 function quizKey(page, i) { return "jaxtf-progress:" + page + ":" + i; }
 function totalKey(page) { return "jaxtf-total:" + page; }
+function workKey(page, i) { return "jaxtf-work:" + page + ":" + i; }
 
 /* ---------- sidebar ---------- */
 function buildSidebar() {
@@ -60,7 +61,13 @@ function buildPageNav() {
   document.querySelector("main").appendChild(nav);
 }
 
-/* ---------- quiz engine ---------- */
+/* ---------- problem-set engine ----------
+   Each .quiz block is one problem: a statement (.q-text), an editable code
+   workspace (injected here, persisted to localStorage), progressive hints
+   (.hint), and a reference solution (.answer) that stays locked until a
+   genuine attempt exists in the workspace.
+   Per-problem knobs: data-min (attempt length to unlock the reference,
+   default 40 chars), data-placeholder (workspace placeholder text).       */
 function enhanceQuizzes() {
   const page = pageName();
   const quizzes = document.querySelectorAll(".quiz");
@@ -69,8 +76,28 @@ function enhanceQuizzes() {
   quizzes.forEach((q, i) => {
     const label = document.createElement("div");
     label.className = "q-label";
-    label.textContent = "Recall " + (i + 1);
+    label.textContent = "Problem " + (i + 1);
     q.prepend(label);
+
+    // workspace: where the solution gets written
+    const ta = document.createElement("textarea");
+    ta.spellcheck = false;
+    ta.placeholder = q.dataset.placeholder ||
+      "# Write your solution here — real code, then run it in a REPL.";
+    ta.value = localStorage.getItem(workKey(page, i)) || "";
+    ta.addEventListener("keydown", (e) => {
+      if (e.key === "Tab") {
+        e.preventDefault();
+        const s = ta.selectionStart, t = ta.selectionEnd;
+        ta.value = ta.value.slice(0, s) + "    " + ta.value.slice(t);
+        ta.selectionStart = ta.selectionEnd = s + 4;
+      }
+    });
+    const ws = document.createElement("div");
+    ws.className = "workspace";
+    ws.appendChild(ta);
+    const qtext = q.querySelector(".q-text");
+    (qtext || label).insertAdjacentElement("afterend", ws);
 
     const controls = document.createElement("div");
     controls.className = "q-controls";
@@ -93,29 +120,41 @@ function enhanceQuizzes() {
       controls.appendChild(hb);
     }
 
-    // answer reveal with one "are you sure" step (active-recall nudge)
+    // reference solution, gated on a real attempt in the workspace
     const ans = q.querySelector(".answer");
+    const minLen = parseInt(q.dataset.min || "40", 10);
+    let ab = null, gate = null;
     if (ans) {
       const lbl = document.createElement("div");
       lbl.className = "ans-label";
-      lbl.textContent = "Solution";
+      lbl.textContent = "Reference solution";
       ans.prepend(lbl);
-      const ab = document.createElement("button");
+      ab = document.createElement("button");
       ab.className = "answer-btn";
-      ab.textContent = "Show solution";
-      let armed = false;
+      ab.textContent = "Compare with reference";
       ab.addEventListener("click", () => {
-        if (!armed) {
-          armed = true;
-          ab.classList.add("confirming");
-          ab.textContent = "Try recalling out loud first — click again to reveal";
-        } else {
-          ans.classList.add("shown");
-          ab.style.display = "none";
-        }
+        ans.classList.add("shown");
+        ab.style.display = "none";
+        if (gate) gate.style.display = "none";
       });
       controls.appendChild(ab);
+      gate = document.createElement("div");
+      gate.className = "gate-note";
+      gate.textContent =
+        `\u{1F512} Reference unlocks after a real attempt (${minLen}+ characters in the box).`;
     }
+
+    function updateGate() {
+      if (!ab) return;
+      const ok = ta.value.trim().length >= minLen;
+      ab.disabled = !ok;
+      if (gate) gate.style.display = ok ? "none" : "";
+    }
+    ta.addEventListener("input", () => {
+      localStorage.setItem(workKey(page, i), ta.value);
+      updateGate();
+    });
+    updateGate();
 
     // link back to the concept section
     const target = q.dataset.concept;
@@ -127,7 +166,7 @@ function enhanceQuizzes() {
       controls.appendChild(a);
     }
 
-    // mastery checkbox, persisted
+    // solved checkbox, persisted
     const wrap = document.createElement("label");
     wrap.className = "gotit";
     const cb = document.createElement("input");
@@ -138,10 +177,11 @@ function enhanceQuizzes() {
       updateProgressBar();
     });
     wrap.appendChild(cb);
-    wrap.appendChild(document.createTextNode(" recalled correctly from memory"));
+    wrap.appendChild(document.createTextNode(" solved it (before opening the reference)"));
     controls.appendChild(wrap);
 
     q.appendChild(controls);
+    if (gate) q.appendChild(gate);
   });
 
   // per-page progress bar
@@ -167,7 +207,7 @@ function updateProgressBar() {
     if (localStorage.getItem(quizKey(page, i)) === "1") done++;
   }
   bar.querySelector(".prog-text").textContent =
-    `Active recall: ${done} / ${total} mastered on this page`;
+    `Problem set: ${done} / ${total} solved on this page`;
   bar.querySelector(".bar-inner").style.width =
     total ? (100 * done) / total + "%" : "0";
 }
@@ -194,8 +234,8 @@ function buildDashboard() {
   }
   if (grandTotal > 0) {
     html += `<p style="margin-top:0.8rem; color: var(--ink-soft); font-size:0.9rem">` +
-      `Total: <strong>${grandDone}/${grandTotal}</strong> recalls mastered. ` +
-      `Revisit unmastered ones tomorrow, then in three days — spacing beats cramming.</p>`;
+      `Total: <strong>${grandDone}/${grandTotal}</strong> problems solved. ` +
+      `Come back to unsolved ones tomorrow, then in three days — spacing beats cramming.</p>`;
   }
   el.innerHTML = html;
 }

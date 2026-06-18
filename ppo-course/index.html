@@ -13,15 +13,14 @@
 <body>
 <main>
 <h1>Proximal Policy Optimization, <span class="chapno">from first principles</span></h1>
-<p class="subtitle">A rigorous, recall-driven course. By the end you will have derived the policy gradient theorem, GAE, the performance difference lemma, TRPO's natural-gradient trust region, and PPO's clipped surrogate — and written a PPO that solves CartPole, from scratch, with every line accounted for.</p>
+<p class="subtitle">A rigorous course in seven chapters. By the end you will have derived the policy gradient theorem, GAE, the performance difference lemma, TRPO's natural-gradient trust region, and PPO's clipped surrogate — and written a PPO that solves CartPole, from scratch, with every line accounted for.</p>
 
 <h2>How this course works</h2>
-<p>Reading about RL produces a comfortable illusion of understanding that evaporates at the keyboard. This course is built around <strong>active recall</strong>: every section is followed by recall boxes asking you to reproduce — not recognize — the material. The rules:</p>
+<p>Each chapter is a short textbook — definitions, derivations, worked examples — followed by a <strong>problem set</strong>. The problems are where the course actually happens: you write the derivation or the code in the box (it saves automatically), and the mathematical core is machine-checked by the companion code. The mechanics:</p>
 <ul>
-<li><strong>Attempt before revealing.</strong> Say or write your answer first. Each recall has progressive <em>hints</em> (use them — a hinted recall beats a peeked answer), a <em>solution</em>, and a <em>📖 Review</em> link jumping to the exact section that teaches the concept, for when the attempt fails.</li>
-<li><strong>Check the box only for honest, unaided successes.</strong> Progress is stored locally per chapter and aggregated below.</li>
-<li><strong>Space it.</strong> Revisit failed recalls the next day, then after three days. The sidebar counts are your map of what's still soft.</li>
-<li><strong>Derive on paper.</strong> The proofs here (log-derivative trick, baseline unbiasedness, GAE telescoping, performance difference lemma, natural gradient step) are short — two to six lines each — and every one is asked again later as a recall. Paper, not eyes.</li>
+<li><strong>Write before you look.</strong> Every problem has a workspace, progressive <em>hints</em>, and a reference solution that stays locked until you've made a genuine attempt. A <em>📖 Review</em> link jumps to the section the problem draws on, for when you need to re-read.</li>
+<li><strong>Verify what's verifiable.</strong> The proofs here (log-derivative trick, baseline unbiasedness, GAE telescoping, performance difference lemma, natural gradient step) are two to six lines each — write them in full. Where a problem has a numeric or coded answer, <code>test_ppo_core.py</code> is the grader; use it before comparing with the reference.</li>
+<li><strong>Check the box only for problems you solved before opening the reference.</strong> Progress is stored locally per chapter and aggregated below; come back to unsolved problems a day later, then after three days.</li>
 </ul>
 
 <h2>Your progress</h2>

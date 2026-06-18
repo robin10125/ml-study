@@ -13,7 +13,7 @@
 <body>
 <main>
 <h1><span class="chapno">Chapter 1</span> · MDPs, Returns &amp; Value Functions</h1>
-<p class="subtitle">PPO is the last link in a chain of ideas: MDP &rarr; policy gradient &rarr; advantage estimation &rarr; trust regions &rarr; clipping. This chapter nails the vocabulary every later derivation is written in. None of it is hard, but all of it must be <em>automatic</em> — by the end you should produce every definition from memory, unprompted.</p>
+<p class="subtitle">PPO is the last link in a chain of ideas: MDP &rarr; policy gradient &rarr; advantage estimation &rarr; trust regions &rarr; clipping. This chapter nails the vocabulary every later derivation is written in. None of it is hard, but all of it must be <em>automatic</em> — the problem set at the end has you produce every definition and identity yourself, and every later chapter assumes they are reflexes.</p>
 
 <h2 id="mdp">1.1 The Markov Decision Process</h2>
 <p>Reinforcement learning formalizes "an agent acting in a world" as a <strong>Markov Decision Process</strong>. At each timestep \(t\) the agent observes a state, picks an action, the world responds with a new state and a scalar reward, repeat.</p>
@@ -53,13 +53,6 @@ $$ \hat{R}_t = \sum_{k=t}^{\infty} \gamma^{\,k-t}\, r_k = r_t + \gamma r_{t+1} +
 
 <p>Why discount? Three reasons, in decreasing order of honesty: (1) it makes the infinite sum converge (since \(|R| \le r_{\max}/(1-\gamma)\)); (2) it expresses that near-term reward is more controllable and more certain than far-future reward; (3) it acts as a <em>variance knob</em> — smaller \(\gamma\) means shorter effective horizon \(\approx 1/(1-\gamma)\), hence less noise in return estimates, at the price of myopia. With \(\gamma = 0.99\), the effective horizon is about 100 steps.</p>
 
-<div class="quiz" data-concept="ch1.html#returns" data-concept-label="§1.3 Trajectories and returns">
-  <div class="q-text"><p>From memory: (a) write the trajectory probability \(p_\theta(\tau)\) as a product, and say which factors depend on \(\theta\); (b) define reward-to-go \(\hat R_t\) and state its one-step recursion; (c) give the effective-horizon rule of thumb for \(\gamma\) and the bound that makes the infinite discounted sum finite.</p></div>
-  <div class="hint">The trajectory factorizes into one initial-state term and, per step, one policy term and one dynamics term.</div>
-  <div class="hint">For (c): geometric series. \(\sum_t \gamma^t = 1/(1-\gamma)\).</div>
-  <div class="answer"><p>(a) \(p_\theta(\tau) = \rho_0(s_0)\prod_t \pi_\theta(a_t|s_t) P(s_{t+1}|s_t,a_t)\); only the \(\pi_\theta\) factors depend on \(\theta\) — \(\rho_0\) and \(P\) belong to the environment. (b) \(\hat R_t = \sum_{k\ge t}\gamma^{k-t} r_k\), with \(\hat R_t = r_t + \gamma \hat R_{t+1}\). (c) Effective horizon \(\approx 1/(1-\gamma)\) (e.g. 100 for \(\gamma=0.99\)); \(|R(\tau)| \le r_{\max} \sum_t \gamma^t = r_{\max}/(1-\gamma)\).</p></div>
-</div>
-
 <h2 id="objective">1.4 The objective</h2>
 <p>Everything we do from here on is maximization of one number:</p>
 <div class="box keypoint"><div class="box-title">The RL objective</div>
@@ -82,33 +75,9 @@ $$ V^\pi(s) = \mathbb{E}_{a \sim \pi(\cdot|s)}\big[ Q^\pi(s,a) \big] \qquad\Long
 $$ V^\pi(s) = \mathbb{E}_{a\sim\pi}\Big[ r(s,a) + \gamma\, \mathbb{E}_{s'\sim P}\big[ V^\pi(s') \big] \Big], \qquad Q^\pi(s,a) = r(s,a) + \gamma\, \mathbb{E}_{s'\sim P}\big[ V^\pi(s') \big]. $$
 <p>These are <em>consistency conditions</em>: the value of now equals immediate reward plus discounted value of next. Chapter 3 turns the residual of this equation (the TD error) into the centerpiece of advantage estimation.</p>
 
-<div class="quiz" data-concept="ch1.html#values" data-concept-label="§1.5 Value functions">
-  <div class="q-text"><p>Define \(V^\pi\), \(Q^\pi\), \(A^\pi\) from memory. Then prove, in one line, that \(\mathbb{E}_{a\sim\pi(\cdot|s)}[A^\pi(s,a)] = 0\), and explain in one sentence why this property makes the advantage the natural learning signal for a policy.</p></div>
-  <div class="hint">Start from \(V^\pi(s) = \mathbb{E}_{a\sim\pi}[Q^\pi(s,a)]\) and substitute into the definition of \(A\).</div>
-  <div class="answer"><p>\(V^\pi(s)=\mathbb{E}_\pi[\hat R_t|s_t=s]\); \(Q^\pi(s,a)=\mathbb{E}_\pi[\hat R_t|s_t=s,a_t=a]\); \(A^\pi = Q^\pi - V^\pi\). Proof: \(\mathbb{E}_{a\sim\pi}[A^\pi(s,a)] = \mathbb{E}_{a\sim\pi}[Q^\pi(s,a)] - V^\pi(s) = V^\pi(s) - V^\pi(s) = 0\). Because it is centered at the policy's own average, its <em>sign</em> classifies actions into better-than-usual (reinforce) and worse-than-usual (suppress) — no global scale of "goodness" needed.</p></div>
-</div>
-
-<div class="quiz" data-concept="ch1.html#values" data-concept-label="§1.5 Bellman equations">
-  <div class="q-text"><p>Write both Bellman expectation equations (for \(V^\pi\) and \(Q^\pi\)) from memory, and express \(A^\pi(s,a)\) using only \(r\), \(\gamma\), \(V^\pi\), and an expectation over \(s'\).</p></div>
-  <div class="hint">For the last part: substitute the Bellman form of \(Q^\pi\) into \(A = Q - V\).</div>
-  <div class="answer"><p>\(V^\pi(s) = \mathbb{E}_{a\sim\pi}[r(s,a) + \gamma \mathbb{E}_{s'}[V^\pi(s')]]\) and \(Q^\pi(s,a) = r(s,a) + \gamma\mathbb{E}_{s'}[V^\pi(s')]\). Hence \(A^\pi(s,a) = r(s,a) + \gamma \mathbb{E}_{s'\sim P}[V^\pi(s')] - V^\pi(s)\) — the expected one-step TD error, foreshadowing §3.3.</p></div>
-</div>
-
 <h2 id="onpolicy">1.6 On-policy vs off-policy — where PPO sits</h2>
 <p>An algorithm is <strong>on-policy</strong> if it can only learn from data generated by the <em>current</em> policy, and <strong>off-policy</strong> if it can consume data from other (older, or entirely different) policies. The policy gradient is, by its definition as an expectation over \(\tau \sim p_\theta\), an on-policy object: data collected under \(\pi_{\theta_{\text{old}}}\) estimates \(\nabla J(\theta_{\text{old}})\), not \(\nabla J(\theta)\) for the \(\theta\) you have after a few updates.</p>
 <p>This sets up the tension the whole course resolves. On-policy purity says: take one gradient step, throw the batch away. Sample efficiency says: squeeze each expensive batch harder. Importance sampling (§4.3) lets you reuse slightly-stale data <em>provided the policy hasn't moved far</em> — and "hasn't moved far" is exactly what TRPO enforces with a constraint and PPO with a clip. PPO is best described as <em>on-policy with a small, controlled off-policy tolerance</em>.</p>
-
-<div class="quiz" data-concept="ch1.html#onpolicy" data-concept-label="§1.6 On-policy vs off-policy">
-  <div class="q-text"><p>Why is the vanilla policy gradient an on-policy quantity, and what is the precise sense in which PPO relaxes this? (Name the mechanism that licenses reusing data and the mechanism that limits the reuse.)</p></div>
-  <div class="hint">Whose distribution does the expectation in \(J(\theta)\) run over?</div>
-  <div class="answer"><p>\(\nabla J(\theta)\) is an expectation over trajectories drawn from \(p_\theta\) itself, so an unbiased estimate needs fresh samples from the current policy. PPO reuses one batch for several epochs by correcting with the importance ratio \(r_t(\theta) = \pi_\theta(a_t|s_t)/\pi_{\theta_{\text{old}}}(a_t|s_t)\) (licenses reuse), while clipping that ratio to \([1-\epsilon, 1+\epsilon]\) (limits how stale/far the reuse can drift). It stays an on-policy method: each batch is still discarded after a few epochs.</p></div>
-</div>
-
-<div class="quiz" data-concept="ch1.html#objective" data-concept-label="§1.4 The objective">
-  <div class="q-text"><p>State the single structural property of \(J(\theta)\) that distinguishes RL optimization from supervised learning, and trace one concrete failure chain it enables (three arrows or fewer).</p></div>
-  <div class="hint">In supervised learning, the data distribution is fixed. Here?</div>
-  <div class="answer"><p>In \(J(\theta) = \mathbb{E}_{\tau\sim p_\theta}[R(\tau)]\) the sampling distribution itself depends on \(\theta\): changing the policy changes which states you ever see. Failure chain: one oversized gradient step makes the policy much worse &rarr; the now-bad policy collects only bad/uninformative states &rarr; gradients estimated on that data cannot find the way back. In supervised learning a bad step is recoverable because the data doesn't move; here it can be effectively permanent — the motivation for trust regions (Chapter 4–5).</p></div>
-</div>
 
 <h2 id="notation">1.7 Notation table (used in every later chapter)</h2>
 <table>
@@ -124,8 +93,40 @@ $$ V^\pi(s) = \mathbb{E}_{a\sim\pi}\Big[ r(s,a) + \gamma\, \mathbb{E}_{s'\sim P}
 <tr><td>\(\epsilon\)</td><td>PPO clip range, typically 0.1–0.3 (Ch 6)</td></tr>
 </table>
 
-<div class="box recall-pause"><div class="box-title">Before moving on</div>
-<p>Close this page and write out, on paper: the MDP tuple, \(p_\theta(\tau)\), \(\hat R_t\) and its recursion, the three value functions, both Bellman equations, and \(J(\theta)\). If any required peeking, redo it tomorrow. Chapter 2 assumes all of them are reflexes.</p>
+<h2 id="problems">Problem set</h2>
+<p>Every later chapter is written in this chapter's vocabulary, so all of it has to come out of your pen, not off the page. Work each problem in the box — definitions, algebra and all — before comparing with the reference.</p>
+
+<div class="quiz" data-concept="ch1.html#returns" data-concept-label="§1.3 Trajectories and returns" data-min="80"
+     data-placeholder="p_theta(tau) =&#10;R_hat_t = ...        recursion: R_hat_t = ...&#10;effective horizon ~ ...      |R(tau)| <= ...&#10;check: rewards (1,2,3), gamma=0.5  ->  R_hat = ?">
+  <div class="q-text"><p>(a) Write the trajectory probability \(p_\theta(\tau)\) as a product, marking which factors depend on \(\theta\). (b) Define reward-to-go \(\hat R_t\) and write its one-step recursion. (c) Give the effective-horizon rule of thumb for \(\gamma\) and the bound that keeps the infinite discounted sum finite. Numeric check: run your recursion backward over rewards \((1, 2, 3)\) with \(\gamma = 0.5\) — you should get \(\hat R_2 = 3\), \(\hat R_1 = 3.5\), \(\hat R_0 = 2.75\).</p></div>
+  <div class="hint">The trajectory factorizes into one initial-state term and, per step, one policy term and one dynamics term.</div>
+  <div class="hint">For (c): geometric series. \(\sum_t \gamma^t = 1/(1-\gamma)\).</div>
+  <div class="answer"><p>(a) \(p_\theta(\tau) = \rho_0(s_0)\prod_t \pi_\theta(a_t|s_t) P(s_{t+1}|s_t,a_t)\); only the \(\pi_\theta\) factors depend on \(\theta\) — \(\rho_0\) and \(P\) belong to the environment. (b) \(\hat R_t = \sum_{k\ge t}\gamma^{k-t} r_k\), with \(\hat R_t = r_t + \gamma \hat R_{t+1}\). (c) Effective horizon \(\approx 1/(1-\gamma)\) (e.g. 100 for \(\gamma=0.99\)); \(|R(\tau)| \le r_{\max} \sum_t \gamma^t = r_{\max}/(1-\gamma)\). Check: \(\hat R_2 = 3\), \(\hat R_1 = 2 + 0.5\cdot 3 = 3.5\), \(\hat R_0 = 1 + 0.5\cdot 3.5 = 2.75\).</p></div>
+</div>
+
+<div class="quiz" data-concept="ch1.html#values" data-concept-label="§1.5 Value functions" data-min="80">
+  <div class="q-text"><p>Define \(V^\pi\), \(Q^\pi\), and \(A^\pi\). Then prove, in one line, that \(\mathbb{E}_{a\sim\pi(\cdot|s)}[A^\pi(s,a)] = 0\), and add one sentence on why this property makes the advantage the natural learning signal for a policy.</p></div>
+  <div class="hint">Start from \(V^\pi(s) = \mathbb{E}_{a\sim\pi}[Q^\pi(s,a)]\) and substitute into the definition of \(A\).</div>
+  <div class="answer"><p>\(V^\pi(s)=\mathbb{E}_\pi[\hat R_t|s_t=s]\); \(Q^\pi(s,a)=\mathbb{E}_\pi[\hat R_t|s_t=s,a_t=a]\); \(A^\pi = Q^\pi - V^\pi\). Proof: \(\mathbb{E}_{a\sim\pi}[A^\pi(s,a)] = \mathbb{E}_{a\sim\pi}[Q^\pi(s,a)] - V^\pi(s) = V^\pi(s) - V^\pi(s) = 0\). Because it is centered at the policy's own average, its <em>sign</em> classifies actions into better-than-usual (reinforce) and worse-than-usual (suppress) — no global scale of "goodness" needed.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch1.html#values" data-concept-label="§1.5 Bellman equations" data-min="80"
+     data-placeholder="V_pi(s) = ...&#10;Q_pi(s,a) = ...&#10;A_pi(s,a) = ...">
+  <div class="q-text"><p>Write both Bellman expectation equations (for \(V^\pi\) and \(Q^\pi\)), then express \(A^\pi(s,a)\) using only \(r\), \(\gamma\), \(V^\pi\), and an expectation over \(s'\).</p></div>
+  <div class="hint">For the last part: substitute the Bellman form of \(Q^\pi\) into \(A = Q - V\).</div>
+  <div class="answer"><p>\(V^\pi(s) = \mathbb{E}_{a\sim\pi}[r(s,a) + \gamma \mathbb{E}_{s'}[V^\pi(s')]]\) and \(Q^\pi(s,a) = r(s,a) + \gamma\mathbb{E}_{s'}[V^\pi(s')]\). Hence \(A^\pi(s,a) = r(s,a) + \gamma \mathbb{E}_{s'\sim P}[V^\pi(s')] - V^\pi(s)\) — the expected one-step TD error, foreshadowing §3.3.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch1.html#onpolicy" data-concept-label="§1.6 On-policy vs off-policy" data-min="60">
+  <div class="q-text"><p>Explain why the vanilla policy gradient is an on-policy quantity, and the precise sense in which PPO relaxes this. Name the mechanism that licenses reusing data and the mechanism that limits the reuse.</p></div>
+  <div class="hint">Whose distribution does the expectation in \(J(\theta)\) run over?</div>
+  <div class="answer"><p>\(\nabla J(\theta)\) is an expectation over trajectories drawn from \(p_\theta\) itself, so an unbiased estimate needs fresh samples from the current policy. PPO reuses one batch for several epochs by correcting with the importance ratio \(r_t(\theta) = \pi_\theta(a_t|s_t)/\pi_{\theta_{\text{old}}}(a_t|s_t)\) (licenses reuse), while clipping that ratio to \([1-\epsilon, 1+\epsilon]\) (limits how stale/far the reuse can drift). It stays an on-policy method: each batch is still discarded after a few epochs.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch1.html#objective" data-concept-label="§1.4 The objective" data-min="60">
+  <div class="q-text"><p>State the single structural property of \(J(\theta)\) that distinguishes RL optimization from supervised learning, and trace one concrete failure chain it enables (three steps or fewer).</p></div>
+  <div class="hint">In supervised learning, the data distribution is fixed. Here?</div>
+  <div class="answer"><p>In \(J(\theta) = \mathbb{E}_{\tau\sim p_\theta}[R(\tau)]\) the sampling distribution itself depends on \(\theta\): changing the policy changes which states you ever see. Failure chain: one oversized gradient step makes the policy much worse &rarr; the now-bad policy collects only bad/uninformative states &rarr; gradients estimated on that data cannot find the way back. In supervised learning a bad step is recoverable because the data doesn't move; here it can be effectively permanent — the motivation for trust regions (Chapter 4–5).</p></div>
 </div>
 
 </main>
