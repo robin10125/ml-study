@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 2 · Autograd: backward(), .grad &amp; no_grad</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 2</span> · Autograd: backward(), .grad &amp; no_grad</h1>
+<p class="subtitle">PyTorch trains models by recording every operation into a graph and walking it backwards. Most of the time this machinery is invisible — you call <code>loss.backward()</code> and gradients appear. But "invisible" is where the bugs live: forgotten <code>zero_grad()</code>, tensors that silently grow the graph, the <code>.grad</code> that's <code>None</code>. This chapter makes the machinery explicit so none of it surprises you.</p>
+
+<h2 id="requires-grad">2.1 requires_grad: opting a tensor into the graph</h2>
+<p>By default a tensor is just data. Set <code>requires_grad=True</code> and PyTorch starts <strong>recording</strong> every operation that uses it, building a graph it can later differentiate:</p>
+<pre><code>x = torch.tensor([2.0], requires_grad=True)
+y = x ** 2 + 3 * x          # y is now a node that REMEMBERS it came from x
+y.grad_fn                    # &lt;AddBackward0&gt; — the recorded operation
+</code></pre>
+<p>Any tensor produced from a <code>requires_grad</code> tensor inherits the flag and a <code>grad_fn</code> — a back-pointer to the operation that made it. Chains of these form the <strong>computation graph</strong>: a record of how the final scalar was computed, edge by edge, back to the inputs. <code>nn.Parameter</code> (Chapter 3) sets <code>requires_grad=True</code> for you, which is why model weights are trainable without you ever touching the flag.</p>
+
+<h2 id="backward">2.2 What backward() actually does</h2>
+<p>Calling <code>.backward()</code> on a scalar walks the graph from that scalar back to every leaf with <code>requires_grad=True</code>, computing \(\partial(\text{scalar})/\partial(\text{leaf})\) by the chain rule, and <strong>deposits the result in each leaf's <code>.grad</code> attribute</strong>:</p>
+<pre><code>x = torch.tensor([2.0], requires_grad=True)
+y = x ** 2 + 3 * x          # dy/dx = 2x + 3
+y.backward()                 # walks the graph, fills x.grad
+x.grad                       # tensor([7.])  — 2*2 + 3
+</code></pre>
+<div class="box keypoint"><div class="box-title">Gradients are a side effect deposited in .grad</div>
+<p>This is the central PyTorch idiom and the one most unlike a "pure" framework: <code>backward()</code> returns nothing. It mutates the <code>.grad</code> field of every leaf tensor as a side effect. The optimizer then reads those <code>.grad</code> fields to update the weights. So a training step is a three-party conversation: the loss's <code>backward()</code> writes <code>.grad</code>, the optimizer's <code>step()</code> reads it, and <code>zero_grad()</code> clears it for next time.</p>
+</div>
+<p><code>.backward()</code> must be called on a <strong>scalar</strong> (a single number) — which your loss always is. On a non-scalar you'd have to pass a gradient vector (<code>y.backward(v)</code>), which you almost never do in training; if you see that error, you forgot to reduce your loss to a scalar with <code>.mean()</code> or <code>.sum()</code>.</p>
+
+<h2 id="accumulate">2.3 .grad accumulates — hence zero_grad()</h2>
+<p>Here is the behavior that bites every beginner: <code>backward()</code> <strong>adds</strong> to <code>.grad</code>; it does not overwrite it.</p>
+<pre><code>x = torch.tensor([1.0, 2.0], requires_grad=True)
+(x ** 2).sum().backward()    # d/dx = 2x
+x.grad                        # tensor([2., 4.])
+(x ** 2).sum().backward()    # again — WITHOUT clearing
+x.grad                        # tensor([4., 8.])  — DOUBLED, not recomputed
+</code></pre>
+<p>So between training steps you must reset gradients to zero, or each step's gradient piles onto the last and your updates are garbage:</p>
+<pre><code>optimizer.zero_grad()        # set every parameter's .grad to 0 (or None)
+loss.backward()              # accumulate this step's gradient
+optimizer.step()             # update using .grad
+</code></pre>
+<div class="box warning"><div class="box-title">Forgetting zero_grad() is the #1 silent training bug</div>
+<p>Nothing errors. Your gradients just accumulate across steps, so effectively your learning rate balloons and loss diverges or thrashes. If a training loop "explodes" for no clear reason, check that <code>zero_grad()</code> is there and is actually being called every step. (The accumulation isn't a mistake in the design — it's what lets you sum gradients over several mini-batches before stepping. But unless you want that, clear every step.)</p>
+</div>
+
+<h2 id="nograd">2.4 Turning autograd off: no_grad, inference_mode, detach</h2>
+<p>Recording the graph costs memory and time. Whenever you're <em>not</em> going to call <code>backward()</code> — evaluation, generation, applying the optimizer update — you should switch recording off. Three tools, by scope:</p>
+<pre><code>with torch.no_grad():            # a block: nothing inside is recorded
+    val_logits = model(val_x)    # forward pass with no graph, less memory
+
+@torch.no_grad()                 # same thing as a decorator on a function
+def generate(model, idx): ...
+
+z = y.detach()                   # one tensor: z shares y's data but is
+                                 # cut out of the graph (requires_grad=False)
+</code></pre>
+<p><code>torch.inference_mode()</code> is a newer, stricter (slightly faster) version of <code>no_grad</code> for pure inference; <code>no_grad</code> is the safe default. Use a <code>no_grad</code> block around your whole eval/generation routine; use <code>.detach()</code> when you want to pull one value out of the graph mid-computation (e.g., to use a model's output as a fixed target).</p>
+<div class="box keypoint"><div class="box-title">detach vs .item() vs .data</div>
+<p><code>x.detach()</code> → a tensor sharing storage but off the graph (still on the GPU, still a tensor). <code>x.item()</code> → a single value pulled out as a plain Python <code>float</code>/<code>int</code> (only for one-element tensors; use it for logging). <code>x.data</code> → legacy, avoid: it bypasses autograd's safety checks. Reach for <code>detach</code> or <code>item</code>, never <code>.data</code>.</p>
+</div>
+
+<h2 id="leaf">2.5 Leaf vs non-leaf, and why .grad is sometimes None</h2>
+<p>A <strong>leaf</strong> tensor is one you created directly with <code>requires_grad=True</code> (your parameters and inputs) — it sits at the edge of the graph. A <strong>non-leaf</strong> is any tensor computed from others (intermediate activations). After <code>backward()</code>, <strong>only leaves keep their <code>.grad</code></strong>; intermediates' gradients are computed, used, and discarded to save memory.</p>
+<pre><code>x = torch.tensor([2.0], requires_grad=True)   # leaf
+y = x * 3                                       # non-leaf
+z = y.sum()
+z.backward()
+x.grad        # tensor([3.])  — kept
+y.grad        # None + a warning — intermediates don't retain grad
+</code></pre>
+<p>Two more ways you end up with a surprising <code>None</code> gradient:</p>
+<ul>
+<li><strong>The tensor never had <code>requires_grad=True</code></strong> — e.g. you built a parameter as a plain <code>torch.randn(...)</code> without wrapping it in <code>nn.Parameter</code>. No flag, no graph, no grad.</li>
+<li><strong>You broke the graph.</strong> Any <code>.detach()</code>, <code>.item()</code>, <code>no_grad</code> block, or conversion to NumPy in the path from parameter to loss severs the chain; gradient can't flow back through the cut. A model whose loss won't go down sometimes has an accidental <code>.detach()</code> in <code>forward</code>.</li>
+</ul>
+
+<h2 id="step">2.6 The shape of one training step</h2>
+<p>Everything above assembles into the loop you'll write for the rest of your life. Memorize the order:</p>
+<pre><code>optimizer.zero_grad()           # 1. clear last step's accumulated grads
+logits = model(inputs)          # 2. forward — builds the graph
+loss = loss_fn(logits, targets) # 3. a scalar at the graph's root
+loss.backward()                 # 4. backward — fills every param's .grad
+optimizer.step()                # 5. update params using .grad (under no_grad)
+</code></pre>
+<p>The optimizer was handed <code>model.parameters()</code> at construction, so it knows which tensors to read <code>.grad</code> from and update. Its <code>step()</code> mutates the weights in place inside its own <code>no_grad</code> region — which is the legitimate use of in-place ops from Chapter 1. Chapter 4 builds this loop out in full; for now, know that <em>autograd's entire contract is steps 1, 4, and 5</em>.</p>
+
+<h2 id="problems">Problem set</h2>
+<p>Run every one of these in a live session and inspect <code>.grad</code> with your own eyes — autograd is best learned by poking it. The reference unlocks after a genuine attempt.</p>
+
+<div class="quiz" data-concept="ch2.html#backward" data-concept-label="§2.2 backward()" data-min="80" data-placeholder="x = torch.tensor([3.0], requires_grad=True)&#10;y = ...&#10;# y.backward()&#10;# x.grad should be ...&#10;# verify:">
+  <div class="q-text"><p>Let <code>f(x) = x³ + 2x</code>. Build it in PyTorch for <code>x = 3.0</code>, call <code>backward()</code>, and read <code>x.grad</code>. Predict the value first (compute <code>f'(3)</code> by hand), then confirm PyTorch agrees. In a comment, state what <code>backward()</code> returned and where the gradient actually went.</p></div>
+  <div class="hint">f'(x) = 3x² + 2, so f'(3) = 29. <code>x.grad</code> is filled as a side effect; <code>backward()</code> itself returns <code>None</code>.</div>
+  <div class="answer"><pre><code>x = torch.tensor([3.0], requires_grad=True)
+y = x ** 3 + 2 * x
+y.backward()
+x.grad                  # tensor([29.])  — 3*3^2 + 2
+# backward() returned None; the gradient was deposited into x.grad as a
+# side effect. That .grad field is exactly what an optimizer reads.</code></pre></div>
+</div>
+
+<div class="quiz" data-concept="ch2.html#accumulate" data-concept-label="§2.3 Accumulation" data-min="100" data-placeholder="w = torch.tensor([1.0, 2.0], requires_grad=True)&#10;# call backward twice without clearing; record w.grad each time&#10;# then show the zero_grad-style fix">
+  <div class="q-text"><p>Demonstrate gradient accumulation: with <code>w = torch.tensor([1.0, 2.0], requires_grad=True)</code>, compute <code>(w**2).sum()</code> and call <code>backward()</code> twice <em>without</em> clearing, printing <code>w.grad</code> after each. Explain the second value. Then show how to get the correct (un-doubled) gradient on the second pass by clearing <code>w.grad</code> first.</p></div>
+  <div class="hint">d/dw of (w²).sum() is 2w = [2, 4]. backward() adds to .grad, so a second call gives [4, 8]. To clear a raw tensor's grad: <code>w.grad.zero_()</code> or <code>w.grad = None</code>.</div>
+  <div class="answer"><pre><code>w = torch.tensor([1.0, 2.0], requires_grad=True)
+(w ** 2).sum().backward(); print(w.grad)   # [2., 4.]
+(w ** 2).sum().backward(); print(w.grad)   # [4., 8.]  -> ADDED, not recomputed
+# the second backward accumulated another [2,4] onto the existing [2,4].
+
+w.grad = None                              # (what optimizer.zero_grad does)
+(w ** 2).sum().backward(); print(w.grad)   # [2., 4.]  -> correct again</code></pre><p>This is exactly why every training loop calls <code>optimizer.zero_grad()</code> before <code>loss.backward()</code>. It's check 6 of <code>test_torch_core.py</code>.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch2.html#nograd" data-concept-label="§2.4 no_grad / detach" data-min="100" data-placeholder="# (a) eval without building a graph&#10;# (b) running total for logging&#10;# (c) detach vs item vs no_grad — when each">
+  <div class="q-text"><p>Three situations — write the idiomatic PyTorch for each and name the tool. (a) Run <code>model(x)</code> for evaluation, where you will not call <code>backward()</code>. (b) Keep a running <code>float</code> sum of the loss across steps for printing. (c) Use a model output <code>y</code> as a <em>fixed target</em> for another loss, so no gradient flows back through it.</p></div>
+  <div class="hint">(a) a <code>with torch.no_grad():</code> block. (b) <code>loss.item()</code>. (c) <code>y.detach()</code>. Match the scope: block, scalar-extraction, single-tensor-cut.</div>
+  <div class="answer"><pre><code># (a) no_grad block: no graph built, less memory, faster
+with torch.no_grad():
+    val_logits = model(x)
+
+# (b) .item() pulls a Python float out, detached from the graph
+running += loss.item()
+
+# (c) .detach() cuts y from the graph; the other loss sees it as a constant
+target = y.detach()
+aux_loss = ((pred - target) ** 2).mean()</code></pre><p>Rule of thumb: <code>no_grad</code> for a region you won't backprop, <code>detach</code> for one tensor mid-graph, <code>item</code> to leave Tensor-land entirely.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch2.html#leaf" data-concept-label="§2.5 Leaf / None grad" data-min="120" data-placeholder="# For each, will p.grad be populated after loss.backward()? Why?&#10;# (a) p = torch.randn(4, requires_grad=True); loss = (p**2).sum()&#10;# (b) p = torch.randn(4); loss = (p**2).sum()&#10;# (c) p = torch.randn(4, requires_grad=True); loss = (p.detach()**2).sum()">
+  <div class="q-text"><p>For each, decide whether <code>p.grad</code> is populated after <code>loss.backward()</code> and give the one-line reason. (a) <code>p = torch.randn(4, requires_grad=True)</code>, <code>loss = (p**2).sum()</code>. (b) same but no <code>requires_grad</code>. (c) <code>requires_grad=True</code> but <code>loss = (p.detach()**2).sum()</code>. (Note: (b) and (c) won't even let you call <code>backward</code> — explain.)</p></div>
+  <div class="hint">Gradient flows only along an unbroken chain of <code>requires_grad</code> tensors from the loss back to a leaf. No flag, or a <code>.detach()</code> in the path, breaks the chain.</div>
+  <div class="answer"><pre><code># (a) YES. p is a leaf with requires_grad=True and an unbroken graph to
+#     the loss; p.grad gets 2p.
+# (b) NO. p never required grad, so loss has no grad_fn; calling
+#     loss.backward() errors ("does not require grad / has no grad_fn").
+# (c) NO. detach() cut p out before the square, so the loss doesn't depend
+#     on p through the graph — again no grad_fn, backward() errors. p.grad
+#     stays None.</code></pre><p>Moral: a stray <code>.detach()</code> (or building a weight as a bare <code>torch.randn</code> instead of <code>nn.Parameter</code>) is why a model sometimes "won't train" — the gradient literally cannot reach it.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch2.html#step" data-concept-label="§2.6 The training step" data-min="120" data-placeholder="# write the 5 lines in the correct order, with a word on what each does&#10;optimizer.zero_grad()&#10;...">
+  <div class="q-text"><p>From memory, write the five lines of one training step in the correct order — zero, forward, loss, backward, step — annotating each with the autograd role it plays (which line builds the graph? which reads <code>.grad</code>? which writes it?). Then answer: what goes wrong if you swap the order of <code>backward()</code> and <code>zero_grad()</code>?</p></div>
+  <div class="hint">Order: zero_grad → forward → loss → backward → step. <code>zero_grad</code> must come <em>before</em> <code>backward</code>, or it wipes the gradient you just computed.</div>
+  <div class="answer"><pre><code>optimizer.zero_grad()            # clear last step's accumulated .grad
+logits = model(inputs)           # forward: BUILDS the graph
+loss = loss_fn(logits, targets)  # scalar root of the graph
+loss.backward()                  # backward: WRITES .grad on every param
+optimizer.step()                 # READS .grad, updates weights in place
+# Swapping backward() and zero_grad(): zero_grad() would erase the gradient
+# backward() just computed, so step() updates with zeros — the model never
+# learns (and no error tells you).</code></pre><p>You will type this loop hundreds of times. The only freedom in the order is that <code>zero_grad</code> may sit either at the very top or right after <code>step</code> — never between <code>backward</code> and <code>step</code>.</p></div>
+</div>
+
+</main>
+</body>
+</html>

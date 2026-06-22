@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Transformer in PyTorch, from zero</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1>A Transformer in PyTorch, <span class="chapno">from zero</span></h1>
+<p class="subtitle">A course about <strong>PyTorch the tool</strong>, not the transformer the idea. You will build a working GPT-style language model from an empty file — but the real subject is the syntax underneath it: tensors and their shapes, autograd, <code>nn.Module</code>, the training loop. By the last page you can type a transformer into a blank editor, fluently, without looking anything up.</p>
+
+<h2>What this course is (and isn't)</h2>
+<p>There are a hundred explanations of <em>why</em> attention works. This is not one of them. This course assumes you broadly know what a transformer is and trains the other half of the skill: writing one in PyTorch <em>by hand</em>, knowing exactly which tensor operation each line of the diagram becomes, why every <code>.view()</code>, <code>.transpose()</code>, and <code>dim=-1</code> is where it is, and what breaks if it isn't.</p>
+<p>So the emphasis is relentlessly on <strong>PyTorch idiom</strong>: shapes and broadcasting, the autograd contract, <code>nn.Module</code> and <code>nn.Parameter</code>, the canonical zero-grad/backward/step loop, and the dozen syntax traps (<code>view</code> vs <code>reshape</code>, in-place underscores, biased vs unbiased variance, <code>cross_entropy</code>'s shape rules) that separate "I can read PyTorch" from "I can write it."</p>
+
+<h2>How this course works</h2>
+<p>Each chapter is a short textbook — explanations with worked code — followed by a <strong>problem set</strong>. The problems are where the learning actually happens: you write real PyTorch in the box (it saves automatically) and run it in a live Python session beside the page (<code>pip install torch</code> is the whole setup). The mechanics:</p>
+<ul>
+<li><strong>Write before you look.</strong> Every problem has a code workspace, progressive <em>hints</em>, and a reference solution that stays locked until you've made a genuine attempt. A <em>📖 Review</em> link jumps to the section the problem draws on, for when you need to re-read.</li>
+<li><strong>Run your code.</strong> Most problems say "predict the shape, then verify" or end with a concrete test (a shape, a number, an assertion). The REPL is the grader — use it before comparing with the reference.</li>
+<li><strong>Check the box only for problems you solved before opening the reference.</strong> Progress is stored locally per chapter and aggregated below; come back to unsolved problems a day later, then after three days.</li>
+</ul>
+
+<h2>Your progress</h2>
+<div id="dashboard"></div>
+
+<h2>The route</h2>
+<p><strong>Part I — PyTorch itself</strong> (no transformer in sight; just the tool, built into muscle memory):</p>
+<p><strong>Ch 1 — Tensors.</strong> Creation, <code>dtype</code> and <code>device</code>; indexing and slicing; the broadcasting rules; the reshape family (<code>view</code>, <code>reshape</code>, <code>permute</code>, <code>transpose</code>, <code>unsqueeze</code>) and the contiguity trap; reductions with <code>dim</code>/<code>keepdim</code>; in-place ops and the trailing-underscore convention.</p>
+<p><strong>Ch 2 — Autograd.</strong> <code>requires_grad</code> and the graph; what <code>.backward()</code> actually does; <code>.grad</code> accumulation and why you <code>zero_grad()</code>; <code>no_grad</code> vs <code>detach</code> vs <code>.item()</code>; leaf vs non-leaf tensors — everything PyTorch hides behind <code>loss.backward()</code>.</p>
+<p><strong>Ch 3 — nn.Module.</strong> The object model: <code>__init__</code>/<code>forward</code>, <code>nn.Parameter</code>, registered buffers, automatic submodule registration, <code>ModuleList</code> vs a plain list; the built-ins (<code>Linear</code>, <code>Embedding</code>, <code>LayerNorm</code>); <code>nn.X</code> vs <code>F.x</code>; <code>state_dict</code>, <code>.to(device)</code>, <code>.train()</code>/<code>.eval()</code>.</p>
+<p><strong>Ch 4 — Data &amp; the loop.</strong> <code>Dataset</code>/<code>DataLoader</code>, <code>torch.optim</code> and <code>AdamW</code>, the five-line training loop you'll write forever, <code>F.cross_entropy</code> and its shape convention, batched matmul and <code>masked_fill</code> — capped by an MLP classifier you train closed-book.</p>
+<p><strong>Part II — the transformer</strong>:</p>
+<p><strong>Ch 5 — The Transformer as Tensor Ops.</strong> The architecture as a shape pipeline: every box in the diagram named with the exact PyTorch op and tensor shape it becomes — embeddings, scaled dot-product attention, the causal <code>masked_fill</code>, multi-head as a <code>view</code>+<code>transpose</code>, the pre-LN residual block, weight tying.</p>
+<p><strong>Ch 6 — The Transformer in PyTorch.</strong> Chapter 5's pipeline as ~120 lines of <code>nn.Module</code>s: <code>LayerNorm</code>, <code>CausalSelfAttention</code>, <code>MLP</code>, <code>Block</code>, <code>GPT</code> — each one a problem in the implementation set, each one machine-verified in the companion code.</p>
+<p><strong>Ch 7 — Training, Sampling &amp; Debugging.</strong> <code>AdamW</code> and the loop, <code>F.cross_entropy</code> reshaping, <code>@torch.no_grad()</code> generation with <code>multinomial</code> sampling, <code>.eval()</code>/device discipline, a PyTorch-specific debugging checklist, and the verified training run that memorizes Alice in Wonderland.</p>
+
+<h2>Companion code</h2>
+<p>In <code>code/</code>, both machine-verified on this machine:</p>
+<ul>
+<li><code>transformer.py</code> — the reference single-file model (~210 lines of idiomatic PyTorch; from-scratch <code>LayerNorm</code>, no <code>nn.TransformerEncoder</code>, no tricks). The default run trains a 632 K-parameter character-level LM that fits its corpus (final loss well under 1.0 vs the untrained baseline \(\ln 46 = 3.83\)) and prints a PASS line; expected output is embedded in Chapter 7.</li>
+<li><code>test_torch_core.py</code> — seven deterministic checks tying the code to the chapters: hand-built <code>LayerNorm</code> vs <code>nn.LayerNorm</code>, attention vs a per-head manual loop, the causality test, a hand-computed cross-entropy, the \(\ln V\) init loss, autograd vs finite differences (and the grad-accumulation gotcha), and Adam's first-step property. Expect <code>ALL 7 CHECKS PASS</code>.</li>
+</ul>
+<p>Setup: <code>python3 -m venv .venv &amp;&amp; .venv/bin/pip install torch</code>, then <code>.venv/bin/python code/test_torch_core.py</code>.</p>
+
+<h2>Prerequisites</h2>
+<p>You should know what a transformer is for — attention, multiple heads, a causal language model, what a loss and an optimizer do — at the level of having read a good explainer or watched a lecture. You do <em>not</em> need to derive any of it; Chapter 5 recaps the architecture purely as a shape pipeline. NumPy familiarity helps but isn't required. <strong>No PyTorch is assumed</strong> — Chapter 1 starts from <code>torch.tensor([1.0])</code>. If you want the math side in depth, the sibling <code>../jax-transformer-course/</code> derives the architecture from first principles in JAX.</p>
+
+</main>
+</body>
+</html>

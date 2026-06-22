@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 4 · Data, Losses &amp; the Training Loop</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 4</span> · Data, Losses &amp; the Training Loop</h1>
+<p class="subtitle">You have tensors (Ch 1), gradients (Ch 2), and modules (Ch 3). This chapter ties them into a model that actually learns: how data gets batched, which optimizer to reach for, the exact shape contract of <code>F.cross_entropy</code>, and the handful of tensor ops — batched matmul, <code>masked_fill</code>, <code>softmax</code> — that the transformer leans on. It ends with a complete classifier you train closed-book.</p>
+
+<h2 id="data">4.1 Dataset and DataLoader</h2>
+<p>PyTorch separates "what is one example" (<code>Dataset</code>) from "how do I get batches of them" (<code>DataLoader</code>). A <code>Dataset</code> implements two methods:</p>
+<pre><code>from torch.utils.data import Dataset, DataLoader
+
+class CharData(Dataset):
+    def __init__(self, data, T):
+        self.data, self.T = data, T            # data: 1-D LongTensor of token ids
+    def __len__(self):
+        return len(self.data) - self.T - 1     # number of valid windows
+    def __getitem__(self, i):
+        chunk = self.data[i : i + self.T + 1]  # T+1 tokens
+        return chunk[:-1], chunk[1:]           # (input, target), each length T
+
+loader = DataLoader(CharData(data, T=64), batch_size=32, shuffle=True)
+for inputs, targets in loader:                 # inputs: (32, 64), targets: (32, 64)
+    ...
+</code></pre>
+<p>The <code>DataLoader</code> handles shuffling, batching (it <em>stacks</em> the per-example tensors your <code>Dataset</code> returns, adding a leading batch axis), and optional multi-process loading (<code>num_workers</code>). For tiny in-memory data you can skip all this and just index random windows yourself — which is exactly what our reference <code>get_batch</code> does, because the corpus is 2 KB. Know the <code>Dataset</code>/<code>DataLoader</code> API (it's everywhere), but don't think it's mandatory.</p>
+
+<h2 id="optim">4.2 Optimizers</h2>
+<p>An optimizer is handed the parameters to train at construction, then on each step reads their <code>.grad</code> and updates them:</p>
+<pre><code>opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+# ... in the loop ...
+opt.zero_grad()
+loss.backward()
+opt.step()
+</code></pre>
+<p><code>model.parameters()</code> is the generator of registered tensors from Chapter 3 — this is the payoff of all that registration bookkeeping. The optimizer stores its own state (Adam keeps running averages per parameter) and applies the update in place under the hood. Defaults worth knowing: <strong>Adam/AdamW</strong> with <code>lr</code> around <code>3e-4</code> is the safe transformer default; <code>AdamW</code> is Adam with correct weight decay and is what you'll use. <code>opt.zero_grad()</code> is just the per-parameter <code>.grad</code> reset from Chapter 2, done for the whole model at once.</p>
+
+<h2 id="celoss">4.3 F.cross_entropy and its shape contract</h2>
+<p>For classification (and next-token prediction is classification over the vocabulary), the loss is cross-entropy. <code>F.cross_entropy</code> is the one to use — and its input convention is the single most common shape bug in PyTorch:</p>
+<div class="box keypoint"><div class="box-title">cross_entropy(logits, targets): raw logits, integer targets, class axis = 1</div>
+<p>It expects <strong>raw logits</strong> (it applies <code>log_softmax</code> internally — do <em>not</em> softmax first), of shape <code>(N, C)</code>, and <strong>integer class indices</strong> (not one-hot) of shape <code>(N,)</code>. The class dimension must be axis 1. It returns the mean negative-log-likelihood as a scalar. Passing probabilities instead of logits, or one-hot targets, gives wrong numbers or an error.</p>
+</div>
+<pre><code>logits = torch.randn(10, 5)          # (N=10, C=5) raw scores
+targets = torch.randint(0, 5, (10,)) # (N,) class indices
+loss = F.cross_entropy(logits, targets)   # scalar
+</code></pre>
+<p>But a language model produces logits of shape <code>(B, T, V)</code> and targets of shape <code>(B, T)</code> — three axes, not two. The fix is to <strong>flatten the batch and time axes together</strong> so every (b, t) position becomes one independent classification example:</p>
+<pre><code>logits = model(inputs)               # (B, T, V)
+loss = F.cross_entropy(
+    logits.reshape(-1, V),           # (B*T, V)
+    targets.reshape(-1),             # (B*T,)
+)
+</code></pre>
+<p>This is exactly the loss line in our <code>transformer.py</code>. <code>reshape(-1, V)</code> collapses <code>(B, T, V)</code> into <code>(B·T, V)</code>; <code>reshape(-1)</code> collapses <code>(B, T)</code> into <code>(B·T,)</code>; the rows line up position-for-position. (Verify by hand on tiny shapes that the flatten keeps logits and their targets aligned — they do, because both flatten in the same row-major order.)</p>
+
+<h2 id="ops">4.4 Three tensor ops the transformer needs</h2>
+<p><strong>Batched matmul.</strong> The <code>@</code> operator (a.k.a. <code>torch.matmul</code>) on tensors with more than two axes treats all leading axes as <em>batch</em> dimensions and matrix-multiplies the last two:</p>
+<pre><code>a = torch.randn(2, 4, 3, 5)          # (B, H, T, hd)
+b = torch.randn(2, 4, 5, 3)          # (B, H, hd, T)
+(a @ b).shape                         # (2, 4, 3, 3) — a (3x5)@(5x3) per (B,H) pair
+</code></pre>
+<p>So <code>q @ k.transpose(-2, -1)</code> on <code>(B, H, T, hd)</code> tensors produces all <code>B·H</code> attention-score matrices <code>(B, H, T, T)</code> in one call — no Python loop over heads. This is the heart of why attention is a handful of lines.</p>
+<p><strong>masked_fill.</strong> Replace entries where a boolean mask is <code>True</code> with a scalar — how the causal mask blocks attention to the future:</p>
+<pre><code>scores = scores.masked_fill(future_mask, float("-inf"))   # -inf -> 0 after softmax
+</code></pre>
+<p><strong>softmax with an explicit <code>dim</code>.</strong> <code>F.softmax</code> needs to know which axis to normalize over; for attention weights that's the key axis, the last one:</p>
+<pre><code>weights = F.softmax(scores, dim=-1)   # each row sums to 1 over the keys
+</code></pre>
+<p>Filling with <code>-inf</code> before softmax works because \(e^{-\infty} = 0\): masked positions get exactly zero weight, and the remaining (visible) positions renormalize to sum to 1.</p>
+
+<h2 id="loop">4.5 The full training loop</h2>
+<p>Everything assembles. Here is a complete, runnable loop for an MLP classifier — the same skeleton your transformer will use, minus the model:</p>
+<pre><code>model = nn.Sequential(nn.Linear(2, 32), nn.ReLU(), nn.Linear(32, 2))
+opt = torch.optim.AdamW(model.parameters(), lr=1e-2)
+
+model.train()
+for epoch in range(100):
+    for xb, yb in loader:              # xb: (B, 2) floats, yb: (B,) class ids
+        opt.zero_grad()               # 1. clear grads
+        logits = model(xb)            # 2. forward, builds graph -> (B, 2)
+        loss = F.cross_entropy(logits, yb)   # 3. scalar loss
+        loss.backward()               # 4. fill .grad
+        opt.step()                    # 5. update weights
+
+# evaluation: eval mode + no_grad
+model.eval()
+with torch.no_grad():
+    acc = (model(X_test).argmax(-1) == y_test).float().mean()
+</code></pre>
+<p>That five-line inner loop is invariant across essentially all of supervised deep learning — only the model, the data, and the loss change. The transformer in Chapters 6–7 drops into exactly this frame, with <code>F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1))</code> as step 3.</p>
+<div class="box warning"><div class="box-title">The five bugs that keep a loop from learning</div>
+<p>(1) No <code>zero_grad()</code> → gradients accumulate, loss diverges. (2) Softmaxing before <code>cross_entropy</code> → wrong loss. (3) Wrong <code>cross_entropy</code> shapes → error or silent mislearning. (4) An accidental <code>.detach()</code>/<code>no_grad</code> in the forward path → no gradient reaches the weights. (5) Forgetting <code>model.train()</code>/<code>.eval()</code> toggles → dropout misbehaves. Every one is from Chapters 2–4; together they are most of "why won't my model train."</p>
+</div>
+
+<h2 id="problems">Problem set</h2>
+<p>The capstone (last problem) is a full from-scratch training loop — the rehearsal for the transformer. Run everything; a loop you haven't watched converge is a loop you don't trust. The reference unlocks after a real attempt.</p>
+
+<div class="quiz" data-concept="ch4.html#data" data-concept-label="§4.1 Dataset" data-min="140" data-placeholder="class CharData(Dataset):&#10;    def __init__(self, data, T): ...&#10;    def __len__(self): ...&#10;    def __getitem__(self, i): ...">
+  <div class="q-text"><p>Write a <code>Dataset</code> for next-token prediction: given a 1-D <code>LongTensor</code> <code>data</code> and context length <code>T</code>, <code>__getitem__(i)</code> returns the pair <code>(input, target)</code> where both have length <code>T</code> and <code>target</code> is <code>input</code> shifted one position right (predict token <code>t+1</code> from tokens <code>≤ t</code>). Get <code>__len__</code> right so no index runs off the end. In a comment, state the shapes <code>DataLoader(ds, batch_size=32)</code> yields and why there's a leading 32.</p></div>
+  <div class="hint">Grab a window of <code>T+1</code> tokens at <code>i</code>; the input is the first <code>T</code>, the target is the last <code>T</code>. Valid starts run up to <code>len(data) - T - 1</code>.</div>
+  <div class="answer"><pre><code>class CharData(Dataset):
+    def __init__(self, data, T):
+        self.data, self.T = data, T
+    def __len__(self):
+        return len(self.data) - self.T - 1     # last start with a full window
+    def __getitem__(self, i):
+        chunk = self.data[i : i + self.T + 1]  # T+1 tokens
+        return chunk[:-1], chunk[1:]           # input, target — each length T
+# DataLoader stacks per-example tensors into a batch, so it yields
+# inputs (32, T) and targets (32, T): the leading 32 is the batch axis the
+# loader adds by stacking 32 independent windows.</code></pre></div>
+</div>
+
+<div class="quiz" data-concept="ch4.html#celoss" data-concept-label="§4.3 cross_entropy shapes" data-min="120" data-placeholder="# LM logits (B,T,V), targets (B,T). Write the loss line.&#10;# Then list 2 ways to call cross_entropy WRONG.">
+  <div class="q-text"><p>Your model outputs <code>logits</code> of shape <code>(B, T, V)</code> and you have integer <code>targets</code> of shape <code>(B, T)</code>. Write the single <code>F.cross_entropy(...)</code> call that computes the mean next-token loss. Then list two <em>specific</em> ways people call <code>cross_entropy</code> wrong (with what happens), and confirm: does it want logits or probabilities?</p></div>
+  <div class="hint">Flatten batch and time together: <code>logits.reshape(-1, V)</code> and <code>targets.reshape(-1)</code>. It wants raw logits and integer (not one-hot) targets.</div>
+  <div class="answer"><pre><code>loss = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1))
+# Wrong way 1: F.cross_entropy(F.softmax(logits, -1), targets) — it applies
+#   log_softmax INTERNALLY, so pre-softmaxing double-counts and gives a
+#   wrong, too-flat loss.
+# Wrong way 2: one-hot targets, or passing (B,T,V) and (B,T) unflattened —
+#   shape error (it wants (N,C) logits and (N,) integer class indices).
+# It wants RAW LOGITS and INTEGER target indices.</code></pre><p>The flatten works because both tensors collapse in the same row-major order, so logit-row <code>k</code> still pairs with target <code>k</code>.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch4.html#ops" data-concept-label="§4.4 Batched ops" data-min="160" data-placeholder="# q, k, v all (B=2, H=4, T=6, hd=8). Build attention WITHOUT a causal mask:&#10;scores = ...&#10;weights = ...&#10;out = ...&#10;# then add the causal masked_fill">
+  <div class="q-text"><p>Given <code>q</code>, <code>k</code>, <code>v</code> all of shape <code>(B=2, H=4, T=6, hd=8)</code>, write three lines of full (non-causal) attention: the scaled scores, the softmax weights, and the output — predicting each shape. Then add the one line that makes it <em>causal</em> using a lower-triangular mask and <code>masked_fill</code>, and explain why the fill value is <code>-inf</code> and why it goes <em>before</em> the softmax.</p></div>
+  <div class="hint">Scores: <code>q @ k.transpose(-2,-1) / sqrt(hd)</code> → <code>(B,H,T,T)</code>. Mask the upper triangle to <code>-inf</code>, then <code>softmax(dim=-1)</code>, then <code>@ v</code>.</div>
+  <div class="answer"><pre><code>import math
+scores = q @ k.transpose(-2, -1) / math.sqrt(8)     # (2, 4, 6, 6)
+weights = F.softmax(scores, dim=-1)                  # (2, 4, 6, 6), rows sum to 1
+out = weights @ v                                    # (2, 4, 6, 8)
+
+# make it causal:
+T = q.shape[-2]
+mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=q.device))
+scores = scores.masked_fill(~mask, float("-inf"))    # block the future
+weights = F.softmax(scores, dim=-1)
+out = weights @ v
+# -inf BEFORE softmax: e^{-inf}=0, so masked keys get exactly zero weight
+# and the visible keys renormalize to sum to 1. Masking AFTER softmax would
+# leave the already-normalized weights summing to <1 and leak future info
+# into the normalizer.</code></pre><p>This is §6.2's attention with the head bookkeeping stripped away — keep it; you'll wrap it in the reshape/transpose dance next chapter.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch4.html#loop" data-concept-label="§4.5 Training loop" data-min="220" data-placeholder="# Full closed-book loop. Two moons or any 2D 2-class data.&#10;import torch, torch.nn as nn, torch.nn.functional as F&#10;# data:&#10;# model:&#10;# optimizer:&#10;# train loop (5 lines):&#10;# eval accuracy under no_grad:">
+  <div class="q-text"><p>Capstone — write a complete, runnable training script closed-book: make a 2-D, 2-class toy dataset (e.g. two Gaussian blobs, ~200 points each), define an MLP classifier with <code>nn.Sequential</code> (2 → 32 → ReLU → 2), train it with <code>AdamW</code> and <code>F.cross_entropy</code> for enough steps to fit, then report test accuracy under <code>model.eval()</code> + <code>no_grad</code>. Get the five-line inner loop exactly right, in order. Actually run it and confirm accuracy &gt; 95%.</p></div>
+  <div class="hint">Data: <code>torch.randn(200,2)+2</code> for class 1, <code>torch.randn(200,2)-2</code> for class 0; concat and make a <code>(N,)</code> long target. Loop order: zero_grad → forward → loss → backward → step.</div>
+  <div class="hint">Accuracy: <code>(logits.argmax(-1) == y).float().mean()</code>, computed inside <code>model.eval()</code> and a <code>torch.no_grad()</code> block.</div>
+  <div class="answer"><pre><code>import torch, torch.nn as nn, torch.nn.functional as F
+torch.manual_seed(0)
+
+# data: two well-separated blobs
+X = torch.cat([torch.randn(200, 2) + 2, torch.randn(200, 2) - 2])
+y = torch.cat([torch.ones(200), torch.zeros(200)]).long()      # (400,)
+
+model = nn.Sequential(nn.Linear(2, 32), nn.ReLU(), nn.Linear(32, 2))
+opt = torch.optim.AdamW(model.parameters(), lr=1e-2)
+
+model.train()
+for step in range(300):
+    opt.zero_grad()                       # 1
+    logits = model(X)                     # 2  (400, 2)
+    loss = F.cross_entropy(logits, y)     # 3  scalar
+    loss.backward()                       # 4
+    opt.step()                            # 5
+
+model.eval()
+with torch.no_grad():
+    acc = (model(X).argmax(-1) == y).float().mean()
+print(f"loss {loss.item():.3f}  acc {acc.item():.3f}")   # acc ~ 1.000</code></pre><p>If you wrote this from an empty editor and it converged, you have the entire training apparatus in hand. The transformer is the same script with a bigger model and the <code>(B,T,V)</code>→<code>(B·T,V)</code> loss reshape. Everything from here is the model.</p></div>
+</div>
+
+</main>
+</body>
+</html>

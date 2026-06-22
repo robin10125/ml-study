@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 3 · nn.Module: Parameters, Buffers &amp; Submodules</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 3</span> · nn.Module: Parameters, Buffers &amp; Submodules</h1>
+<p class="subtitle">A PyTorch model is a tree of <code>nn.Module</code>s. The class does a surprising amount of quiet bookkeeping — collecting parameters, moving tensors between devices, switching train/eval behavior — and the whole thing rests on one magic method intercepting attribute assignment. Once you see the mechanism, building a transformer out of modules is just nesting.</p>
+
+<h2 id="anatomy">3.1 The anatomy of a Module</h2>
+<p>Every model component subclasses <code>nn.Module</code> and defines two methods: <code>__init__</code> (create the layers and weights) and <code>forward</code> (the computation). You <em>call</em> the module like a function; PyTorch routes that to <code>forward</code>:</p>
+<pre><code>import torch.nn as nn
+
+class Linear(nn.Module):
+    def __init__(self, n_in, n_out):
+        super().__init__()                       # MUST come first
+        self.weight = nn.Parameter(torch.randn(n_out, n_in) * 0.02)
+        self.bias = nn.Parameter(torch.zeros(n_out))
+
+    def forward(self, x):                        # x: (..., n_in)
+        return x @ self.weight.T + self.bias     # (..., n_out)
+
+layer = Linear(4, 3)
+y = layer(x)            # calls layer.forward(x) — NEVER call .forward() yourself
+</code></pre>
+<div class="box warning"><div class="box-title">Two non-negotiables</div>
+<p><strong>(1) Call <code>super().__init__()</code> first</strong>, before assigning any layer or parameter — it sets up the internal registries, and without it parameter tracking silently breaks. <strong>(2) Call the module, not <code>.forward()</code>:</strong> write <code>layer(x)</code>, not <code>layer.forward(x)</code>. The <code>__call__</code> wrapper runs registered hooks and other machinery around <code>forward</code>; calling <code>forward</code> directly skips them.</p>
+</div>
+
+<h2 id="parameter">3.2 nn.Parameter: a tensor the optimizer trains</h2>
+<p>An <code>nn.Parameter</code> is just a <code>Tensor</code> with <code>requires_grad=True</code> and one extra property: <strong>when you assign it as an attribute of a Module, the Module registers it</strong> as a trainable parameter. That registration is what makes <code>model.parameters()</code> — the list you hand to the optimizer — find it.</p>
+<pre><code>self.weight = nn.Parameter(torch.randn(3, 4))   # registered, trainable
+self.scratch = torch.randn(3, 4)                 # a plain attribute — NOT registered
+</code></pre>
+<div class="box keypoint"><div class="box-title">If it's not an nn.Parameter, the optimizer never sees it</div>
+<p>Assign a bare <code>torch.randn(...)</code> as <code>self.w</code> and your forward pass works, but <code>model.parameters()</code> won't include it, so the optimizer never updates it and it stays at its random init forever — a model that "half-trains" for no visible reason. Any weight you want learned must be wrapped in <code>nn.Parameter</code>. (This is the <code>requires_grad</code> story from Chapter 2, now automated: <code>nn.Parameter</code> sets the flag <em>and</em> registers the tensor.)</p>
+</div>
+
+<h2 id="submodule">3.3 Submodules register automatically — the __setattr__ trick</h2>
+<p>The same magic extends to whole modules. Assign an <code>nn.Module</code> as an attribute of another and it becomes a <strong>submodule</strong>; its parameters are now part of the parent's <code>parameters()</code>, recursively:</p>
+<pre><code>class Block(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.ln = nn.LayerNorm(d)        # submodule
+        self.fc = nn.Linear(d, d)        # submodule
+
+    def forward(self, x):
+        return self.fc(self.ln(x))
+
+block = Block(8)
+sum(p.numel() for p in block.parameters())   # counts ln's AND fc's params
+</code></pre>
+<p>This works because <code>nn.Module</code> overrides <code>__setattr__</code>: every time you write <code>self.something = value</code>, it checks whether <code>value</code> is a <code>Parameter</code> or a <code>Module</code> and files it in the right internal dict. That single mechanism is the whole tree: a model is modules holding modules holding parameters, and one call to <code>model.parameters()</code> walks it all.</p>
+<div class="box warning"><div class="box-title">A plain Python list of modules is invisible — use nn.ModuleList</div>
+<p><code>self.layers = [nn.Linear(8, 8) for _ in range(3)]</code> stores the modules in an ordinary list, which <code>__setattr__</code> does <em>not</em> introspect — so those three layers are <strong>not registered</strong>, their parameters don't appear in <code>parameters()</code>, and they don't train. Wrap the list in <code>nn.ModuleList(...)</code> (for indexing/iteration) or <code>nn.Sequential(...)</code> (to chain automatically). Same trap for dicts → <code>nn.ModuleDict</code>. Your transformer's stack of blocks <em>must</em> be a <code>ModuleList</code>.</p>
+</div>
+<pre><code>self.blocks = nn.ModuleList([Block(8) for _ in range(3)])   # registered
+for blk in self.blocks:        # iterate like a list
+    x = blk(x)
+</code></pre>
+
+<h2 id="buffer">3.4 Buffers: state that isn't trained</h2>
+<p>Sometimes a module needs persistent tensor state that should move with the model (<code>.to(device)</code>, save/load) but is <em>not</em> a trained parameter — a causal mask, running statistics, positional constants. That's a <strong>buffer</strong>:</p>
+<pre><code>self.register_buffer("mask", torch.tril(torch.ones(T, T)))
+# self.mask now exists, moves with .to(device), is saved in state_dict,
+# but has requires_grad=False and is NOT in parameters() — never trained.
+</code></pre>
+<p>The distinction: <code>nn.Parameter</code> = learned (in <code>parameters()</code>, gets gradients); buffer = fixed state (in <code>state_dict</code>, no gradients). A causal attention mask is the canonical buffer — it's a constant the model carries around, not something to optimize. (You can also just rebuild the mask in <code>forward</code> each call, as our reference code does; a buffer saves recomputation.)</p>
+
+<h2 id="builtins">3.5 The built-in layers you'll actually use</h2>
+<p>You rarely hand-roll <code>Linear</code> — PyTorch ships the building blocks. The four that make up a transformer:</p>
+<table>
+<tr><th>layer</th><th>what it holds</th><th>shape map</th></tr>
+<tr><td><code>nn.Linear(in, out)</code></td><td><code>weight (out,in)</code>, <code>bias (out)</code></td><td><code>(…, in) → (…, out)</code></td></tr>
+<tr><td><code>nn.Embedding(num, dim)</code></td><td><code>weight (num, dim)</code></td><td><code>(…) ints → (…, dim)</code></td></tr>
+<tr><td><code>nn.LayerNorm(dim)</code></td><td><code>weight (dim)</code>, <code>bias (dim)</code></td><td><code>(…, dim) → (…, dim)</code></td></tr>
+<tr><td><code>nn.Dropout(p)</code></td><td>nothing (no params)</td><td>shape-preserving</td></tr>
+</table>
+<pre><code>lin = nn.Linear(4, 3)      # bias=True by default; pass bias=False to drop it
+lin.weight.shape           # (3, 4) — note: (out, in). forward does x @ weight.T
+emb = nn.Embedding(46, 8)  # a lookup table; emb(ids) == emb.weight[ids]
+</code></pre>
+<p>Note the two surprises new users hit: <code>nn.Linear</code> stores its weight as <code>(out, in)</code> (so the forward is <code>x @ W.T</code>), and <code>nn.Embedding</code> is literally the fancy-indexing gather from Chapter 1 wrapped as a trainable module — <code>emb(ids)</code> equals <code>emb.weight[ids]</code>.</p>
+
+<h2 id="functional">3.6 nn.X vs F.x — modules vs functions</h2>
+<p>Many operations come in two forms: a <strong>module</strong> (capital, e.g. <code>nn.ReLU</code>, <code>nn.Softmax</code>) and a <strong>function</strong> (<code>torch.nn.functional</code> as <code>F</code>, e.g. <code>F.relu</code>, <code>F.softmax</code>). They compute the same thing. The rule:</p>
+<div class="box keypoint"><div class="box-title">Module form for things with state; functional form for pure ops</div>
+<p>Use the <code>nn.</code> module when the operation <em>owns parameters or buffers</em> you want registered and managed — <code>nn.Linear</code>, <code>nn.Embedding</code>, <code>nn.LayerNorm</code>. Use the <code>F.</code> function for stateless math you just apply in <code>forward</code> — <code>F.relu</code>, <code>F.gelu</code>, <code>F.softmax</code>, <code>F.cross_entropy</code>. Activations have no weights, so calling <code>F.gelu(x)</code> in <code>forward</code> is cleaner than registering an <code>nn.GELU()</code> submodule. (Both are fine; this is the convention you'll see in real code, including ours.)</p>
+</div>
+<pre><code>import torch.nn.functional as F
+# in forward:
+x = F.gelu(self.fc1(x))           # functional activation, no state
+w = F.softmax(scores, dim=-1)     # functional, must pass dim
+</code></pre>
+
+<h2 id="lifecycle">3.7 Lifecycle: to(device), train/eval, state_dict</h2>
+<p>Because a Module knows all its parameters and buffers, three whole-model operations are one call each:</p>
+<pre><code>model.to(device)        # move every parameter &amp; buffer to a device (in place)
+model.train()           # set training mode (dropout on, etc.)
+model.eval()            # set eval mode (dropout off, batchnorm uses running stats)
+sd = model.state_dict() # an OrderedDict {name: tensor} of all params + buffers
+model.load_state_dict(sd)   # restore them — this is how you save/load weights
+</code></pre>
+<div class="box warning"><div class="box-title">.train()/.eval() change behavior; no_grad changes recording — they're orthogonal</div>
+<p><code>model.eval()</code> flips a <em>mode flag</em> that layers like <code>Dropout</code> read (dropout becomes a no-op in eval). It does <strong>not</strong> turn off autograd. <code>torch.no_grad()</code> stops graph recording but does <strong>not</strong> change dropout. For evaluation/generation you usually want <em>both</em>: <code>model.eval()</code> for correct layer behavior <em>and</em> a <code>no_grad</code> block for speed. Forgetting <code>.eval()</code> means dropout randomly corrupts your generations; forgetting to switch back to <code>.train()</code> means your model stops learning. Our <code>generate()</code> is decorated <code>@torch.no_grad()</code> and calls <code>model.eval()</code> — both.</p>
+</div>
+
+<h2 id="problems">Problem set</h2>
+<p>These are about the <em>mechanics</em> of Module — registration, the list trap, parameter counting. Build the modules and actually inspect <code>list(m.parameters())</code> and <code>m.state_dict().keys()</code>. The reference unlocks after a real attempt.</p>
+
+<div class="quiz" data-concept="ch3.html#anatomy" data-concept-label="§3.1–3.2 Module + Parameter" data-min="140" data-placeholder="class MyLinear(nn.Module):&#10;    def __init__(self, n_in, n_out):&#10;        super().__init__()&#10;        ...&#10;    def forward(self, x):&#10;        ...">
+  <div class="q-text"><p>Write <code>MyLinear(nn.Module)</code> from scratch: a learned <code>weight</code> of shape <code>(n_out, n_in)</code> and <code>bias</code> of shape <code>(n_out)</code>, with <code>forward(x)</code> mapping <code>(…, n_in) → (…, n_out)</code>. Then construct <code>MyLinear(4, 3)</code> and verify <code>len(list(m.parameters())) == 2</code> and a <code>(10, 4)</code> input gives a <code>(10, 3)</code> output. Add a comment: what breaks if you forget <code>super().__init__()</code>, and what breaks if <code>weight</code> is a plain tensor not an <code>nn.Parameter</code>?</p></div>
+  <div class="hint">Weight is <code>(n_out, n_in)</code> so forward is <code>x @ weight.T + bias</code> (matching <code>nn.Linear</code>'s layout). Both learned tensors must be <code>nn.Parameter</code>.</div>
+  <div class="answer"><pre><code>class MyLinear(nn.Module):
+    def __init__(self, n_in, n_out):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(n_out, n_in) * 0.02)
+        self.bias = nn.Parameter(torch.zeros(n_out))
+    def forward(self, x):                 # x: (..., n_in)
+        return x @ self.weight.T + self.bias    # (..., n_out)
+
+m = MyLinear(4, 3)
+list(m.parameters())                      # [weight (3,4), bias (3,)]
+m(torch.randn(10, 4)).shape               # (10, 3)
+# no super().__init__(): the internal registries aren't set up, so
+#   assigning Parameters raises / they never register.
+# weight as a plain tensor: not in parameters(), optimizer never trains it,
+#   and it has no requires_grad so no gradient flows.</code></pre></div>
+</div>
+
+<div class="quiz" data-concept="ch3.html#submodule" data-concept-label="§3.3 ModuleList trap" data-min="140" data-placeholder="# Model A uses a plain list; Model B uses nn.ModuleList.&#10;# Build both with 3 Linear(8,8) layers and compare len(list(.parameters()))">
+  <div class="q-text"><p>Build two models, each meant to hold three <code>nn.Linear(8, 8)</code> layers applied in sequence: model A stores them in a plain Python list <code>self.layers = [...]</code>; model B uses <code>nn.ModuleList([...])</code>. For each, print <code>len(list(model.parameters()))</code>. Explain the difference and which one trains. (Each <code>Linear</code> has 2 parameter tensors.)</p></div>
+  <div class="hint"><code>__setattr__</code> only introspects values that are themselves Parameters or Modules — a plain list isn't, so its contents go unregistered. <code>ModuleList</code> registers them.</div>
+  <div class="answer"><pre><code>class A(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = [nn.Linear(8, 8) for _ in range(3)]   # plain list!
+    def forward(self, x):
+        for l in self.layers: x = l(x)
+        return x
+
+class B(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([nn.Linear(8, 8) for _ in range(3)])
+    def forward(self, x):
+        for l in self.layers: x = l(x)
+        return x
+
+len(list(A().parameters()))   # 0  -> layers NOT registered, won't train
+len(list(B().parameters()))   # 6  -> 3 Linears x 2 tensors each
+# A's forward still runs, but the optimizer never sees those weights, so
+# they stay at random init forever. The stack of transformer blocks must
+# be a ModuleList for exactly this reason.</code></pre></div>
+</div>
+
+<div class="quiz" data-concept="ch3.html#buffer" data-concept-label="§3.4 Buffers" data-min="120" data-placeholder="# A module that holds a fixed lower-triangular causal mask of size (T,T).&#10;# It must move with .to(device) and save in state_dict, but never train.&#10;class Masked(nn.Module):&#10;    ...">
+  <div class="q-text"><p>Write a small module that, in <code>__init__</code>, stores a fixed <code>(T, T)</code> lower-triangular causal mask so that it (i) moves with <code>model.to(device)</code>, (ii) appears in <code>state_dict()</code>, but (iii) is <em>never</em> trained and has no gradient. Then say, in a comment, why <code>nn.Parameter</code> would be the wrong choice here and why a plain <code>self.mask = ...</code> attribute would be a bug on GPU.</p></div>
+  <div class="hint"><code>self.register_buffer("mask", torch.tril(torch.ones(T, T)))</code>. Parameter → it'd be trained (wrong). Plain attribute → it won't follow <code>.to(device)</code>, so it stays on CPU and crashes a CUDA matmul.</div>
+  <div class="answer"><pre><code>class Masked(nn.Module):
+    def __init__(self, T):
+        super().__init__()
+        self.register_buffer("mask",
+                             torch.tril(torch.ones(T, T, dtype=torch.bool)))
+    def forward(self, scores):            # scores: (..., T, T)
+        return scores.masked_fill(~self.mask, float("-inf"))
+# nn.Parameter: the mask would get gradients and be "trained" — nonsense,
+#   it's a fixed structural constant.
+# plain attribute: not registered, so model.to('cuda') leaves it on CPU;
+#   the next masked_fill mixes CPU and CUDA tensors and raises. Buffers
+#   move with the model; plain tensor attributes do not.</code></pre></div>
+</div>
+
+<div class="quiz" data-concept="ch3.html#builtins" data-concept-label="§3.5 Built-ins" data-min="120" data-placeholder="# (a) nn.Linear(4,3).weight.shape == ?&#10;# (b) show nn.Embedding(46,8)(ids) equals a fancy-index gather&#10;# (c) why ids must be long">
+  <div class="q-text"><p>Three quick checks on the built-ins. (a) What is <code>nn.Linear(4, 3).weight.shape</code>, and given that, what does <code>forward</code> compute? (b) For <code>emb = nn.Embedding(46, 8)</code> and integer ids, show the equivalent plain-tensor expression using fancy indexing from Chapter 1. (c) What dtype must <code>ids</code> be, and what error appears if they're floats?</p></div>
+  <div class="hint"><code>Linear</code> weight is <code>(out, in)</code> → forward is <code>x @ W.T + b</code>. <code>emb(ids) == emb.weight[ids]</code>. Embedding indices must be <code>long</code>.</div>
+  <div class="answer"><pre><code># (a) (3, 4) == (out, in). forward computes x @ weight.T + bias, mapping
+#     (..., 4) -> (..., 3).
+# (b) emb(ids) is exactly emb.weight[ids]  — the (num, dim) table fancy-
+#     indexed by ids; output shape ids.shape + (8,).
+# (c) ids must be torch.long (int64). Float ids raise something like
+#     "Expected tensor for argument index to have scalar type Long".</code></pre></div>
+</div>
+
+<div class="quiz" data-concept="ch3.html#lifecycle" data-concept-label="§3.6–3.7 functional + lifecycle" data-min="120" data-placeholder="# (a) eval-time forward done right (two things)&#10;# (b) F.gelu vs nn.GELU in forward — which and why&#10;# (c) what .eval() actually changes">
+  <div class="q-text"><p>(a) Write the two-part wrapper for running a model at inference time correctly (the mode change <em>and</em> the autograd change) and say why each is needed. (b) In a <code>forward</code> method, would you call <code>F.gelu(x)</code> or register and call an <code>nn.GELU()</code> submodule — and what's the reasoning? (c) Name one concrete thing <code>model.eval()</code> changes and one thing it does <em>not</em>.</p></div>
+  <div class="hint"><code>model.eval()</code> + <code>torch.no_grad()</code> are orthogonal: mode vs recording. GELU has no parameters, so the functional form is the idiomatic choice.</div>
+  <div class="answer"><pre><code># (a)
+model.eval()                      # mode flag: dropout off, etc.
+with torch.no_grad():             # stop graph recording: faster, less memory
+    out = model(x)
+# eval() fixes layer BEHAVIOR; no_grad fixes graph RECORDING — different axes,
+# you generally want both at inference.
+
+# (b) F.gelu(x): GELU is stateless (no parameters), so there's nothing to
+#     register — the functional form is cleaner. Reserve nn.* modules for
+#     things that own weights/buffers (Linear, LayerNorm, Embedding).
+
+# (c) eval() DOES change dropout (becomes a no-op) and BN's running-stats
+#     use. It does NOT disable autograd — backward still works in eval mode.</code></pre></div>
+</div>
+
+</main>
+</body>
+</html>

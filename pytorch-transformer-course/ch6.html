@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 6 · The Transformer in PyTorch</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 6</span> · The Transformer in PyTorch</h1>
+<p class="subtitle">Chapter 5's shape pipeline becomes ~120 lines of <code>nn.Module</code>. Five classes — <code>LayerNorm</code>, <code>CausalSelfAttention</code>, <code>MLP</code>, <code>Block</code>, <code>GPT</code> — each a near-direct transcription of a section you just read. This is the chapter where the course's promise gets cashed: every class here is a problem in the implementation set, and the same code lives verified in <code>code/transformer.py</code>. Constants throughout: <code>D=128, H=4, hd=32, d_ff=512, n_layers=3</code>.</p>
+
+<h2 id="ln">6.1 LayerNorm from scratch</h2>
+<p>PyTorch has <code>nn.LayerNorm</code>, but building it ourselves nails down two things: <code>nn.Parameter</code> (the learned scale and shift) and the biased-variance gotcha from Chapter 1.</p>
+<pre><code>class LayerNorm(nn.Module):
+    def __init__(self, d_model, eps=1e-5):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(d_model))    # learned scale, starts at 1
+        self.beta = nn.Parameter(torch.zeros(d_model))    # learned shift, starts at 0
+        self.eps = eps
+
+    def forward(self, x):                                 # x: (..., D)
+        mean = x.mean(dim=-1, keepdim=True)               # (..., 1)
+        var = x.var(dim=-1, keepdim=True, unbiased=False) # biased — matches nn.LayerNorm
+        return (x - mean) / torch.sqrt(var + self.eps) * self.gamma + self.beta
+</code></pre>
+<p>Checklist: stats over <code>dim=-1</code> (per token, over features — never the batch or time axis); <code>keepdim=True</code> so <code>(...,1)</code> broadcasts back over <code>(...,D)</code>; <code>eps</code> <em>inside</em> the sqrt (else an all-constant token gives <code>var=0</code> → division by zero → NaN); <code>unbiased=False</code> (§1.6); <code>gamma</code>/<code>beta</code> of shape <code>(D,)</code> as <code>nn.Parameter</code> so they're trained. <code>gamma</code> at ones and <code>beta</code> at zeros means the layer starts as the identity standardization.</p>
+
+<h2 id="attn">6.2 CausalSelfAttention: the centerpiece</h2>
+<p>Transcribing §5.3 directly. Four <code>nn.Linear</code> projections (bias-free, like the original paper), the <code>view</code>/<code>transpose</code> head dance, batched scores, causal mask, softmax, and merge:</p>
+<pre><code>class CausalSelfAttention(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.wq = nn.Linear(d_model, d_model, bias=False)
+        self.wk = nn.Linear(d_model, d_model, bias=False)
+        self.wv = nn.Linear(d_model, d_model, bias=False)
+        self.wo = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x):                                # x: (B, T, D)
+        B, T, D = x.shape
+        H, hd = self.n_heads, self.d_head
+        q = self.wq(x).view(B, T, H, hd).transpose(1, 2)  # (B, H, T, hd)
+        k = self.wk(x).view(B, T, H, hd).transpose(1, 2)
+        v = self.wv(x).view(B, T, H, hd).transpose(1, 2)
+
+        scores = (q @ k.transpose(-2, -1)) / math.sqrt(hd)   # (B, H, T, T)
+        mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
+        scores = scores.masked_fill(~mask, float("-inf"))    # before softmax!
+        attn = F.softmax(scores, dim=-1)                     # (B, H, T, T)
+
+        out = attn @ v                                       # (B, H, T, hd)
+        out = out.transpose(1, 2).contiguous().view(B, T, D) # merge heads
+        return self.wo(out)                                  # (B, T, D)
+</code></pre>
+<p>Why <code>q @ k.transpose(-2, -1)</code> computes everything at once: with heads on axis 1, the leading <code>(B, H)</code> are batch dimensions for <code>@</code> (§4.4), and the matmul runs on the last two axes — a <code>(T, hd) × (hd, T)</code> per (batch, head) pair, i.e. all <code>B·H</code> score matrices in a single op, no Python loop. The mask is rebuilt each forward from <code>T</code> (you could cache it as a buffer — §3.4 — but rebuilding is simpler and the cost is trivial). Three classic bugs to not write: scaling by <code>√D</code> not <code>√hd</code>; masking after softmax; forgetting <code>.contiguous()</code> at the merge.</p>
+
+<h2 id="mlp-block">6.3 MLP and Block</h2>
+<pre><code>class MLP(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, d_ff)
+        self.fc2 = nn.Linear(d_ff, d_model)
+
+    def forward(self, x):                                # (B,T,D) -> (B,T,D)
+        return self.fc2(F.gelu(self.fc1(x)))             # widen, GELU, project back
+
+
+class Block(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff):
+        super().__init__()
+        self.ln1 = LayerNorm(d_model)
+        self.attn = CausalSelfAttention(d_model, n_heads)
+        self.ln2 = LayerNorm(d_model)
+        self.mlp = MLP(d_model, d_ff)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))                   # pre-LN attention sub-block
+        x = x + self.mlp(self.ln2(x))                    # pre-LN MLP sub-block
+        return x
+</code></pre>
+<p><code>Block</code> is §5.4 verbatim. Note the use of <code>F.gelu</code> (functional, stateless — §3.6) inside <code>MLP</code>, versus the <code>nn.Module</code> submodules (<code>ln1</code>, <code>attn</code>, …) that own parameters and so are registered by attribute assignment. Two <em>separate</em> <code>LayerNorm</code> instances — they learn different scales because they normalize different activations.</p>
+
+<h2 id="gpt">6.4 GPT: assembling the model</h2>
+<pre><code>class GPT(nn.Module):
+    def __init__(self, vocab, d_model=128, n_layers=3, n_heads=4, d_ff=512, max_T=256):
+        super().__init__()
+        self.max_T = max_T
+        self.token_emb = nn.Embedding(vocab, d_model)
+        self.pos_emb = nn.Embedding(max_T, d_model)
+        self.blocks = nn.ModuleList(                      # MUST be ModuleList (§3.3)
+            [Block(d_model, n_heads, d_ff) for _ in range(n_layers)])
+        self.ln_f = LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab, bias=False)
+        self.head.weight = self.token_emb.weight         # weight tying (§5.5)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, std=0.02)
+
+    def forward(self, idx):                              # idx: (B, T) ints
+        B, T = idx.shape
+        pos = torch.arange(T, device=idx.device)         # (T,)
+        x = self.token_emb(idx) + self.pos_emb(pos)      # (B, T, D), pos broadcasts
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        return self.head(x)                              # (B, T, vocab)
+</code></pre>
+<p>Everything from Part I shows up here. <code>nn.ModuleList</code> so the blocks register (a plain list would leave them untrained — §3.3). Weight tying by assigning <code>self.head.weight = self.token_emb.weight</code> — the two now share one <code>(V, D)</code> tensor, and since <code>Linear</code> computes <code>x @ weight.T</code>, that's the tied unembedding (§5.5). <code>self.apply(fn)</code> walks every submodule and runs <code>fn</code> on it — the standard initialization idiom, here normal(0, 0.02) for weights and zeros for biases. The <code>forward</code> is the §5.1 pipeline line for line.</p>
+<div class="box warning"><div class="box-title">Weight tying and the pos_emb device</div>
+<p>Two subtleties. (1) Tying must use <em>identical shapes</em>: <code>nn.Linear(D, V)</code> has weight <code>(V, D)</code>, and <code>nn.Embedding(V, D)</code> has weight <code>(V, D)</code> — they match, so the assignment shares storage cleanly. (2) <code>torch.arange(T)</code> defaults to CPU; on GPU it must be created with <code>device=idx.device</code> or the <code>pos_emb</code> lookup mixes devices and crashes. Both are exactly the kind of thing Part I trained you to catch.</p>
+</div>
+
+<h2 id="count">6.5 Counting parameters as a sanity check</h2>
+<p>Before training, count: <code>sum(p.numel() for p in model.parameters())</code>. For our config on a vocab of 46 you should get <strong>632,192</strong> parameters. A number far from what you expect means a layer is the wrong size or — if it's suspiciously <em>small</em> — a sub-block isn't registered (the <code>ModuleList</code>/plain-list trap). This one line catches structural bugs before you waste a training run on them.</p>
+
+<h2 id="problems">Implementation set</h2>
+<p>Write each class in a real file (call it <code>my_transformer.py</code>), testing each in the REPL as you go — instantiate it, push a random tensor through, check the output shape. The boxes here are for drafting; the reference for each is also in <code>code/transformer.py</code>, and <code>code/test_torch_core.py</code> machine-checks the lot. Don't open a reference until your version runs.</p>
+
+<div class="quiz" data-concept="ch6.html#ln" data-concept-label="§6.1 LayerNorm" data-min="160" data-placeholder="class LayerNorm(nn.Module):&#10;    def __init__(self, d_model, eps=1e-5):&#10;        super().__init__()&#10;        ...&#10;    def forward(self, x):&#10;        ...&#10;# test: out.mean(-1)~0, out.var(-1, unbiased=False)~1">
+  <div class="q-text"><p>Write <code>LayerNorm(nn.Module)</code> with learned <code>gamma</code>/<code>beta</code> (shape <code>(D,)</code>, initialized to ones/zeros). Test on a random <code>(B, T, D)</code> input that <code>out.mean(-1)</code> ≈ 0 and <code>out.var(-1, unbiased=False)</code> ≈ 1, and that it matches <code>nn.LayerNorm(D)</code> (default init) to <code>atol=1e-5</code>. Add comments: what breaks with (a) <code>dim=0</code>, (b) no <code>keepdim</code>, (c) <code>unbiased=True</code>, (d) <code>eps</code> outside the sqrt?</p></div>
+  <div class="hint">Two reductions over <code>dim=-1</code> with <code>keepdim=True</code>; standardize; affine with the two Parameters. The match to <code>nn.LayerNorm</code> requires <code>unbiased=False</code>.</div>
+  <div class="answer"><pre><code>class LayerNorm(nn.Module):
+    def __init__(self, d_model, eps=1e-5):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(d_model))
+        self.beta = nn.Parameter(torch.zeros(d_model))
+        self.eps = eps
+    def forward(self, x):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        return (x - mean) / torch.sqrt(var + self.eps) * self.gamma + self.beta
+# (a) dim=0: normalizes over the BATCH — wrong stats, leaks across examples
+# (b) no keepdim: stats are (B,T), won't broadcast against (B,T,D) -> error
+# (c) unbiased=True: divides by D-1, so it won't match nn.LayerNorm (silent)
+# (d) eps outside sqrt: a constant token has var 0 -> 1/sqrt(0)=inf -> NaN</code></pre><p>This is check 1 of <code>test_torch_core.py</code> (it compares against <code>nn.LayerNorm</code>).</p></div>
+</div>
+
+<div class="quiz" data-concept="ch6.html#attn" data-concept-label="§6.2 CausalSelfAttention" data-min="350" data-placeholder="import math&#10;class CausalSelfAttention(nn.Module):&#10;    def __init__(self, d_model, n_heads):&#10;        super().__init__()&#10;        ...&#10;    def forward(self, x):  # (B,T,D)&#10;        ...">
+  <div class="q-text"><p>The centerpiece. Write <code>CausalSelfAttention(nn.Module)</code> — four bias-free <code>nn.Linear</code> projections, multi-head, causal — annotating each forward line with its shape. Tests before comparing: output shape equals input shape; and on an input where all tokens are identical, attention reduces to a uniform average over the visible prefix (so row <code>t</code>'s output equals the mean of <code>v[:t+1]</code>). Finish with a comment: why does <code>q @ k.transpose(-2,-1)</code> produce all <code>B·H</code> score matrices at once, and which axis-1 op needs <code>.contiguous()</code>?</p></div>
+  <div class="hint">Order: project → <code>view(B,T,H,hd)</code> → <code>transpose(1,2)</code> → <code>q@kᵀ/√hd</code> → <code>tril</code> + <code>masked_fill(-inf)</code> → <code>softmax(dim=-1)</code> → <code>@v</code> → <code>transpose(1,2).contiguous().view(B,T,D)</code> → <code>wo</code>.</div>
+  <div class="hint">Three bugs to avoid: dividing by <code>√D</code> instead of <code>√hd</code>; masking after softmax; merging heads without <code>.contiguous()</code> (raises a stride error).</div>
+  <div class="answer"><pre><code>import math
+class CausalSelfAttention(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.wq = nn.Linear(d_model, d_model, bias=False)
+        self.wk = nn.Linear(d_model, d_model, bias=False)
+        self.wv = nn.Linear(d_model, d_model, bias=False)
+        self.wo = nn.Linear(d_model, d_model, bias=False)
+    def forward(self, x):                                # (B, T, D)
+        B, T, D = x.shape
+        H, hd = self.n_heads, self.d_head
+        q = self.wq(x).view(B, T, H, hd).transpose(1, 2)  # (B, H, T, hd)
+        k = self.wk(x).view(B, T, H, hd).transpose(1, 2)
+        v = self.wv(x).view(B, T, H, hd).transpose(1, 2)
+        scores = (q @ k.transpose(-2, -1)) / math.sqrt(hd)  # (B, H, T, T)
+        mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
+        scores = scores.masked_fill(~mask, float("-inf"))
+        attn = F.softmax(scores, dim=-1)                    # (B, H, T, T)
+        out = (attn @ v).transpose(1, 2).contiguous().view(B, T, D)  # (B,T,D)
+        return self.wo(out)
+# leading (B,H) are batch dims for @, so q @ kᵀ is a (T,hd)x(hd,T) matmul per
+# (batch, head): all B·H score matrices in one op, no head loop.
+# .contiguous() at the merge: transpose(1,2) makes the tensor non-contiguous
+# and view() requires row-major memory.</code></pre><p>Check 2 of <code>test_torch_core.py</code> compares this against a per-head Python-loop reference; check 3 is the causality test. Point the test's import at <em>your</em> file and run them.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch6.html#mlp-block" data-concept-label="§6.3 MLP + Block" data-min="200" data-placeholder="class MLP(nn.Module):&#10;    ...&#10;class Block(nn.Module):&#10;    ...&#10;# why two LayerNorms, not one shared:">
+  <div class="q-text"><p>Write <code>MLP(nn.Module)</code> (<code>D → d_ff → D</code> with <code>F.gelu</code>) and <code>Block(nn.Module)</code> (pre-LN, two residual adds, owning <code>ln1/attn/ln2/mlp</code>). Test that a <code>(B, T, D)</code> input gives a <code>(B, T, D)</code> output. Comments: why two separate <code>LayerNorm</code>s rather than one shared instance, and what trainability problem appears at depth if you drop the <code>x +</code>.</p></div>
+  <div class="hint">Pre-LN: <code>x = x + self.attn(self.ln1(x))</code>, then <code>x = x + self.mlp(self.ln2(x))</code>. Use <code>F.gelu</code> (functional) inside MLP.</div>
+  <div class="answer"><pre><code>class MLP(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, d_ff)
+        self.fc2 = nn.Linear(d_ff, d_model)
+    def forward(self, x):
+        return self.fc2(F.gelu(self.fc1(x)))
+
+class Block(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff):
+        super().__init__()
+        self.ln1 = LayerNorm(d_model)
+        self.attn = CausalSelfAttention(d_model, n_heads)
+        self.ln2 = LayerNorm(d_model)
+        self.mlp = MLP(d_model, d_ff)
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
+# two LayerNorms: they normalize different activations (pre-attention vs
+# pre-MLP) and learn different gamma/beta; one shared norm would force the
+# same statistics on both sub-blocks.
+# drop x+: no identity highway -> gradients shrink through each block ->
+# deep stacks stop learning.</code></pre></div>
+</div>
+
+<div class="quiz" data-concept="ch6.html#gpt" data-concept-label="§6.4 GPT" data-min="280" data-placeholder="class GPT(nn.Module):&#10;    def __init__(self, vocab, d_model=128, n_layers=3, n_heads=4, d_ff=512, max_T=256):&#10;        super().__init__()&#10;        ...&#10;    def forward(self, idx):  # (B,T)&#10;        ...">
+  <div class="q-text"><p>Assemble <code>GPT(nn.Module)</code>: token + positional <code>nn.Embedding</code>, a <code>ModuleList</code> of blocks, final <code>LayerNorm</code>, a tied unembedding head, and normal(0, 0.02) init via <code>self.apply</code>. The <code>forward(idx)</code> maps <code>(B, T)</code> ids to <code>(B, T, vocab)</code> logits. Tests: instantiate <code>GPT(46)</code> and check the param count is <code>632,192</code>; and on random tokens the first loss is ≈ <code>ln 46 = 3.83</code>. Comments: why <code>blocks</code> must be a <code>ModuleList</code>, and why <code>torch.arange(T)</code> needs <code>device=idx.device</code>.</p></div>
+  <div class="hint">Tie with <code>self.head.weight = self.token_emb.weight</code>. Lift positions with <code>pos = torch.arange(T, device=idx.device)</code>, add <code>pos_emb(pos)</code> (broadcasts over B). Loop the blocks, final norm, head.</div>
+  <div class="hint">Param count and init-loss sanity: <code>sum(p.numel() for p in m.parameters())</code> should be 632,192; <code>F.cross_entropy(m(toks).reshape(-1,46), rand_targets.reshape(-1))</code> ≈ 3.83 on a fresh model.</div>
+  <div class="answer"><pre><code>class GPT(nn.Module):
+    def __init__(self, vocab, d_model=128, n_layers=3, n_heads=4, d_ff=512, max_T=256):
+        super().__init__()
+        self.max_T = max_T
+        self.token_emb = nn.Embedding(vocab, d_model)
+        self.pos_emb = nn.Embedding(max_T, d_model)
+        self.blocks = nn.ModuleList(
+            [Block(d_model, n_heads, d_ff) for _ in range(n_layers)])
+        self.ln_f = LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab, bias=False)
+        self.head.weight = self.token_emb.weight         # weight tying
+        self.apply(self._init_weights)
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, std=0.02)
+            if m.bias is not None: nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, std=0.02)
+    def forward(self, idx):                              # (B, T)
+        B, T = idx.shape
+        pos = torch.arange(T, device=idx.device)         # (T,)
+        x = self.token_emb(idx) + self.pos_emb(pos)      # (B, T, D)
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        return self.head(x)                              # (B, T, vocab)
+# ModuleList: a plain list wouldn't register the blocks -> their params miss
+#   parameters() -> they never train.
+# device=idx.device: arange defaults to CPU; on GPU the pos_emb lookup would
+#   mix devices and crash. Match the input's device.</code></pre><p>Check 5 of <code>test_torch_core.py</code> is the init-loss ≈ ln(vocab); check 3 is causality against the full model.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch6.html#count" data-concept-label="§6.1–6.4 Whole model" data-min="220" data-placeholder="# Assemble my_transformer.py and write your OWN causality test (~6 lines):&#10;# corrupt tokens >= t, assert logits < t unchanged.&#10;# Report: param count, init loss, causality pass/fail.">
+  <div class="q-text"><p>The cash-out. Assemble your five classes into <code>my_transformer.py</code> and run three checks against it yourself: (1) parameter count equals <code>632,192</code>; (2) the init loss on random tokens is ≈ 3.83; (3) a causality test you write from scratch (~6 lines) — clone a token sequence, corrupt positions <code>≥ t</code>, run both through the model, and assert the logits at positions <code>&lt; t</code> are unchanged with <code>torch.allclose</code>. Paste your test and all three results. Don't open the reference until they pass or you're genuinely stuck — debugging your own model is half the value here.</p></div>
+  <div class="hint">Causality test: <code>toks2 = toks.clone(); toks2[0, t:] = (toks2[0, t:] + 1) % V</code>, then under <code>no_grad</code> compare <code>model(toks)[0, :t]</code> vs <code>model(toks2)[0, :t]</code> with <code>torch.allclose(..., atol=1e-5)</code>. Put the model in <code>.eval()</code> first so there's no dropout noise.</div>
+  <div class="answer"><pre><code>import torch, torch.nn.functional as F
+from my_transformer import GPT
+
+torch.manual_seed(0)
+model = GPT(46).eval()
+print(sum(p.numel() for p in model.parameters()))    # 632192
+
+toks = torch.randint(0, 46, (4, 16))
+with torch.no_grad():
+    loss = F.cross_entropy(model(toks).reshape(-1, 46),
+                           torch.randint(0, 46, (4 * 16,)))
+print(loss.item())                                   # ~3.83 (= ln 46)
+
+# causality test (write this yourself):
+t = 9
+a = torch.randint(0, 46, (1, 16))
+b = a.clone(); b[0, t:] = (b[0, t:] + 1) % 46        # corrupt the future
+with torch.no_grad():
+    la, lb = model(a), model(b)
+print(torch.allclose(la[0, :t], lb[0, :t], atol=1e-5))   # True
+# reference assembly: code/transformer.py
+# reference checks: code/test_torch_core.py -> ALL 7 CHECKS PASS</code></pre><p>If your from-scratch file hits 632,192 params, an init loss near 3.83, and a passing causality test, you have written a working transformer in PyTorch without reference. Chapter 7 makes it learn.</p></div>
+</div>
+
+</main>
+</body>
+</html>

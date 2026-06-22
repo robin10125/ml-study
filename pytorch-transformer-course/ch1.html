@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 1 · Tensors: Shapes, Broadcasting &amp; In-Place Ops</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 1</span> · Tensors: Shapes, Broadcasting &amp; In-Place Ops</h1>
+<p class="subtitle">Everything in PyTorch is a tensor flowing through operations that reshape it. Before autograd, before <code>nn.Module</code>, you need the shape language fluent: how tensors are created, indexed, broadcast, and reshaped — and the handful of syntax traps that produce 90% of "RuntimeError: size mismatch". Ninety percent of writing a transformer is keeping shapes straight; this chapter is where that skill is built.</p>
+
+<h2 id="tensor">1.1 A tensor is data + dtype + device + shape</h2>
+<p>A <code>torch.Tensor</code> is an n-dimensional array, like a NumPy <code>ndarray</code>, but carrying two extra things that matter constantly: a <strong>device</strong> (CPU or a particular GPU) and a flag for whether autograd is tracking it (Chapter 2). Four attributes you will read all day:</p>
+<pre><code>import torch
+x = torch.tensor([[1.0, 2.0, 3.0],
+                  [4.0, 5.0, 6.0]])
+x.shape     # torch.Size([2, 3])  — a tuple; x.shape[0] == 2
+x.dtype     # torch.float32       — the default for floats
+x.device    # device(type='cpu')
+x.ndim      # 2                   — number of axes
+x.numel()   # 6                   — total number of elements
+</code></pre>
+<p>The most important habit in all of PyTorch: <strong>think in shapes</strong>. When you read code, annotate every intermediate with its shape; when you write it, predict the output shape before you run. A transformer is a sequence of shape transformations <code>(B, T)</code> → <code>(B, T, D)</code> → … → <code>(B, T, V)</code>, and bugs are almost always a shape that isn't what you assumed.</p>
+<div class="box keypoint"><div class="box-title">dtype and device must match</div>
+<p>Operations require operands to share a dtype and a device. <code>float_tensor + int_tensor</code> sometimes promotes, but <code>a @ b</code> with mismatched dtypes, or a CPU tensor combined with a CUDA tensor, raises. Two conversions you'll use everywhere: <code>x.float()</code> / <code>x.long()</code> (dtype) and <code>x.to(device)</code> (device, and optionally dtype). Integer tokens are <code>torch.long</code> (int64); model activations are <code>torch.float32</code>.</p>
+</div>
+
+<h2 id="create">1.2 Creating tensors</h2>
+<p>The constructors you'll reach for, and what each is <em>for</em>:</p>
+<pre><code>torch.tensor([1, 2, 3])          # from a Python list; infers dtype (here int64)
+torch.zeros(2, 3)                # (2,3) of 0.0       — note: shape as *args, not a tuple
+torch.ones(2, 3)                 # (2,3) of 1.0
+torch.full((2, 3), 7.0)          # (2,3) of 7.0       — here shape IS a tuple
+torch.arange(5)                  # tensor([0,1,2,3,4]) — like range(), exclusive end
+torch.arange(0, 1, 0.25)         # tensor([0.0, 0.25, 0.5, 0.75])
+torch.eye(3)                     # 3x3 identity
+torch.randn(2, 3)                # (2,3) ~ N(0,1)     — the workhorse for init
+torch.rand(2, 3)                 # (2,3) ~ Uniform[0,1)
+torch.randint(0, 10, (2, 3))     # (2,3) ints in [0,10)
+torch.zeros_like(x)              # zeros, matching x's shape AND dtype AND device
+</code></pre>
+<div class="box warning"><div class="box-title">The shape-argument inconsistency that trips everyone</div>
+<p><code>torch.zeros</code>, <code>ones</code>, <code>randn</code>, <code>rand</code> take the shape as <em>separate arguments</em>: <code>torch.zeros(2, 3)</code>. But <code>torch.full</code>, <code>torch.randint</code>, and the <code>.view()</code>/<code>.reshape()</code> methods take a <em>tuple</em>: <code>torch.full((2, 3), 7)</code>. Passing a tuple to <code>torch.zeros((2,3))</code> happens to work (it accepts both), but mixing them up the other way — <code>torch.randint(0, 10, 2, 3)</code> — errors. When unsure, a tuple is the safe choice.</p>
+</div>
+<p>For reproducibility there is a global RNG, seeded once: <code>torch.manual_seed(0)</code>. (Unlike JAX, PyTorch keeps a hidden stateful RNG — each <code>randn</code> call advances it, so two calls differ.) For a local, non-global stream pass a <code>generator=</code>: <code>g = torch.Generator().manual_seed(0); torch.randn(3, generator=g)</code>.</p>
+
+<h2 id="index">1.3 Indexing and slicing</h2>
+<p>NumPy indexing carries over wholesale. The forms that matter for model code:</p>
+<pre><code>x = torch.arange(12).reshape(3, 4)     # rows 0..2, cols 0..3
+x[0]            # first row,    shape (4,)        — indexing drops that axis
+x[0, 2]        # scalar tensor, shape ()
+x[:, 1]        # second column, shape (3,)
+x[0:2]         # first two rows, shape (2, 4)     — slicing KEEPS the axis
+x[:, -1]       # last column
+x[x &gt; 5]       # boolean mask -&gt; 1-D tensor of the matching elements
+</code></pre>
+<p>Two distinctions worth burning in. <strong>Indexing with an integer removes an axis; slicing with <code>a:b</code> keeps it.</strong> <code>x[0]</code> is <code>(4,)</code> but <code>x[0:1]</code> is <code>(1, 4)</code>. And the <strong>ellipsis</strong> <code>...</code> means "all the axes I didn't mention," which is how you index the last axis of an unknown-rank tensor: <code>x[..., -1]</code> takes the last element along the final axis whether <code>x</code> is 2-D or 4-D. You'll use that in attention.</p>
+<p><strong>Fancy / integer-array indexing</strong> is the engine behind embeddings. Index a table with a tensor of integers and you gather rows:</p>
+<pre><code>table = torch.randn(46, 8)             # (vocab=46, dim=8)
+ids = torch.tensor([[1, 1, 4],
+                    [4, 0, 1]])         # (B=2, T=3) token ids
+table[ids].shape                        # (2, 3, 8) — one 8-vector per id
+</code></pre>
+<p>That single line, <code>table[ids]</code>, <em>is</em> what <code>nn.Embedding</code> does. The output shape is the index shape with the looked-up vector appended.</p>
+
+<h2 id="broadcast">1.4 Broadcasting: the rule behind every elementwise op</h2>
+<p>When two tensors have different shapes, PyTorch tries to <strong>broadcast</strong> them to a common shape before operating elementwise. The rule, applied axis by axis <em>from the right</em>:</p>
+<div class="box definition"><div class="box-title">The broadcasting rule</div>
+<p>Align shapes at their trailing (rightmost) dimensions. For each axis, the sizes are compatible if they are <strong>equal</strong>, or <strong>one of them is 1</strong> (that operand is virtually repeated along the axis), or one tensor <strong>runs out of axes</strong> (treated as size 1). Otherwise it's an error.</p>
+</div>
+<pre><code>a = torch.randn(4, 3)
+b = torch.randn(3)         # (3,) aligns to the last axis of (4,3)
+a + b                       # (4,3): b added to every row
+
+c = torch.randn(4, 1)
+a + c                       # (4,3): c's column broadcast across the 3 columns
+
+m = torch.randn(4, 3)
+n = torch.randn(4)
+m + n                       # ERROR: (4,3) vs (4,) -> trailing 3 vs 4, incompatible
+m + n[:, None]              # (4,1) vs (4,3) -> OK: add n as a column
+</code></pre>
+<p>The fix in that last line is the workhorse move: <code>n[:, None]</code> (equivalently <code>n.unsqueeze(1)</code>) inserts a size-1 axis so the shapes line up. LayerNorm's per-token mean is exactly this — compute a <code>(B, T, 1)</code> statistic and let it broadcast back over <code>(B, T, D)</code>.</p>
+<div class="box keypoint"><div class="box-title">Broadcasting bugs are silent</div>
+<p>If the shapes happen to be broadcast-compatible but not what you meant, you get <em>wrong numbers, no error</em>. The classic: subtracting a <code>(T,)</code> from a <code>(B, T)</code> when you meant per-batch — it broadcasts along the wrong axis and trains badly with nothing to debug. Always check that an elementwise result has the shape you expect.</p>
+</div>
+
+<h2 id="reshape">1.5 The reshape family — and the contiguity trap</h2>
+<p>Rearranging axes is most of what attention code does. The operations, by what they change:</p>
+<table>
+<tr><th>op</th><th>what it does</th><th>moves data?</th></tr>
+<tr><td><code>x.view(2, 6)</code></td><td>reinterpret the same memory with a new shape</td><td>no — requires contiguous</td></tr>
+<tr><td><code>x.reshape(2, 6)</code></td><td>same, but copies if it has to</td><td>only if needed</td></tr>
+<tr><td><code>x.transpose(0, 1)</code></td><td>swap two axes</td><td>no — returns a view</td></tr>
+<tr><td><code>x.permute(2, 0, 1)</code></td><td>reorder all axes at once</td><td>no — returns a view</td></tr>
+<tr><td><code>x.unsqueeze(1)</code></td><td>insert a size-1 axis at position 1</td><td>no</td></tr>
+<tr><td><code>x.squeeze(1)</code></td><td>remove a size-1 axis</td><td>no</td></tr>
+<tr><td><code>x.flatten(1)</code></td><td>collapse axes 1.. into one</td><td>only if needed</td></tr>
+</table>
+<p><code>-1</code> in a <code>view</code>/<code>reshape</code> means "infer this axis from the total element count": <code>x.view(B, T, -1)</code> figures out the last dimension for you. Exactly one axis may be <code>-1</code>.</p>
+<p><strong>transpose vs permute:</strong> <code>transpose(i, j)</code> swaps exactly two axes; <code>permute</code> takes the full new ordering. <code>x.transpose(1, 2)</code> on a 4-D tensor is <code>x.permute(0, 2, 1, 3)</code>.</p>
+<div class="box warning"><div class="box-title">view fails after transpose — and why .contiguous() fixes it</div>
+<p><code>transpose</code> and <code>permute</code> don't move data; they return a <em>view</em> with rearranged strides, so the elements are no longer laid out in row-major order. <code>view</code> demands row-major (contiguous) memory and will raise <code>RuntimeError: view size is not compatible with input tensor's size and stride</code>. Two fixes: call <code>.contiguous()</code> first (forces a copy into row-major), or use <code>.reshape()</code> (which calls <code>contiguous</code> for you when needed). This is <em>the</em> attention-code gotcha — after <code>attn_out.transpose(1, 2)</code> you must <code>.contiguous().view(B, T, D)</code> to merge heads.</p>
+</div>
+<pre><code>x = torch.arange(6).reshape(2, 3)
+x.t().view(6)            # RuntimeError: not contiguous
+x.t().contiguous().view(6)   # ok
+x.t().reshape(6)             # ok — reshape copies when needed
+</code></pre>
+
+<h2 id="reduce">1.6 Reductions: <code>dim</code> and <code>keepdim</code></h2>
+<p>Sums, means, maxes, softmaxes — all take a <code>dim</code> saying <em>which axis to collapse</em>, and a <code>keepdim</code> saying whether to leave a size-1 stub in its place:</p>
+<pre><code>x = torch.randn(2, 3, 4)            # (B, T, D)
+x.sum()                  # scalar — reduce everything
+x.sum(dim=-1)            # (2, 3)    — collapse the last axis
+x.sum(dim=-1, keepdim=True)  # (2, 3, 1) — keep it as size 1 for broadcasting
+x.mean(dim=0)            # (3, 4)    — average over the batch
+x.max(dim=-1)            # NamedTuple(values=(2,3), indices=(2,3))
+</code></pre>
+<p><code>keepdim=True</code> is what lets a statistic broadcast straight back against the original tensor: <code>x - x.mean(dim=-1, keepdim=True)</code> works because <code>(2,3,1)</code> broadcasts over <code>(2,3,4)</code>; without <code>keepdim</code> the <code>(2,3)</code> result wouldn't align. <code>dim=-1</code> ("the last axis", the feature axis) is the one you want for per-token operations; <code>dim=0</code> (the batch axis) is almost never what a model wants to normalize over.</p>
+<div class="box warning"><div class="box-title">var() defaults to the unbiased (Bessel-corrected) estimate</div>
+<p><code>x.var(dim=-1)</code> divides by \(n-1\), not \(n\). LayerNorm uses the <em>biased</em> variance (divide by \(n\)), so you must pass <code>unbiased=False</code> to match <code>nn.LayerNorm</code>. Forgetting this is a real, silent discrepancy you'll hit in Chapter 6. (<code>.mean()</code> has no such trap; <code>.std()</code> shares <code>var</code>'s.)</p>
+</div>
+
+<h2 id="inplace">1.7 In-place ops, the trailing underscore, and the NumPy bridge</h2>
+<p>Most PyTorch ops return a <strong>new</strong> tensor and leave their input alone — <code>y = x + 1</code> doesn't touch <code>x</code>. The exceptions are <strong>in-place</strong> ops, marked by a <em>trailing underscore</em>, which mutate the tensor and return it:</p>
+<pre><code>x.add_(1)        # x += 1, in place
+x.mul_(0.5)      # x *= 0.5
+x.zero_()        # fill with 0
+x.clamp_(min=0)  # ReLU, in place
+x.relu()         # NOT in place — returns a new tensor
+x += 1           # in place (Python's augmented assignment maps to add_)
+</code></pre>
+<div class="box keypoint"><div class="box-title">The underscore convention</div>
+<p><code>foo_()</code> mutates and returns self; <code>foo()</code> returns a fresh tensor. This is consistent across the whole library. In-place ops save memory, but they fight autograd: mutating a tensor that the backward pass still needs raises <em>"a variable needed for gradient computation has been modified by an inplace operation."</em> Until you understand Chapter 2, prefer out-of-place (<code>x = x + 1</code>) in any code that will be differentiated, and reserve in-place ops for the optimizer and explicit no-grad regions.</p>
+</div>
+<p>Finally, the <strong>NumPy bridge</strong>. <code>torch.from_numpy(arr)</code> and <code>tensor.numpy()</code> convert between the two — and for CPU tensors they <em>share memory</em>, so mutating one changes the other. <code>tensor.tolist()</code> gives plain Python; <code>tensor.item()</code> pulls a one-element tensor out as a Python number (you'll use <code>loss.item()</code> constantly to log without dragging the autograd graph along).</p>
+
+<h2 id="problems">Problem set</h2>
+<p>Work these in order, in the box (it saves automatically) and in a live <code>python</code> session — <code>import torch</code> and actually run what you write, checking every shape. The reference unlocks once you've made a real attempt; the 📖 link jumps back to the section a problem draws on.</p>
+
+<div class="quiz" data-concept="ch1.html#tensor" data-concept-label="§1.1 dtype/device/shape" data-min="60" data-placeholder="# predictions first, then verify in the REPL&#10;a.dtype = ...&#10;# (a)&#10;...&#10;# (b)&#10;...">
+  <div class="q-text"><p>Predict, then verify. (a) What <code>dtype</code> does <code>torch.tensor([1, 2, 3])</code> have, and <code>torch.tensor([1.0, 2, 3])</code>? (b) You have <code>ids = torch.tensor([1, 2, 3])</code> (a tensor of token indices) but a layer needs floats. Write the conversion. (c) You have a CPU tensor <code>x</code> and a variable <code>device</code>; write the one call that moves it there. Add a one-line note on why token ids should stay <code>long</code>, not become <code>float</code>.</p></div>
+  <div class="hint">dtype is inferred from the contents: any float makes the whole tensor float. <code>.float()</code>, <code>.long()</code>, and <code>.to(device)</code> are the three converters.</div>
+  <div class="answer"><pre><code># (a) [1,2,3] -> torch.int64 (long); [1.0,2,3] -> torch.float32
+#     a single float promotes the whole tensor to float
+# (b)
+ids_f = ids.float()                 # or ids.to(torch.float32)
+# (c)
+x = x.to(device)                    # returns a tensor on `device`; rebind it
+# ids index an embedding table (a gather): they must be integer indices.
+# As floats they can't index, and nn.Embedding requires LongTensor input.</code></pre></div>
+</div>
+
+<div class="quiz" data-concept="ch1.html#index" data-concept-label="§1.3 Indexing" data-min="80" data-placeholder="x = torch.arange(24).reshape(2, 3, 4)&#10;# (a)&#10;...&#10;# (b)&#10;...&#10;# (c)&#10;...">
+  <div class="q-text"><p>Let <code>x = torch.arange(24).reshape(2, 3, 4)</code> with axes <code>(B, T, D)</code>. Write expressions and <strong>predict each shape before running</strong>: (a) the last feature of every (B, T) position; (b) the first time-step of every batch element; (c) row 0's time-steps 1 onward. Then explain in a comment why <code>x[0]</code> and <code>x[0:1]</code> have different shapes.</p></div>
+  <div class="hint">Use the ellipsis for "all leading axes": <code>x[..., -1]</code>. An integer index removes its axis; a slice <code>a:b</code> keeps it.</div>
+  <div class="answer"><pre><code>x[..., -1]      # (a) (2, 3)  — last feature, all (B,T)
+x[:, 0]         # (b) (2, 4)  — first time-step, all batch
+x[0, 1:]        # (c) (2, 4)  — batch 0, T from index 1, all D
+# x[0]   -> (3, 4): integer index drops the batch axis
+# x[0:1] -> (1, 3, 4): a slice keeps the axis (size 1)</code></pre><p>That keep-vs-drop distinction is exactly how you take "the last position's logits" in generation: <code>logits[:, -1, :]</code> keeps batch and feature, drops time.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch1.html#index" data-concept-label="§1.3 Fancy indexing" data-min="60" data-placeholder="table = torch.randn(46, 8)&#10;ids = torch.randint(0, 46, (2, 5))&#10;# embedded = ...&#10;# shape: ...">
+  <div class="q-text"><p>You have an embedding table <code>table</code> of shape <code>(46, 8)</code> and a batch of token ids <code>ids</code> of shape <code>(2, 5)</code>. Write the single expression that looks up an 8-vector for every id, and state the output shape. In a comment, give the general rule for the shape of <code>table[ids]</code>.</p></div>
+  <div class="hint">Integer-array indexing: <code>table[ids]</code>. The result takes the shape of the index, then appends the looked-up vector's shape.</div>
+  <div class="answer"><pre><code>embedded = table[ids]               # shape (2, 5, 8)
+# rule: table[idx] has shape idx.shape + table.shape[1:]
+# i.e. replace each integer in `ids` with the row table[that integer].
+# This IS nn.Embedding(46, 8)(ids).</code></pre></div>
+</div>
+
+<div class="quiz" data-concept="ch1.html#broadcast" data-concept-label="§1.4 Broadcasting" data-min="100" data-placeholder="# For each pair: result shape or ERROR, with the reason&#10;# (a) (8,1,6) + (1,5,6)&#10;# (b) (8,5,6) + (6,)&#10;# (c) (8,5,6) + (5,)&#10;# (d) fix (c):">
+  <div class="q-text"><p>For each pair give the broadcast result shape or write ERROR with the reason — work it right-to-left: (a) <code>(8, 1, 6)</code> + <code>(1, 5, 6)</code>; (b) <code>(8, 5, 6)</code> + <code>(6,)</code>; (c) <code>(8, 5, 6)</code> + <code>(5,)</code>. Then (d): fix (c) so the <code>(5,)</code> adds along the time axis, with a one-line explanation.</p></div>
+  <div class="hint">Align trailing axes. Compatible if equal, or one is 1, or one tensor has run out of axes. For (d) you need to insert a size-1 axis so the 5 lands on the right axis.</div>
+  <div class="answer"><pre><code># (a) (8, 5, 6)  — the two size-1 axes each expand
+# (b) (8, 5, 6)  — (6,) aligns to the last axis, broadcasts over (8,5)
+# (c) ERROR      — trailing axes 6 vs 5 are incompatible
+# (d)
+fixed = a + b[:, None]              # b: (5,) -> (5,1), aligns to the T axis,
+                                    # broadcasts across the 6 features
+# (b[None, :, None] also works to be explicit about all three axes.)</code></pre></div>
+</div>
+
+<div class="quiz" data-concept="ch1.html#reshape" data-concept-label="§1.5 Reshape family" data-min="120" data-placeholder="x = torch.randn(2, 6, 32)  # (B, T, D)&#10;# split D=32 into H=4 heads of 8, then put heads next to batch&#10;q = ...&#10;# back to (B, T, D):&#10;merged = ...">
+  <div class="q-text"><p>The core attention reshape. Given <code>x</code> of shape <code>(B=2, T=6, D=32)</code>, split the feature axis into <code>H=4</code> heads of size <code>8</code> and produce a tensor of shape <code>(B, H, T, 8)</code>. Then, from a tensor of that shape, write the inverse that merges heads back to <code>(B, T, D)</code>. One of the two directions needs a <code>.contiguous()</code> — say which and why.</p></div>
+  <div class="hint">Forward: <code>view(B, T, H, 8)</code> then <code>transpose(1, 2)</code>. Inverse: <code>transpose(1, 2)</code> then back to <code>(B, T, D)</code> — but <code>view</code> after a transpose needs contiguous memory.</div>
+  <div class="hint">Why the transpose breaks <code>view</code>: <code>transpose</code> returns a non-contiguous view (rearranged strides); <code>view</code> requires row-major. Insert <code>.contiguous()</code> or use <code>.reshape()</code>.</div>
+  <div class="answer"><pre><code>B, T, D = x.shape; H, hd = 4, 8
+# split into heads, move H next to B
+q = x.view(B, T, H, hd).transpose(1, 2)        # (B, H, T, 8)
+
+# merge heads back: transpose first, THEN flatten the last two axes
+merged = q.transpose(1, 2).contiguous().view(B, T, D)   # (B, T, 32)
+# .contiguous() is needed on the inverse: transpose(1,2) makes q non-
+# contiguous, and view() demands row-major memory. (.reshape(B,T,D)
+# would also work, copying when necessary.)
+# The forward view() is fine because x started contiguous.</code></pre><p>This exact pair of moves brackets every multi-head attention you'll write. Burn it in.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch1.html#reduce" data-concept-label="§1.6 Reductions" data-min="120" data-placeholder="def layer_norm_stats(x):  # x: (B, T, D)&#10;    mean = ...&#10;    var = ...&#10;    return (x - mean) / torch.sqrt(var + 1e-5)&#10;# why keepdim: ...&#10;# why unbiased=False: ...">
+  <div class="q-text"><p>Write the normalization core of LayerNorm: given <code>x</code> of shape <code>(B, T, D)</code>, compute the per-token (last-axis) mean and variance and return the standardized tensor <code>(x - mean) / sqrt(var + 1e-5)</code>, still shape <code>(B, T, D)</code>. Two comments: why both stats need <code>keepdim=True</code>, and why <code>var</code> needs <code>unbiased=False</code>. Verify <code>out.mean(-1)</code> ≈ 0 and <code>out.var(-1, unbiased=False)</code> ≈ 1.</p></div>
+  <div class="hint">Reduce over <code>dim=-1</code> with <code>keepdim=True</code> so the <code>(B,T,1)</code> stats broadcast back over <code>(B,T,D)</code>.</div>
+  <div class="answer"><pre><code>def layer_norm_stats(x):                       # x: (B, T, D)
+    mean = x.mean(dim=-1, keepdim=True)        # (B, T, 1)
+    var = x.var(dim=-1, keepdim=True, unbiased=False)  # (B, T, 1)
+    return (x - mean) / torch.sqrt(var + 1e-5)
+# keepdim: without it the stats are (B,T) and won't broadcast against
+#   (B,T,D) — you'd get a shape error or, worse, the wrong broadcast.
+# unbiased=False: LayerNorm uses the biased variance (divide by D, not
+#   D-1); torch's default unbiased=True would mismatch nn.LayerNorm.</code></pre><p>Add the learned scale/shift in Chapter 6 and this becomes the whole layer. It's check 1 of <code>test_torch_core.py</code>.</p></div>
+</div>
+
+<div class="quiz" data-concept="ch1.html#inplace" data-concept-label="§1.7 In-place ops" data-min="100" data-placeholder="# (a) which mutate x?&#10;# (b) share-memory surprise:&#10;# (c) loss logging:">
+  <div class="q-text"><p>Three short answers. (a) Of <code>x.add_(1)</code>, <code>x.relu()</code>, <code>x.clamp_(min=0)</code>, <code>x.mul(2)</code>, which mutate <code>x</code> in place, and how do you know at a glance? (b) After <code>a = torch.ones(3); b = a.numpy(); a.add_(1)</code>, what is <code>b</code>, and why? (c) You want to accumulate a running loss total for logging without keeping the autograd graph alive — write <code>total += ...</code> correctly.</p></div>
+  <div class="hint">Trailing underscore = in-place. <code>from_numpy</code>/<code>.numpy()</code> share memory on CPU. <code>.item()</code> extracts a Python float, detached from the graph.</div>
+  <div class="answer"><pre><code># (a) add_ and clamp_ mutate x (trailing underscore). relu() and mul()
+#     return new tensors; x is unchanged. The underscore is the tell.
+# (b) b is array([2., 2., 2.]): a.numpy() shares storage with a on CPU,
+#     so the in-place add_ is visible through b too.
+# (c)
+total += loss.item()        # .item() -> Python float, no graph retained
+# (total += loss would keep every step's graph in memory — a slow leak.)</code></pre></div>
+</div>
+
+</main>
+</body>
+</html>

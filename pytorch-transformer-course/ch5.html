@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 5 · The Transformer as Tensor Ops</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 5</span> · The Transformer as Tensor Ops</h1>
+<p class="subtitle">This is not a chapter about <em>why</em> attention works — you've met that idea. It's about pinning every box in the GPT diagram to the exact PyTorch operation and tensor shape it becomes, so that Chapter 6 is pure transcription. We walk the data from a batch of token ids to a batch of next-token logits, naming the op and tracking the shape at every step.</p>
+
+<div class="box keypoint"><div class="box-title">The shape alphabet (memorize it)</div>
+<p><strong>B</strong> = batch size · <strong>T</strong> = sequence length (tokens) · <strong>V</strong> = vocabulary size · <strong>D</strong> = <code>d_model</code>, the residual-stream width · <strong>H</strong> = number of heads · <strong>hd</strong> = <code>D / H</code>, the per-head width · <strong>d_ff</strong> = the MLP hidden width (usually <code>4D</code>). Our reference model: <code>D=128, H=4, hd=32, d_ff=512, n_layers=3</code>. Every shape below is written in these letters.</p>
+</div>
+
+<h2 id="pipeline">5.1 The whole pipeline, as shapes</h2>
+<p>A decoder-only transformer is one function <code>(B, T) ints → (B, T, V) logits</code>. Here is the entire journey, each arrow an operation you already know:</p>
+<div class="fig"><pre>tokens            (B, T)        ints
+  │  token_emb lookup  +  pos_emb lookup
+  ▼
+x                 (B, T, D)     float — the "residual stream"
+  │  × n_layers:   x = x + attn(LN(x));  x = x + mlp(LN(x))
+  ▼
+x                 (B, T, D)
+  │  final LayerNorm
+  ▼
+x                 (B, T, D)
+  │  unembed  (× tied embedding matrixᵀ)
+  ▼
+logits            (B, T, V)     a distribution over the vocab at every position</pre>
+<div class="caption">The residual stream stays <code>(B, T, D)</code> from top to bottom — every block reads it and adds back to it. Only the two ends change rank: the embedding lifts <code>(B,T)</code>→<code>(B,T,D)</code>, the unembedding projects <code>(B,T,D)</code>→<code>(B,T,V)</code>.</div>
+</div>
+
+<h2 id="embed">5.2 Embeddings: two lookups that add</h2>
+<p>The input is a <code>(B, T)</code> <code>LongTensor</code> of token ids. Two <code>nn.Embedding</code> tables turn it into vectors:</p>
+<ul>
+<li><strong>Token embedding</strong> <code>nn.Embedding(V, D)</code>: gather a <code>D</code>-vector per token → <code>(B, T, D)</code>. (The fancy-index gather from Chapter 1.)</li>
+<li><strong>Positional embedding</strong> <code>nn.Embedding(max_T, D)</code>: a learned vector per <em>position</em> <code>0..T-1</code>, looked up by <code>torch.arange(T)</code> → <code>(T, D)</code>, which <strong>broadcasts</strong> across the batch when added.</li>
+</ul>
+<pre><code>pos = torch.arange(T, device=idx.device)            # (T,)
+x = token_emb(idx) + pos_emb(pos)                    # (B,T,D) + (T,D) -> (B,T,D)
+</code></pre>
+<p>Why positions at all? Attention is permutation-equivariant — it has no inherent notion of order — so position must be injected as data. The add of a <code>(T, D)</code> onto a <code>(B, T, D)</code> is broadcasting (Chapter 1) doing exactly what it should: the same positional vector added to every batch element.</p>
+
+<h2 id="attention">5.3 Attention, op by op</h2>
+<p>One head computes, for each position, a weighted average of the value vectors at <em>visible</em> positions, where the weights come from query·key similarity. Multi-head does <code>H</code> of these in parallel on slices of the feature axis. As operations:</p>
+<table>
+<tr><th>step</th><th>op</th><th>shape</th></tr>
+<tr><td>project to q, k, v</td><td><code>x @ Wq</code> etc. (<code>nn.Linear</code>)</td><td><code>(B,T,D)</code> each</td></tr>
+<tr><td>split into heads</td><td><code>.view(B,T,H,hd)</code></td><td><code>(B,T,H,hd)</code></td></tr>
+<tr><td>head axis forward</td><td><code>.transpose(1,2)</code></td><td><code>(B,H,T,hd)</code></td></tr>
+<tr><td>scores</td><td><code>q @ k.transpose(-2,-1) / √hd</code></td><td><code>(B,H,T,T)</code></td></tr>
+<tr><td>causal mask</td><td><code>.masked_fill(future, -inf)</code></td><td><code>(B,H,T,T)</code></td></tr>
+<tr><td>weights</td><td><code>F.softmax(dim=-1)</code></td><td><code>(B,H,T,T)</code></td></tr>
+<tr><td>gather values</td><td><code>weights @ v</code></td><td><code>(B,H,T,hd)</code></td></tr>
+<tr><td>merge heads</td><td><code>.transpose(1,2).contiguous().view(B,T,D)</code></td><td><code>(B,T,D)</code></td></tr>
+<tr><td>output projection</td><td><code>@ Wo</code></td><td><code>(B,T,D)</code></td></tr>
+</table>
+<p>Three things to internalize from this table, all pure PyTorch:</p>
+<ul>
+<li><strong>Heads are a reshape, not a loop.</strong> Splitting <code>D</code> into <code>(H, hd)</code> and moving <code>H</code> next to <code>B</code> means batched matmul (§4.4) does all <code>H</code> heads — and all <code>B</code> batch elements — in one <code>@</code>. The <code>view</code>+<code>transpose</code> is the entire multi-head trick.</li>
+<li><strong>The scale is <code>√hd</code>, not <code>√D</code>.</strong> The dot product is over the per-head width <code>hd</code>, so that's the variance to normalize. Using <code>√D</code> is a real bug that just trains worse.</li>
+<li><strong>Mask with <code>-inf</code> before softmax</strong> (§4.4): <code>e^{-∞}=0</code>, so the future gets zero weight and the visible past renormalizes. The mask is lower-triangular (<code>torch.tril</code>) — position <code>t</code> may attend to <code>0..t</code>.</li>
+</ul>
+<div class="box warning"><div class="box-title">The contiguity trap, again</div>
+<p>After <code>weights @ v</code> you have <code>(B,H,T,hd)</code> with heads on axis 1. To merge heads you <code>transpose(1,2)</code> back to <code>(B,T,H,hd)</code> — but that's now non-contiguous, so a bare <code>.view(B,T,D)</code> raises. You must <code>.contiguous().view(...)</code> (or <code>.reshape(...)</code>). This is the §1.5 trap in its natural habitat; expect to hit it.</p>
+</div>
+
+<h2 id="mlp-block">5.4 The MLP and the pre-LN block</h2>
+<p>The per-position <strong>MLP</strong> is two linears with a nonlinearity, widening to <code>d_ff</code> and back: <code>Linear(D, d_ff) → GELU → Linear(d_ff, D)</code>, shape <code>(B,T,D)→(B,T,d_ff)→(B,T,D)</code>. It acts independently at every position (no mixing across <code>T</code> — that's attention's job).</p>
+<p>A <strong>block</strong> wraps attention and MLP each in a <em>pre-LN residual</em>: normalize at the entrance of the branch, add the branch output back to the untouched stream.</p>
+<pre><code>x = x + attn(ln1(x))      # attention sub-block
+x = x + mlp(ln2(x))       # MLP sub-block
+</code></pre>
+<p>Two design points, both consequential in code. <strong>Pre-LN</strong> (norm <em>inside</em> the branch, before attn/mlp) rather than post-LN keeps an unobstructed residual highway from input to output, which is what lets deep stacks train stably. And the <strong>residual <code>x +</code></strong> is not optional decoration: it's the identity path gradients flow down. Drop it and a deep stack stops training (gradients shrink multiplicatively through each block). Each block has <em>two separate</em> LayerNorms — they normalize different activations.</p>
+
+<h2 id="head">5.5 Final norm and the tied unembedding</h2>
+<p>After the last block, one more <code>LayerNorm</code>, then project the <code>(B,T,D)</code> stream to <code>(B,T,V)</code> logits. The projection matrix is, by convention, the <strong>transpose of the token-embedding matrix</strong> — "weight tying":</p>
+<pre><code>logits = x @ token_emb.weight.T          # (B,T,D) @ (D,V) -> (B,T,V)
+</code></pre>
+<p>In <code>nn.Module</code> terms that's an <code>nn.Linear(D, V, bias=False)</code> whose <code>.weight</code> is set to share storage with <code>token_emb.weight</code> (both are <code>(V, D)</code>, so the Linear computes <code>x @ weight.T</code> — exactly the tie). Tying halves the embedding parameters and ties the "meaning" of a token on the way in and out. Each output vector <code>logits[b,t]</code> is the dot product of the position's representation against every token's embedding — similarity in embedding space, read off as a score.</p>
+
+<h2 id="loss-train">5.6 From logits to a loss</h2>
+<p>Training is next-token prediction: from logits <code>(B,T,V)</code> for inputs <code>tokens[:, :-1]</code>, predict the targets <code>tokens[:, 1:]</code>. That's the <code>cross_entropy</code> with the <code>(B·T, V)</code> flatten from §4.3:</p>
+<pre><code>inputs, targets = tokens[:, :-1], tokens[:, 1:]      # the shift
+logits = model(inputs)                                # (B, T, V)
+loss = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1))
+</code></pre>
+<p>One sanity number to carry into the next chapters: an <em>untrained</em> model outputs near-uniform logits, so its loss should sit near \(\ln V\) (for our <code>V=46</code>, that's \(\ln 46 \approx 3.83\)). If your fresh model's first loss is wildly off that, something is wrong before you've trained a single step. We'll use that check explicitly.</p>
+
+<h2 id="problems">Problem set</h2>
+<p>These are shape-and-op problems — no training yet. The goal is that, asked "what does the residual stream look like after the third block?" or "which op merges the heads?", you answer instantly. The reference unlocks after a real attempt.</p>
+
+<div class="quiz" data-concept="ch5.html#pipeline" data-concept-label="§5.1 The pipeline" data-min="120" data-placeholder="# Trace the shape at each stage for B=2, T=10, D=128, V=46, n_layers=3&#10;# tokens: ...&#10;# after embeddings: ...&#10;# after block 1 / 2 / 3: ...&#10;# after final LN: ...&#10;# logits: ...">
+  <div class="q-text"><p>For <code>B=2, T=10, D=128, V=46</code>, write the shape of the tensor at each stage of the full pipeline: the input tokens, after the embeddings, after each of the 3 blocks, after the final LayerNorm, and the output logits. In a comment, state the one invariant that makes the block stack composable.</p></div>
+  <div class="hint">The residual stream is <code>(B, T, D)</code> and stays that shape through every block — that's the invariant. Only the embedding and unembedding change rank.</div>
+  <div class="answer"><pre><code>tokens          (2, 10)        ints
+after embeddings(2, 10, 128)   token_emb + pos_emb
+after block 1   (2, 10, 128)
+after block 2   (2, 10, 128)
+after block 3   (2, 10, 128)
+after final LN  (2, 10, 128)
+logits          (2, 10, 46)    unembed to vocab
+# invariant: every block is (B,T,D) -> (B,T,D), so blocks compose by simple
+# function composition / a for-loop. Shape in == shape out is what lets you
+# stack any number of them.</code></pre></div>
+</div>
+
+<div class="quiz" data-concept="ch5.html#attention" data-concept-label="§5.3 Attention shapes" data-min="160" data-placeholder="# B=2, T=10, D=128, H=4 -> hd=32. Give op + shape for each step:&#10;# project q: ...&#10;# split+transpose: ...&#10;# scores: ...&#10;# mask: ...&#10;# softmax: ...&#10;# @v: ...&#10;# merge: ...&#10;# out proj: ...">
+  <div class="q-text"><p>For <code>B=2, T=10, D=128, H=4</code> (so <code>hd=32</code>), write the PyTorch op <em>and</em> resulting shape for every step of multi-head causal attention, from projecting <code>q</code> to the final output projection. Mark which step needs <code>.contiguous()</code> and why, and which constant the scores are divided by.</p></div>
+  <div class="hint">project → <code>view(B,T,H,hd)</code> → <code>transpose(1,2)</code> → <code>q@kᵀ/√hd</code> → <code>masked_fill(-inf)</code> → <code>softmax(-1)</code> → <code>@v</code> → <code>transpose(1,2).contiguous().view(B,T,D)</code> → <code>@Wo</code>.</div>
+  <div class="answer"><pre><code>q = wq(x)                        # (2,10,128)   [also k, v]
+q = q.view(2,10,4,32).transpose(1,2)   # (2,4,10,32)  heads next to batch
+scores = q @ k.transpose(-2,-1) / sqrt(32)   # (2,4,10,10)   divide by √hd=√32
+scores = scores.masked_fill(~tril, -inf)     # (2,4,10,10)   block the future
+w = F.softmax(scores, dim=-1)                # (2,4,10,10)   rows sum to 1
+o = w @ v                                    # (2,4,10,32)
+o = o.transpose(1,2).contiguous().view(2,10,128)  # (2,10,128) merge heads
+out = wo(o)                                  # (2,10,128)
+# .contiguous() needed at the merge: transpose(1,2) makes o non-contiguous,
+# and view() requires row-major memory. Divide by √hd (=√32), NOT √D.</code></pre></div>
+</div>
+
+<div class="quiz" data-concept="ch5.html#mlp-block" data-concept-label="§5.4 The block" data-min="140" data-placeholder="# Write the two-line pre-LN block.&#10;x = ...&#10;x = ...&#10;# (a) why x+ matters at depth:&#10;# (b) how many LayerNorms per block, and why not share one:&#10;# (c) MLP inner shape for D=128:">
+  <div class="q-text"><p>Write the two lines of a pre-LN block (attention sub-block, then MLP sub-block). Then three short answers: (a) what fails at depth if you drop the <code>x +</code>; (b) how many distinct LayerNorms a block contains and why they can't be one shared norm; (c) for <code>D=128</code> and <code>d_ff=4D</code>, the shape the MLP widens to internally.</p></div>
+  <div class="hint">Pre-LN: <code>x = x + attn(ln1(x))</code> then <code>x = x + mlp(ln2(x))</code>. Two norms — they standardize different activations. <code>d_ff = 4*128 = 512</code>.</div>
+  <div class="answer"><pre><code>x = x + attn(ln1(x))      # normalize at the branch entrance, add back
+x = x + mlp(ln2(x))
+# (a) no x+: no identity highway — gradients pass multiplicatively through
+#     every block and shrink layer by layer; deep stacks stop training.
+# (b) TWO LayerNorms (ln1, ln2). They normalize different tensors (the
+#     stream before attention vs before the MLP), with their own learned
+#     scale/shift; sharing one would force the same statistics on both.
+# (c) MLP: (B,T,128) -> (B,T,512) -> (B,T,128), widening to d_ff=512.</code></pre></div>
+</div>
+
+<div class="quiz" data-concept="ch5.html#head" data-concept-label="§5.5 Tied unembedding + §5.6 loss" data-min="140" data-placeholder="# (a) unembed op + shape, with weight tying&#10;# (b) the next-token shift&#10;# (c) the expected untrained loss for V=46, and why">
+  <div class="q-text"><p>(a) Write the unembedding op that turns the final <code>(B,T,D)</code> stream into <code>(B,T,V)</code> logits using the <em>tied</em> token-embedding matrix, with shapes. (b) Write the two-line next-token shift that produces <code>inputs</code> and <code>targets</code> from a <code>(B, T+1)</code> token window. (c) State the loss a freshly-initialized model should report for <code>V=46</code>, and the one-sentence reason.</p></div>
+  <div class="hint">Unembed: <code>x @ token_emb.weight.T</code>, <code>(B,T,D)@(D,V)</code>. Shift: <code>tokens[:, :-1]</code>, <code>tokens[:, 1:]</code>. Untrained loss ≈ <code>ln(V)</code>.</div>
+  <div class="answer"><pre><code># (a)
+logits = x @ token_emb.weight.T          # (B,T,D) @ (D,V) -> (B,T,V)
+#     weight tying: the unembed matrix IS the (V,D) embedding, transposed.
+# (b)
+inputs, targets = tokens[:, :-1], tokens[:, 1:]   # predict t+1 from <= t
+# (c) ~ ln(46) = 3.83. An untrained model outputs near-uniform logits, so
+#     it assigns ~1/V probability to the true token; -ln(1/V) = ln V.</code></pre><p>That <code>ln V</code> baseline is your first debugging instrument — if a brand-new model's loss isn't near it, the bug is in the model, not the training.</p></div>
+</div>
+
+</main>
+</body>
+</html>

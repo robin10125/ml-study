@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 7 · Training, Sampling &amp; Debugging</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+<script defer src="quiz.js"></script>
+</head>
+<body>
+<main>
+<h1><span class="chapno">Chapter 7</span> · Training, Sampling &amp; Debugging</h1>
+<p class="subtitle">You have a model that produces logits. This chapter makes it learn and makes it talk: the optimizer, the data pipeline, the exact training loop, autoregressive sampling under <code>no_grad</code>, the verified run that memorizes Alice in Wonderland — and a PyTorch-specific debugging checklist for when it doesn't. By the end you've assembled and run the whole thing.</p>
+
+<h2 id="optim">7.1 The optimizer and the loop</h2>
+<p>Drop the model into the five-line loop from Chapter 4 — nothing new, just the LM loss reshape (§4.3) as step 3:</p>
+<pre><code>model = GPT(vocab).to(device)
+opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+model.train()
+for step in range(1, steps + 1):
+    inputs, targets = get_batch(...)         # (B, T), (B, T)
+    logits = model(inputs)                   # (B, T, V)
+    loss = F.cross_entropy(logits.reshape(-1, vocab), targets.reshape(-1))
+    opt.zero_grad()                          # clear last step's grads
+    loss.backward()                          # fill .grad
+    opt.step()                               # update weights
+</code></pre>
+<p><strong>AdamW</strong> is the transformer default: Adam (per-parameter adaptive step sizes from running gradient moments) with decoupled weight decay. <code>lr=3e-4</code> is the classic starting point. The optimizer holds its own state — for Adam, two running averages (<code>m</code>, <code>v</code>) per parameter — and updates weights in place inside its own <code>no_grad</code> region. One worth-knowing property: on the <em>first</em> step, Adam's bias correction makes the update exactly <code>lr · sign(gradient)</code>, independent of the gradient's magnitude (it's check 7 of the test suite).</p>
+
+<h2 id="data">7.2 The data pipeline</h2>
+<p>The corpus is 2 KB, so we skip <code>DataLoader</code> and sample random windows directly — a vivid use of fancy indexing (§1.3):</p>
+<pre><code>def get_batch(data, batch_size, T, device, generator):
+    starts = torch.randint(0, len(data) - T - 1, (batch_size,), generator=generator)
+    idx = starts[:, None] + torch.arange(T + 1)[None, :]   # (B, T+1) window indices
+    return data[idx].to(device)                            # (B, T+1) gather
+</code></pre>
+<p>The index trick: <code>starts[:, None]</code> is <code>(B, 1)</code>, <code>arange(T+1)[None, :]</code> is <code>(1, T+1)</code>; they broadcast to a <code>(B, T+1)</code> grid of absolute positions, and <code>data[idx]</code> gathers all <code>B</code> windows at once. In the loop we split each window into <code>inputs = batch[:, :-1]</code> and <code>targets = batch[:, 1:]</code> — the next-token shift (§5.6). Passing an explicit <code>generator</code> makes the batch sequence reproducible without touching the global RNG.</p>
+
+<h2 id="generate">7.3 Sampling: generating text</h2>
+<p>To generate, feed the context, take the <em>last</em> position's logits, turn them into a probability distribution, sample one token, append, repeat. Wrapped in <code>@torch.no_grad()</code> and <code>eval()</code> mode (§3.7), because we're not training:</p>
+<pre><code>@torch.no_grad()
+def generate(model, idx, n_new, temperature=0.8):
+    model.eval()
+    for _ in range(n_new):
+        idx_cond = idx[:, -model.max_T:]                 # never exceed the pos table
+        logits = model(idx_cond)[:, -1, :] / temperature # (B, V): last position only
+        probs = F.softmax(logits, dim=-1)
+        nxt = torch.multinomial(probs, num_samples=1)    # (B, 1): sample one token
+        idx = torch.cat([idx, nxt], dim=1)               # append, grow the sequence
+    return idx
+</code></pre>
+<p>The PyTorch-specific moves here: <code>logits[:, -1, :]</code> keeps batch and vocab, drops time — the integer index removes that axis (§1.3). <code>torch.multinomial(probs, 1)</code> draws a token id from the categorical distribution (vs <code>argmax</code>, which would be greedy/deterministic). <strong>Temperature</strong> divides the logits before softmax: <code>&lt;1</code> sharpens (more confident, more repetitive), <code>&gt;1</code> flattens (more random). And <code>idx[:, -model.max_T:]</code> truncates the context so we never index past the learned position table — a real crash if you forget it on long generations.</p>
+
+<h2 id="run">7.4 The verified run</h2>
+<p>Running <code>code/transformer.py</code> with its defaults (seed 0, 3000 steps, CPU) on this machine produces the following, verbatim. The loss falls from the untrained <code>ln 46 ≈ 3.83</code> baseline to <code>0.093</code> — the model has memorized the passage — and the sample begins by quoting it before drifting (a 632 K-param model on 2 KB of text):</p>
+<div class="fig"><pre>corpus: 2095 chars, vocab = 46, device = cpu
+params: 632,192  (expect first loss near ln 46 = 3.83)
+step     1  loss 3.892  (0s)
+step   250  loss 1.876  (19s)
+step   500  loss 0.490  (37s)
+step   750  loss 0.182  (55s)
+step  1000  loss 0.134  (74s)
+step  1250  loss 0.119  (94s)
+step  1500  loss 0.109  (111s)
+step  1750  loss 0.104  (128s)
+step  2000  loss 0.101  (146s)
+step  2250  loss 0.096  (166s)
+step  2500  loss 0.094  (184s)
+step  2750  loss 0.093  (201s)
+step  3000  loss 0.093  (220s)
+
+FINAL: average loss over last 100 steps = 0.093
+
+sample:
+Alice after it, never once considering how
+in the world she was thasury to to tougy, t thasho thasut gshnvero t thofnr...
+
+PASS: model fits the corpus (loss 0.093 &lt; 1.0; untrained baseline ln 46 = 3.83).</pre>
+<div class="caption">~3m44s wall-clock on CPU. The clean loss curve — 3.89 → 0.49 by step 500 → 0.09 — and the PASS line are the signal that every piece from Chapters 6–7 is correct end to end. <code>code/test_torch_core.py</code> independently confirms the components with <code>ALL 7 CHECKS PASS</code>.</div>
+</div>
+<p>That the sample starts as a perfect quote ("Alice after it, never once considering how / in the world she was…") and then degrades is exactly right for the setup: with so few parameters relative to the task framing, the model memorizes the high-probability continuations and grows uncertain off the beaten path. Loss <code>0.093</code> — far below <code>1.0</code> — is unambiguous success.</p>
+
+<h2 id="debug">7.5 A PyTorch debugging checklist</h2>
+<p>When a transformer (or any model) misbehaves, the cause is almost always one of these — and almost all of them are silent. Work the list top to bottom:</p>
+<div class="box warning"><div class="box-title">Loss won't go down / explodes</div>
+<ul>
+<li><strong>Missing <code>zero_grad()</code></strong> (§2.3) — gradients accumulate, training diverges. The single most common cause.</li>
+<li><strong>Pre-softmaxed the loss</strong> (§4.3) — passing probabilities to <code>F.cross_entropy</code> instead of raw logits.</li>
+<li><strong>Broken graph</strong> (§2.5) — a stray <code>.detach()</code>/<code>.item()</code>/<code>no_grad</code> in <code>forward</code>, or a weight built as a bare tensor instead of <code>nn.Parameter</code>, so the optimizer never updates it.</li>
+<li><strong>Unregistered submodules</strong> (§3.3) — blocks in a plain list, not a <code>ModuleList</code>: they run but never train. (The param count catches this — §6.5.)</li>
+<li><strong>Learning rate</strong> — diverging? lower it. Frozen? raise it. <code>3e-4</code> is the sane starting point.</li>
+</ul></div>
+<div class="box warning"><div class="box-title">First loss is wrong</div>
+<ul>
+<li><strong>Not near <code>ln V</code></strong> (§5.6) — a fresh model should report ≈ <code>ln(vocab)</code>. Far above means broken init or a bug; suspiciously below means label leakage (e.g. a broken causal mask letting the model see the answer).</li>
+<li><strong>NaN immediately</strong> — <code>eps</code> outside the LayerNorm sqrt (§6.1), or masking that fills an entire softmax row with <code>-inf</code> (no visible keys → <code>softmax</code> of all <code>-inf</code> → NaN).</li>
+</ul></div>
+<div class="box warning"><div class="box-title">Shape and runtime errors</div>
+<ul>
+<li><strong>"view size is not compatible … stride"</strong> (§1.5) — you <code>view()</code>d after a <code>transpose</code>; add <code>.contiguous()</code> or use <code>.reshape()</code>. This is the attention head-merge.</li>
+<li><strong>"Expected … Long"</strong> (§3.5) — token ids passed as float; <code>nn.Embedding</code> needs <code>long</code>.</li>
+<li><strong>Device mismatch</strong> (§6.4) — a <code>torch.arange</code>/mask created without <code>device=</code>; or you forgot <code>model.to(device)</code> / <code>batch.to(device)</code>.</li>
+<li><strong>"grad can be implicitly created only for scalar"</strong> (§2.2) — you called <code>backward()</code> on a non-scalar; reduce the loss with <code>.mean()</code>.</li>
+</ul></div>
+<div class="box warning"><div class="box-title">Generation looks wrong</div>
+<ul>
+<li><strong>Forgot <code>model.eval()</code></strong> (§3.7) — dropout still active, corrupting samples (our model has no dropout, but real ones do).</li>
+<li><strong>Context overflow</strong> (§7.3) — generating past <code>max_T</code> without truncating the context indexes off the position table and crashes.</li>
+<li><strong>Forgot <code>.train()</code> afterward</strong> — leaving the model in <code>eval</code> mode silently weakens later training.</li>
+</ul></div>
+
+<h2 id="problems">Problem set</h2>
+<p>The last problem assembles and <em>runs</em> the entire model to a PASS — the moment the whole course pays off. The reference unlocks after a real attempt.</p>
+
+<div class="quiz" data-concept="ch7.html#data" data-concept-label="§7.2 Data pipeline" data-min="160" data-placeholder="def get_batch(data, batch_size, T, device, generator):&#10;    starts = ...&#10;    idx = ...&#10;    return ...&#10;# then split a batch into inputs/targets">
+  <div class="q-text"><p>Write <code>get_batch(data, batch_size, T, device, generator)</code> that returns a <code>(B, T+1)</code> tensor of random length-<code>(T+1)</code> windows from the 1-D token array <code>data</code>, using the broadcasting index trick (no Python loop). Then write the two lines that split a returned batch into <code>inputs</code> and <code>targets</code> for next-token prediction. Comment: what are the shapes of <code>starts[:, None]</code> and <code>arange(T+1)[None, :]</code>, and what do they broadcast to?</p></div>
+  <div class="hint"><code>starts = torch.randint(0, len(data)-T-1, (B,), generator=generator)</code>. Build the index grid <code>starts[:, None] + torch.arange(T+1)[None, :]</code>, then <code>data[idx]</code>.</div>
+  <div class="answer"><pre><code>def get_batch(data, batch_size, T, device, generator):
+    starts = torch.randint(0, len(data) - T - 1, (batch_size,), generator=generator)
+    idx = starts[:, None] + torch.arange(T + 1)[None, :]   # (B, T+1)
+    return data[idx].to(device)
+
+inputs, targets = batch[:, :-1], batch[:, 1:]              # each (B, T)
+# starts[:, None] is (B, 1); arange(T+1)[None, :] is (1, T+1); they
+# broadcast to a (B, T+1) grid of absolute indices, and data[idx] gathers
+# every window in one fancy-index op.</code></pre></div>
+</div>
+
+<div class="quiz" data-concept="ch7.html#generate" data-concept-label="§7.3 Sampling" data-min="200" data-placeholder="@torch.no_grad()&#10;def generate(model, idx, n_new, temperature=0.8):&#10;    model.eval()&#10;    for _ in range(n_new):&#10;        ...&#10;    return idx">
+  <div class="q-text"><p>Write <code>generate(model, idx, n_new, temperature=0.8)</code>: autoregressively append <code>n_new</code> tokens to the prompt <code>idx</code> (shape <code>(B, T0)</code>). Decorate it <code>@torch.no_grad()</code> and put the model in <code>eval()</code>. Four things to get right: truncate the context to <code>max_T</code>, take only the last position's logits, apply temperature before softmax, and sample with <code>multinomial</code> (not <code>argmax</code>). Comments: why <code>multinomial</code> over <code>argmax</code>, and what crashes if you skip the context truncation.</p></div>
+  <div class="hint">Per step: <code>idx_cond = idx[:, -model.max_T:]</code>; <code>logits = model(idx_cond)[:, -1, :] / temperature</code>; <code>probs = F.softmax(logits, -1)</code>; <code>nxt = torch.multinomial(probs, 1)</code>; <code>idx = torch.cat([idx, nxt], dim=1)</code>.</div>
+  <div class="answer"><pre><code>@torch.no_grad()
+def generate(model, idx, n_new, temperature=0.8):
+    model.eval()
+    for _ in range(n_new):
+        idx_cond = idx[:, -model.max_T:]                 # cap context length
+        logits = model(idx_cond)[:, -1, :] / temperature # (B, V): last step only
+        probs = F.softmax(logits, dim=-1)
+        nxt = torch.multinomial(probs, num_samples=1)    # (B, 1)
+        idx = torch.cat([idx, nxt], dim=1)
+    return idx
+# multinomial vs argmax: argmax is greedy/deterministic and gets stuck in
+#   loops; multinomial samples from the distribution -> varied, temperature-
+#   controllable text.
+# no truncation: once the sequence passes max_T, model() indexes the
+#   position embedding out of range and crashes (index out of bounds).</code></pre><p>(<code>no_grad</code> + <code>eval</code>: §3.7 — recording off for speed, mode set for correct layer behavior.)</p></div>
+</div>
+
+<div class="quiz" data-concept="ch7.html#optim" data-concept-label="§7.1 Training loop" data-min="180" data-placeholder="# Full training loop body for the LM. model, opt, get_batch given.&#10;for step in range(1, steps+1):&#10;    ...">
+  <div class="q-text"><p>Write the body of the language-model training loop: sample a batch, split into inputs/targets, forward, compute the <code>(B·T, V)</code> cross-entropy loss, and do the optimizer dance — in the correct order. Then answer: which single line, if removed, makes the loss diverge, and which line, if it pre-softmaxed, makes the loss subtly wrong?</p></div>
+  <div class="hint">Order: get_batch → split → <code>model(inputs)</code> → <code>F.cross_entropy(logits.reshape(-1,V), targets.reshape(-1))</code> → <code>zero_grad</code> → <code>backward</code> → <code>step</code>.</div>
+  <div class="answer"><pre><code>for step in range(1, steps + 1):
+    batch = get_batch(data, batch_size, T, device, gen)
+    inputs, targets = batch[:, :-1], batch[:, 1:]
+    logits = model(inputs)                               # (B, T, V)
+    loss = F.cross_entropy(logits.reshape(-1, vocab), targets.reshape(-1))
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+# removing opt.zero_grad() -> gradients accumulate across steps -> the
+#   effective LR balloons and the loss diverges.
+# pre-softmaxing (F.cross_entropy(F.softmax(logits,-1), ...)) -> double
+#   log-softmax, a too-flat loss that learns poorly with no error raised.</code></pre></div>
+</div>
+
+<div class="quiz" data-concept="ch7.html#debug" data-concept-label="§7.5 Debugging" data-min="160" data-placeholder="# Diagnose each from the symptom — name the bug AND the fix:&#10;# (a) fresh model's first loss is 0.4, not ~3.83&#10;# (b) RuntimeError about view size / stride after attention&#10;# (c) loss is NaN from step 1&#10;# (d) model runs but loss is totally flat; param count is way too low">
+  <div class="q-text"><p>Diagnose each symptom — name the likely bug and the one-line fix. (a) A brand-new model reports first loss <code>0.4</code>, not <code>~3.83</code>. (b) <code>RuntimeError</code> about "view size … stride" right after attention. (c) Loss is <code>NaN</code> from step 1. (d) The model trains but loss barely moves, and <code>sum(p.numel() …)</code> is far below 632 K.</p></div>
+  <div class="hint">(a) information leaking from the future → causal mask. (b) §1.5 contiguity. (c) division by zero in a norm or an all-<code>-inf</code> softmax row. (d) §3.3 unregistered modules.</div>
+  <div class="answer"><pre><code># (a) Loss far BELOW ln V means the model sees the answer: the causal mask
+#     is broken (wrong direction, or applied after softmax). Fix the mask
+#     so position t attends only to <= t.
+# (b) view() after transpose on non-contiguous memory. Fix: insert
+#     .contiguous() before .view() at the head merge (or use .reshape()).
+# (c) NaN: eps OUTSIDE the LayerNorm sqrt (var=0 -> inf), or a softmax row
+#     that is entirely -inf. Fix: eps inside sqrt; ensure each query has at
+#     least one visible (unmasked) key.
+# (d) Blocks stored in a plain list, not nn.ModuleList -> unregistered ->
+#     not in parameters() -> never trained. Fix: wrap in nn.ModuleList.</code></pre></div>
+</div>
+
+<div class="quiz" data-concept="ch7.html#run" data-concept-label="§7.1–7.4 Full run" data-min="250" data-placeholder="# Assemble the WHOLE thing into one file and run it.&#10;# model + AdamW + get_batch + train loop + generate.&#10;# Report: first loss, final loss, whether it PASSed (loss < 1.0), a sample.">
+  <div class="q-text"><p>The finale. Combine your Chapter 6 model with this chapter's <code>get_batch</code>, training loop, and <code>generate</code> into a single runnable file, train it on the Alice corpus (it's in <code>code/transformer.py</code>), and report: the first loss (should be ≈ <code>3.83</code>), the final loss (should be <code>&lt; 1.0</code>), whether it printed PASS, and a generated sample. If your loss doesn't fall, run the §7.5 checklist before opening the reference. This is the whole course in one file — write as much of it from memory as you can.</p></div>
+  <div class="hint">Skeleton: tokenize the corpus (<code>chars = sorted(set(CORPUS))</code>, build <code>stoi</code>), <code>model = GPT(vocab)</code>, <code>opt = AdamW(model.parameters(), 3e-4)</code>, loop ~3000 steps with the §7.1 body, then <code>generate</code> from a seed prompt. Track a running average of the last ~100 losses for a clean readout.</p></div>
+  <div class="hint">Expected trajectory (seed 0, CPU): step 1 ≈ 3.89, step 500 ≈ 0.49, step 1000 ≈ 0.13, final ≈ 0.09 → PASS. ~3–4 minutes on CPU.</div>
+  <div class="answer"><pre><code># The full reference is code/transformer.py — run it directly:
+#   python code/transformer.py
+# Verified output on this machine (seed 0, 3000 steps, CPU):
+#   step     1  loss 3.892
+#   step   500  loss 0.490
+#   step  1000  loss 0.134
+#   step  3000  loss 0.093
+#   FINAL: average loss over last 100 steps = 0.093
+#   PASS: model fits the corpus (loss 0.093 < 1.0; baseline ln 46 = 3.83).
+# And code/test_torch_core.py -> ALL 7 CHECKS PASS.
+#
+# If you assembled this from your own modules and it PASSed, you can write a
+# transformer in PyTorch from an empty file. That was the whole point.</code></pre><p>From here: swap the tiny corpus for a bigger one, add <code>nn.Dropout</code> in the block and <code>F.scaled_dot_product_attention</code> for speed, batch on a GPU with <code>.to('cuda')</code> — every extension is a small edit to code you now own line by line.</p></div>
+</div>
+
+</main>
+</body>
+</html>
